@@ -153,6 +153,22 @@ bitflags! {
         /// `normalized_value` may be `None` on the returned `SchemaInfo` for
         /// nodes whose value nothing else needed. See `PERF_LAZY_PSVI.md`.
         const BUILD_PSVI_TYPED_VALUES = 0x0020;
+        /// Put the types the XPath 2.0 data model adds to the XML Schema
+        /// namespace (XDM 1.0 §2.6.2) in scope for `xsi:type` where the set's
+        /// XSD version does not define them: in an XSD 1.0 set
+        /// `xs:anyAtomicType`, `xs:untypedAtomic`, `xs:dayTimeDuration` and
+        /// `xs:yearMonthDuration`, in an XSD 1.1 set `xs:untypedAtomic`
+        /// (Structures 1.1 §1.3.1.1: not "defined in this specification").
+        /// An `xsi:type` naming one then resolves to the set's component
+        /// ([`SchemaSet::xpath_type`](crate::SchemaSet::xpath_type)) and
+        /// overrides the governing type when ·validly substitutable· for it,
+        /// by the types' places in the data model's hierarchy.
+        ///
+        /// For a host that validates nodes of the data model, whose in-scope
+        /// schema types include them. Off by default: an XML Schema processor
+        /// does not resolve them (`cvc-elt.4.1`). Schema documents are not
+        /// affected — they name only what their XSD version defines.
+        const XPATH_TYPES = 0x0040;
     }
 }
 

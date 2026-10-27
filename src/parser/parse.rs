@@ -1277,8 +1277,27 @@ fn vc_token_available(
     })
 }
 
+/// Whether `xs:{local_name}` is a type ·automatically known· to the
+/// processor for `vc:typeAvailable` / `vc:typeUnavailable` (Structures 1.1
+/// §4.2.2: an element is ignored when "any item in the ·actual value· T is not
+/// the expanded name of some type definition ·automatically known· to the
+/// processor", or for `vc:typeUnavailable` when every item is one
+/// "·automatically known· to and supported by the processor"): the built-in
+/// types a schema document of `xsd_version` can name.
+///
+/// §3.16.7.4 defines the term: "A type about which a processor possesses
+/// prior knowledge, and which the processor can support without any
+/// declaration of the type being supplied by the user", which "can be included
+/// automatically by that processor in all schemas, but need not be". The
+/// XPath 2.0 data model's `xs:untypedAtomic` is not a type definition of any
+/// schema here (a schema document naming it is `src-resolve`, Structures 1.1
+/// §1.3.1.1), so it is not available in either version — an element guarded
+/// by `vc:typeAvailable="xs:untypedAtomic"` is ignored, one guarded by
+/// `vc:typeUnavailable` kept — and XSD 1.1's additions are available in 1.1
+/// only.
 fn vc_is_xs_type_available(local_name: &str, xsd_version: XsdVersion) -> bool {
     match crate::types::XmlTypeCode::from_local_name(local_name) {
+        Some(crate::types::XmlTypeCode::UntypedAtomic) => false,
         Some(code) => !code.is_xsd11() || xsd_version == XsdVersion::V1_1,
         None => false,
     }

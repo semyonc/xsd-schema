@@ -230,6 +230,9 @@ impl ValidatorRegistry {
         registry.register(Arc::new(DayTimeDurationValidator));
         registry.register(Arc::new(DateTimeStampValidator));
 
+        // The XPath 2.0 data model's xs:untypedAtomic
+        registry.register(Arc::new(UntypedAtomicValidator));
+
         registry
     }
 
@@ -2881,199 +2884,98 @@ fn parse_gmonth(s: &str) -> ValidationResult<GMonthValue> {
     })
 }
 
-/// Parse xs:yearMonthDuration (XSD 1.1)
-/// Format: -?P(nY)?(nM)?
+/// Whether the designators of a duration literal come in the order of
+/// Datatypes 1.1 §3.3.6.2's grammar — `Y`, `M`, `D`, then after `T` `H`, `M`,
+/// `S`. [`parse_duration`] does not check the order (it accepts `P1M1Y` for
+/// `xs:duration`); the two duration subtypes do.
+fn duration_fields_in_order(s: &str) -> bool {
+    let mut last = 0u8;
+    let mut in_time = false;
+    for c in s.chars() {
+        let rank = match (c, in_time) {
+            ('T', _) => {
+                in_time = true;
+                continue;
+            }
+            ('Y', false) => 1,
+            ('M', false) => 2,
+            ('D', false) => 3,
+            ('H', true) => 4,
+            ('M', true) => 5,
+            ('S', true) => 6,
+            _ => continue,
+        };
+        if rank <= last {
+            return false;
+        }
+        last = rank;
+    }
+    true
+}
+
+/// Parse xs:yearMonthDuration: a lexical form of `xs:duration` that matches
+/// the pattern `[^DT]*` (Datatypes 1.1 §3.4.26.1; XDM 1.0 §2.6.2 restricts
+/// `xs:duration` with the same pattern) — no day field, no time part.
 fn parse_year_month_duration(s: &str) -> ValidationResult<YearMonthDurationValue> {
-    let (negative, rest) = if let Some(stripped) = s.strip_prefix('-') {
-        (true, stripped)
-    } else {
-        (false, s)
+    let bad = |message: &str| ValidationError::InvalidLexical {
+        value: s.to_string(),
+        type_name: "yearMonthDuration",
+        message: message.to_string(),
     };
-
-    if !rest.starts_with('P') {
-        return Err(ValidationError::InvalidLexical {
-            value: s.to_string(),
-            type_name: "yearMonthDuration",
-            message: "Must start with 'P' (or '-P')".to_string(),
-        });
+    let duration = parse_duration(s).map_err(|e| match e {
+        ValidationError::InvalidLexical { message, .. } => bad(&message),
+        other => other,
+    })?;
+    if s.contains(['D', 'T']) {
+        return Err(bad(
+            "yearMonthDuration cannot contain day or time components",
+        ));
     }
-
-    let content = &rest[1..];
-    if content.is_empty() {
-        return Err(ValidationError::InvalidLexical {
-            value: s.to_string(),
-            type_name: "yearMonthDuration",
-            message: "Duration cannot be empty".to_string(),
-        });
+    if !duration_fields_in_order(s) {
+        return Err(bad("the fields of a duration are in the order Y, M"));
     }
-
-    // Must not contain day/time components
-    if content.contains('D') || content.contains('T') {
-        return Err(ValidationError::InvalidLexical {
-            value: s.to_string(),
-            type_name: "yearMonthDuration",
-            message: "yearMonthDuration cannot contain day or time components".to_string(),
-        });
-    }
-
-    let mut years = 0u32;
-    let mut months = 0u32;
-    let mut current = content;
-
-    // Parse years
-    if let Some(y_pos) = current.find('Y') {
-        years = current[..y_pos]
-            .parse()
-            .map_err(|_| ValidationError::InvalidLexical {
-                value: s.to_string(),
-                type_name: "yearMonthDuration",
-                message: "Invalid years value".to_string(),
-            })?;
-        current = &current[y_pos + 1..];
-    }
-
-    // Parse months
-    if let Some(m_pos) = current.find('M') {
-        months = current[..m_pos]
-            .parse()
-            .map_err(|_| ValidationError::InvalidLexical {
-                value: s.to_string(),
-                type_name: "yearMonthDuration",
-                message: "Invalid months value".to_string(),
-            })?;
-        current = &current[m_pos + 1..];
-    }
-
-    // Check nothing remains
-    if !current.is_empty() {
-        return Err(ValidationError::InvalidLexical {
-            value: s.to_string(),
-            type_name: "yearMonthDuration",
-            message: "Invalid duration format".to_string(),
-        });
-    }
-
     Ok(YearMonthDurationValue {
-        negative,
-        years,
-        months,
+        negative: duration.negative,
+        years: duration.years,
+        months: duration.months,
     })
 }
 
-/// Parse xs:dayTimeDuration (XSD 1.1)
-/// Format: -?P(nD)?(T(nH)?(nM)?(n(.n)?S)?)?
+/// Parse xs:dayTimeDuration: a lexical form of `xs:duration` that matches
+/// the pattern `[^YM]*[DT].*` (Datatypes 1.1 §3.4.27.1; XDM 1.0 §2.6.2) — a
+/// day field or a time part, and no year or month field.
 fn parse_day_time_duration(s: &str) -> ValidationResult<DayTimeDurationValue> {
-    let (negative, rest) = if let Some(stripped) = s.strip_prefix('-') {
-        (true, stripped)
-    } else {
-        (false, s)
+    let bad = |message: &str| ValidationError::InvalidLexical {
+        value: s.to_string(),
+        type_name: "dayTimeDuration",
+        message: message.to_string(),
     };
-
-    if !rest.starts_with('P') {
-        return Err(ValidationError::InvalidLexical {
-            value: s.to_string(),
-            type_name: "dayTimeDuration",
-            message: "Must start with 'P' (or '-P')".to_string(),
-        });
+    let duration = parse_duration(s).map_err(|e| match e {
+        ValidationError::InvalidLexical { message, .. } => bad(&message),
+        other => other,
+    })?;
+    // Year and month fields precede the day field and the time part, whose
+    // `M` is minutes.
+    let date_part = s.split('T').next().unwrap_or(s);
+    if date_part.contains(['Y', 'M']) {
+        return Err(bad(
+            "dayTimeDuration cannot contain year or month components",
+        ));
     }
-
-    let content = &rest[1..];
-    if content.is_empty() {
-        return Err(ValidationError::InvalidLexical {
-            value: s.to_string(),
-            type_name: "dayTimeDuration",
-            message: "Duration cannot be empty".to_string(),
-        });
+    if !s.contains(['D', 'T']) {
+        return Err(bad("dayTimeDuration needs a day or a time component"));
     }
-
-    // Must not contain year/month components (before T)
-    let date_part = if let Some(t_pos) = content.find('T') {
-        &content[..t_pos]
-    } else {
-        content
-    };
-    if date_part.contains('Y') || date_part.contains('M') {
-        return Err(ValidationError::InvalidLexical {
-            value: s.to_string(),
-            type_name: "dayTimeDuration",
-            message: "dayTimeDuration cannot contain year or month components".to_string(),
-        });
+    if !duration_fields_in_order(s) {
+        return Err(bad(
+            "the fields of a duration are in the order D, T, H, M, S",
+        ));
     }
-
-    let mut days = 0u32;
-    let mut hours = 0u32;
-    let mut minutes = 0u32;
-    let mut seconds = Decimal::ZERO;
-    let mut current = content;
-
-    // Parse days
-    if let Some(d_pos) = current.find('D') {
-        days = current[..d_pos]
-            .parse()
-            .map_err(|_| ValidationError::InvalidLexical {
-                value: s.to_string(),
-                type_name: "dayTimeDuration",
-                message: "Invalid days value".to_string(),
-            })?;
-        current = &current[d_pos + 1..];
-    }
-
-    // Parse time part
-    if let Some(stripped) = current.strip_prefix('T') {
-        current = stripped;
-
-        // Parse hours
-        if let Some(h_pos) = current.find('H') {
-            hours = current[..h_pos]
-                .parse()
-                .map_err(|_| ValidationError::InvalidLexical {
-                    value: s.to_string(),
-                    type_name: "dayTimeDuration",
-                    message: "Invalid hours value".to_string(),
-                })?;
-            current = &current[h_pos + 1..];
-        }
-
-        // Parse minutes
-        if let Some(m_pos) = current.find('M') {
-            minutes = current[..m_pos]
-                .parse()
-                .map_err(|_| ValidationError::InvalidLexical {
-                    value: s.to_string(),
-                    type_name: "dayTimeDuration",
-                    message: "Invalid minutes value".to_string(),
-                })?;
-            current = &current[m_pos + 1..];
-        }
-
-        // Parse seconds
-        if let Some(s_pos) = current.find('S') {
-            seconds = parse_seconds(&current[..s_pos]).ok_or_else(|| {
-                ValidationError::InvalidLexical {
-                    value: s.to_string(),
-                    type_name: "dayTimeDuration",
-                    message: "Invalid seconds value".to_string(),
-                }
-            })?;
-            current = &current[s_pos + 1..];
-        }
-    }
-
-    // Check nothing remains
-    if !current.is_empty() {
-        return Err(ValidationError::InvalidLexical {
-            value: s.to_string(),
-            type_name: "dayTimeDuration",
-            message: "Invalid duration format".to_string(),
-        });
-    }
-
     Ok(DayTimeDurationValue {
-        negative,
-        days,
-        hours,
-        minutes,
-        seconds,
+        negative: duration.negative,
+        days: duration.days,
+        hours: duration.hours,
+        minutes: duration.minutes,
+        seconds: duration.seconds,
     })
 }
 
@@ -4332,6 +4234,49 @@ impl TypeValidator for DayTimeDurationValidator {
                 | "pattern"
                 | "enumeration"
         )
+    }
+}
+
+/// Validator for `xs:untypedAtomic`, the XPath 2.0 data model's type of
+/// "untyped atomic data, such as text that has not been assigned a more
+/// specific type" (XDM 1.0 §2.6.2): every string is a value of it, unchanged —
+/// §2.6.4: "When xs:untypedAtomic is specified as the type, no validation takes
+/// place". Its typed value is the string as an `xs:untypedAtomic`. The type
+/// has no facets of its own, so no white space is normalized; a facet a
+/// restriction of it adds applies to the string.
+pub struct UntypedAtomicValidator;
+
+impl TypeValidator for UntypedAtomicValidator {
+    fn type_name(&self) -> &'static str {
+        "untypedAtomic"
+    }
+    fn type_code(&self) -> XmlTypeCode {
+        XmlTypeCode::UntypedAtomic
+    }
+    fn primitive_type(&self) -> PrimitiveTypeCode {
+        PrimitiveTypeCode::String
+    }
+    fn whitespace(&self) -> WhitespaceMode {
+        WhitespaceMode::Preserve
+    }
+
+    fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
+        Ok(XmlValue::untyped(value))
+    }
+
+    fn validate_with_facets(&self, value: &str, facets: &FacetSet) -> ValidationResult<XmlValue> {
+        let ws = facets
+            .whitespace
+            .as_ref()
+            .map(|w| w.value)
+            .unwrap_or(WhitespaceMode::Preserve);
+        let normalized = normalize_whitespace(value, ws);
+        facets.validate_string(&normalized)?;
+        Ok(XmlValue::untyped(normalized.into_owned()))
+    }
+
+    fn facet_applicable(&self, facet: &str) -> bool {
+        matches!(facet, "pattern" | "enumeration" | "whitespace")
     }
 }
 

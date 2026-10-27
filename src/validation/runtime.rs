@@ -7589,13 +7589,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         };
 
         // Look up the type
-        let resolved = self
-            .schema_set
-            .lookup_type(qname.namespace_uri, qname.local_name)
-            .or_else(|| {
-                self.schema_set
-                    .get_built_in_type_by_qname(qname.namespace_uri, qname.local_name)
-            });
+        let resolved = self.lookup_xsi_type(qname.namespace_uri, qname.local_name);
 
         match resolved {
             Some(type_key) => {
@@ -7683,15 +7677,27 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             .unwrap_or(&empty);
         match parse_qname_with_snapshot(value, ns_context, &self.schema_set.name_table, true) {
             Ok(qname) => self
-                .schema_set
-                .lookup_type(qname.namespace_uri, qname.local_name)
-                .or_else(|| {
-                    self.schema_set
-                        .get_built_in_type_by_qname(qname.namespace_uri, qname.local_name)
-                })
+                .lookup_xsi_type(qname.namespace_uri, qname.local_name)
                 .is_some(),
             Err(_) => false,
         }
+    }
+
+    /// The type definition an `xsi:type` naming `{namespace}local_name`
+    /// ·resolves· to: a named type of the schema, or a built-in type the set's
+    /// XSD version defines — and with [`ValidationFlags::XPATH_TYPES`] the
+    /// types of the XPath 2.0 data model it does not
+    /// ([`SchemaSet::xpath_type`]).
+    fn lookup_xsi_type(&self, namespace: Option<NameId>, local_name: NameId) -> Option<TypeKey> {
+        self.schema_set
+            .lookup_type(namespace, local_name)
+            .or_else(|| {
+                self.schema_set.xsi_type_built_in(
+                    namespace,
+                    local_name,
+                    self.flags.contains(ValidationFlags::XPATH_TYPES),
+                )
+            })
     }
 
     /// Returns xs:anyType's content model for lax assessment.

@@ -290,18 +290,14 @@ fn derives_from_type_test<N: DomNavigator>(
                 return false;
             };
             match built_in_key(schema_set, *code) {
+                // Every set has the types of the data model, an XSD 1.0 set
+                // too (`SchemaSet::xpath_type`), with their places in its
+                // hierarchy: every atomic type derives from
+                // `xs:anyAtomicType` ("xs:anyAtomicType is an atomic type that
+                // includes all atomic values", §2.5.1).
                 Some(expected) => schema_set.xpath_derives_from(actual, expected),
-                // An XSD 1.0 schema set has no `xs:anyAtomicType` component,
-                // but §2.5.4's derives-from still holds for every atomic type
-                // ("xs:anyAtomicType is an atomic type that includes all atomic
-                // values", §2.5.1).
-                None if *code == XmlTypeCode::AnyAtomicType => {
-                    is_atomic_simple_type(schema_set, actual)
-                }
-                // No other predefined type the binder accepts is missing from
-                // a set that annotated the node, except `xs:untypedAtomic`
-                // (no annotated node has it) and the XSD 1.1 types in an
-                // XSD 1.0 set (no node of that set has them either).
+                // A predefined type the set does not have (`xs:dateTimeStamp`
+                // in an XSD 1.0 set): no node of the set has it.
                 None => false,
             }
         }
@@ -325,14 +321,10 @@ pub(crate) fn is_atomic_simple_type(schema_set: &crate::schema::SchemaSet, key: 
         .is_some_and(|def| def.variety == crate::parser::frames::SimpleTypeVariety::Atomic)
 }
 
-/// The schema set's key for the predefined type with this code.
+/// The schema set's key for the predefined type with this code — the data
+/// model's types included in both XSD versions ([`SchemaSet::xpath_type`](crate::schema::SchemaSet::xpath_type)).
 fn built_in_key(schema_set: &crate::schema::SchemaSet, code: XmlTypeCode) -> Option<TypeKey> {
-    if code == XmlTypeCode::AnyType {
-        return Some(TypeKey::Complex(schema_set.any_type_key()));
-    }
-    schema_set
-        .get_built_in_simple_type_by_code(code)
-        .map(TypeKey::Simple)
+    schema_set.xpath_type(code)
 }
 
 /// The code of a predefined type, if `key` is one in this schema set.

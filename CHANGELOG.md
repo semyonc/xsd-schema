@@ -207,6 +207,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   attribute values, as `s4s-att-not-allowed` / `s4s-elt-invalid-content` /
   `s4s-att-invalid-value` (was `ct-props-correct` / `sch-props-correct`).
 
+- a schema document of an XML Schema 1.1 set can no longer name
+  `xs:untypedAtomic` — a `type`, `base`, `itemType`, `memberTypes` or type
+  alternative naming it is `src-resolve`, as in an XML Schema 1.0 set. The
+  type is the XPath 2.0 data model's (XML Schema 1.1 Structures §1.3.1.1: "not
+  defined in this specification"); a host reaches it through
+  `SchemaSet::xpath_type`. `vc:typeAvailable` / `vc:typeUnavailable` treat it
+  as not available in either version.
+
 ### Added
 
 - `xpath::RegexCache`: compiled regular expressions of `fn:matches`,
@@ -351,6 +359,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   function). During validation, such a warning from an XSD 1.1 assertion or
   type alternative is reported to the sink, as the same code is for a literal
   (with `ValidationFlags::REPORT_WARNINGS`).
+
+- `SchemaSet::xpath_type` / `BuiltinTypes::xpath_type`: the types the XPath
+  2.0 data model adds to the XML Schema namespace (`xs:anyAtomicType`,
+  `xs:untypedAtomic`, `xs:dayTimeDuration`, `xs:yearMonthDuration`) for a host
+  that validates nodes against a type it names — in an XML Schema 1.0 set too,
+  where they validate, annotate and take part in the type hierarchy as in a
+  1.1 set. Schema documents of a 1.0 set still cannot name them.
+- `ValidationFlags::XPATH_TYPES`: an `xsi:type` may name those types where the
+  set's XSD version does not define them.
 
 ### Changed
 
@@ -914,6 +931,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `fn:adjust-dateTime-to-timezone` and `fn:adjust-date-to-timezone` raise
   FODT0001 when the adjusted year is out of range (a debug build panicked, a
   release build wrapped the year).
+
+- `xs:untypedAtomic` had no validator ("No validator for type code
+  UntypedAtomic"): every string is now a valid, unnormalized value. Without
+  `ValidationFlags::XPATH_TYPES` an `xsi:type` naming it is `cvc-elt.4.1`.
+- `xs:dayTimeDuration` and `xs:yearMonthDuration` accepted literals that are
+  not durations (`PT`, `P1DT`, `P+1D`, `P+1Y`) and, for the constructor
+  functions, the same.
 
 ### Performance
 

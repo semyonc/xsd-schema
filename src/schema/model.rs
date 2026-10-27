@@ -624,6 +624,60 @@ impl SchemaSet {
         self.builtin_types().get_type_code(type_id)
     }
 
+    /// The built-in type with this code as a host of the XPath 2.0 data model
+    /// sees the set — the lookup for a host that validates nodes against a
+    /// type it names (an annotation it stipulates, a type test): `xs:anyType`,
+    /// every built-in simple type of the set, and in both XSD versions the four
+    /// types the data model adds to the XML Schema namespace (XDM 1.0 §2.6.2):
+    /// `xs:anyAtomicType`, `xs:untypedAtomic`, `xs:dayTimeDuration`,
+    /// `xs:yearMonthDuration` ([`BuiltinTypes::xpath_type`]). `None` for a code
+    /// that names no type of the set (a node kind, `item()`, and in an XSD 1.0
+    /// set `xs:dateTimeStamp` and `xs:error`).
+    ///
+    /// An XSD 1.0 set's schema documents still cannot name those four (XML
+    /// Schema 1.0 has none of them: a reference is `src-resolve`), nor an
+    /// XSD 1.1 set's `xs:untypedAtomic` (no XSD version defines it), and an
+    /// `xsi:type` resolves those only for a validator with
+    /// [`ValidationFlags::XPATH_TYPES`](crate::validation::ValidationFlags::XPATH_TYPES).
+    ///
+    /// ```
+    /// use xsd_schema::{SchemaSet, TypeKey, XmlTypeCode};
+    /// use xsd_schema::validation::validate_simple_type;
+    ///
+    /// let set = SchemaSet::new(); // XML Schema 1.0
+    /// let day_time = set.xpath_type(XmlTypeCode::DayTimeDuration).unwrap();
+    /// let value = validate_simple_type("PT90M", day_time, &set).unwrap();
+    /// assert_eq!(value.typed_value.type_code, XmlTypeCode::DayTimeDuration);
+    /// assert!(validate_simple_type("P1Y", day_time, &set).is_err());
+    /// // Schema documents of the set do not see it.
+    /// assert_eq!(set.builtin_types().day_time_duration, None);
+    /// ```
+    pub fn xpath_type(&self, code: XmlTypeCode) -> Option<TypeKey> {
+        if code == XmlTypeCode::AnyType {
+            return Some(TypeKey::Complex(self.any_type_key()));
+        }
+        self.builtin_types().xpath_type(code).map(TypeKey::Simple)
+    }
+
+    /// The built-in type an `xsi:type` naming `{namespace}local_name`
+    /// resolves to: what a schema document resolves — and, with
+    /// `xpath_types` (a host's [`ValidationFlags::XPATH_TYPES`](crate::validation::ValidationFlags::XPATH_TYPES)),
+    /// the XPath 2.0 data model's types the set's XSD version does not define
+    /// ([`xpath_type`](Self::xpath_type)).
+    pub(crate) fn xsi_type_built_in(
+        &self,
+        namespace: Option<NameId>,
+        local_name: NameId,
+        xpath_types: bool,
+    ) -> Option<TypeKey> {
+        let found = self.get_built_in_type_by_qname(namespace, local_name);
+        if found.is_some() || !xpath_types || namespace != Some(well_known::XS_NAMESPACE) {
+            return found;
+        }
+        let code = XmlTypeCode::from_local_name(self.name_table.resolve_ref(local_name))?;
+        self.builtin_types().xpath_type(code).map(TypeKey::Simple)
+    }
+
     /// Check if `derived` derives from `base` (transitively).
     ///
     /// For built-in types, this uses the standard XSD derivation hierarchy.
@@ -643,6 +697,11 @@ impl SchemaSet {
         let builtin = self.builtin_types();
         if builtin.is_builtin(derived) && builtin.is_builtin(base) {
             return builtin.derives_from(derived, base);
+        }
+        // An XSD 1.0 set's `xs:anyAtomicType` (a host's): every atomic type
+        // derives from it (XDM 1.0 §2.6.2).
+        if builtin.is_detached_any_atomic_type(base) {
+            return self.is_atomic_simple_type(derived);
         }
 
         // For user-defined types (or mixed), walk the resolved base type chain
@@ -843,6 +902,19 @@ impl SchemaSet {
 
         // Clause 2.2.1/2.2.2: Walk the base type chain
         let builtin = self.builtin_types();
+
+        // An XSD 1.0 set's `xs:anyAtomicType`, which only a host reaches: XDM
+        // 1.0 §2.6.2 makes it the base of every primitive atomic type ("All
+        // primitive atomic types … have xs:anyAtomicType as their base type"),
+        // while the {base type definition} of a 1.0 primitive stays
+        // `xs:anySimpleType`. So every atomic type derives from it, by
+        // restriction steps only (a list or union type does not, nor does
+        // `xs:anySimpleType`).
+        if builtin.is_detached_any_atomic_type(base) {
+            return !exclude_methods.contains(DerivationSet::RESTRICTION)
+                && self.is_atomic_simple_type(derived);
+        }
+
         let mut current = derived;
         let mut visited = std::collections::HashSet::new();
 
@@ -912,6 +984,19 @@ impl SchemaSet {
         }
 
         false
+    }
+
+    /// Whether `key` is an atomic simple type: atomic variety and not
+    /// `xs:anySimpleType` (whose built-in component carries the atomic
+    /// variety). A restriction of a list or union type inherits its base's
+    /// variety when references are resolved.
+    fn is_atomic_simple_type(&self, key: SimpleTypeKey) -> bool {
+        key != self.builtin_types().any_simple_type
+            && self
+                .arenas
+                .simple_types
+                .get(key)
+                .is_some_and(|def| def.variety == crate::parser::frames::SimpleTypeVariety::Atomic)
     }
 
     /// Check if complex type `derived` is derived from complex type `base` with method filtering.

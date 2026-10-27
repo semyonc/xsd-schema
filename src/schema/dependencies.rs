@@ -457,6 +457,8 @@ fn is_builtin_simple_type(
         || (builtin.day_time_duration == Some(key))
         || (builtin.datetime_stamp == Some(key))
         || (builtin.untyped_atomic == Some(key))
+        // The XPath 2.0 data model's types an XSD 1.0 set has for a host
+        || builtin.is_xpath_type(key)
 }
 
 /// Check if a type key refers to a built-in type
