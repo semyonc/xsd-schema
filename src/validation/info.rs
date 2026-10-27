@@ -152,6 +152,12 @@ bitflags! {
         /// unaffected. The only observable change is that `typed_value` /
         /// `normalized_value` may be `None` on the returned `SchemaInfo` for
         /// nodes whose value nothing else needed. See `PERF_LAZY_PSVI.md`.
+        ///
+        /// `SchemaInfo::typed_value` is kept, whatever this bit says, for an
+        /// element that took its declaration's `default` / `fixed` value and
+        /// for elements and attributes whose type is or can hold `xs:ID`,
+        /// `xs:IDREF`, `xs:QName` or `xs:NOTATION` values (derived, list and
+        /// union types included): see [`SchemaInfo::typed_value`].
         const BUILD_PSVI_TYPED_VALUES = 0x0020;
         /// Put the types the XPath 2.0 data model adds to the XML Schema
         /// namespace (XDM 1.0 §2.6.2) in scope for `xsi:type` where the set's
@@ -362,9 +368,46 @@ pub struct SchemaInfo {
     pub is_nil: bool,
     /// Content type of the element (Empty, TextOnly, ElementOnly, Mixed)
     pub content_type: Option<ContentType>,
-    /// The parsed typed value from simple-type validation
+    /// The typed value from simple-type validation — the node's \[schema
+    /// actual value\] (Structures §3.3.5.4, §3.2.5.2). `None` when it has none:
+    /// no simple type or simple content, a value that is not valid, a
+    /// ·nilled· element; and for an element's start and end of attributes.
+    /// An `xs:QName` / `xs:NOTATION` in it holds its expanded name, read with
+    /// the bindings in scope at the node — or, for an element that took its
+    /// declaration's value constraint, with those of the schema element the
+    /// value is written on (the {value}; see
+    /// [`SchemaSet::element_value_constraint_for_type`](crate::SchemaSet::element_value_constraint_for_type),
+    /// which gives it before the element's content).
+    ///
+    /// **Kept without PSVI retention.** With
+    /// [`ValidationFlags::BUILD_PSVI_TYPED_VALUES`] cleared the runtime may
+    /// leave this `None` for a node whose value nothing needed, but never for
+    /// the following — for them it is what it is with the flag set:
+    ///
+    /// - an element that took its declaration's `default` / `fixed` value
+    ///   ([`is_default`](Self::is_default); §3.3.4.3 clause 5.1), whatever its
+    ///   type;
+    /// - an element or attribute whose type's values are or can hold `xs:ID`,
+    ///   `xs:IDREF`, `xs:QName` or `xs:NOTATION` values: a type derived from
+    ///   one of them, a list type with such items (`xs:IDREFS` included), a
+    ///   union with such a member type, a complex type with such simple
+    ///   content.
+    ///
+    /// That holds wherever the runtime hands out a `SchemaInfo` for an
+    /// element's end or an attribute: the push API
+    /// ([`validate_end_element`](crate::validation::ValidationRuntime::validate_end_element),
+    /// [`validate_attribute`](crate::validation::ValidationRuntime::validate_attribute),
+    /// and in XSD 1.1 the results of `take_deferred_attribute_results`) and
+    /// the
+    /// [`after_attribute`](crate::validation::ValidationEventHandler::after_attribute)
+    /// hook of the streaming drivers.
     pub typed_value: Option<XmlValue>,
-    /// The whitespace-normalized value (PSVI `[schema normalized value]`)
+    /// The whitespace-normalized value (PSVI `[schema normalized value]`).
+    /// For an element that took its declaration's value constraint
+    /// ([`is_default`](Self::is_default)), the constraint's {lexical form}
+    /// (Structures §3.3.5.4 clause 1.1), also under an `xsi:type` or a type
+    /// alternative — see
+    /// [`ElementValueConstraint::lexical_form`](crate::schema::ElementValueConstraint::lexical_form).
     pub normalized_value: Option<String>,
     /// Constraint codes from validation errors on this node (PSVI `[schema error code]`)
     pub schema_error_codes: Vec<&'static str>,

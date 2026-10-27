@@ -15,6 +15,7 @@
 //! - `derivation` - Type derivation validation
 //! - `redefine` - xs:redefine processing
 //! - `override_dir` - xs:override processing (XSD 1.1)
+//! - `value_constraint` - an element declaration's {value constraint} for hosts
 
 pub mod annotation;
 pub mod composition;
@@ -33,6 +34,7 @@ pub(crate) mod nesting;
 pub mod override_dir;
 pub mod redefine;
 pub mod resolver;
+pub mod value_constraint;
 pub mod wildcard;
 
 // Re-exports from model
@@ -47,6 +49,9 @@ pub use decl::{
     AttributeDecl, DeclarationScope, ElementDecl, FormKind, NotationDecl, TypeReference,
     ValueConstraint,
 };
+
+// Re-exports from value_constraint
+pub use value_constraint::{ElementValueConstraint, ValueConstraintVariety};
 
 // Re-exports from group
 pub use group::{AttributeGroupDef, AttributeGroupRef, ModelGroupDef, ModelGroupRef, Occurrence};

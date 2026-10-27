@@ -4349,6 +4349,10 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             ) {
                 ev_state.text_content.push_str(text);
                 ev_state.has_text = true;
+            } else if !text.is_empty() {
+                // White space is character [children] too: an element that has
+                // them takes no value constraint (§3.3.4.3 clause 5.1).
+                ev_state.has_text = true;
             }
         }
 
@@ -4600,6 +4604,89 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         }
     }
 
+    /// Clause 5.1.1 of Element Locally Valid (Element) (§3.3.4.3) for an
+    /// element whose governing type an `xsi:type` gave and whose content is
+    /// empty or element-only: "If E's ·governing type definition· is an
+    /// ·instance-specified type definition·, then D.{value constraint} is a
+    /// valid default for the ·governing type definition· as defined in
+    /// Element Default Valid (Immediate) (§3.3.6.2)", whose clause 2 requires
+    /// "2.1 T.{content type}.{variety} = mixed. 2.2 The particle T.{content
+    /// type}.{particle} is ·emptiable·". Clause 5.1 applies only to an element
+    /// with "neither element nor character [children]" that is not ·nilled·.
+    /// (Mixed content without an emptiable particle fails the content model
+    /// of the element, which has no children, `cvc-complex-type.2.4`.)
+    fn check_default_for_complex_override(&mut self, ev_state: &mut ElementValidationState) {
+        if ev_state.is_nil
+            || ev_state.has_text
+            || ev_state.has_element_children
+            || ev_state.type_source != Some(TypeSource::XsiType)
+            || !matches!(
+                ev_state.content_type,
+                Some(ContentType::Empty) | Some(ContentType::ElementOnly)
+            )
+        {
+            return;
+        }
+        let Some(elem_key) = ev_state.element_decl else {
+            return;
+        };
+        let decl = &self.schema_set.arenas.elements[elem_key];
+        let (kind, value) = match (&decl.default_value, &decl.fixed_value) {
+            (Some(value), _) => ("default", value),
+            (None, Some(value)) => ("fixed", value),
+            (None, None) => return,
+        };
+        let elem_name = self.schema_set.name_table.resolve(ev_state.local_name);
+        let err = errors::error(
+            "cvc-elt.5.1.1",
+            format!(
+                "Element '{elem_name}' is empty and takes its {kind} value '{value}', which is \
+                 not a valid default for its xsi:type: a type whose content is neither simple \
+                 nor mixed"
+            ),
+            self.current_location.clone(),
+        );
+        self.report_validation_error_to(err, &mut ev_state.error_codes);
+        ev_state.validity = SchemaValidity::Invalid;
+    }
+
+    /// Clause 5.1.1 for a simple governing type an `xsi:type` gave: Simple
+    /// Default Valid (§3.2.6.2) "2 V.{lexical form} maps to V.{value} in the
+    /// value space of T" — the element's value (its typed value, read from
+    /// the {lexical form} under the governing type) is equal or identical to
+    /// the declaration's {value}. Not compared when the declared type has no
+    /// value space of its own (`xs:anySimpleType`: an untyped {value}), or
+    /// when the {value} is not known (the schema is then in error).
+    fn check_default_maps_to_value(&mut self, ev_state: &mut ElementValidationState) {
+        let (Some(elem_key), Some(value)) = (ev_state.element_decl, ev_state.typed_value.as_ref())
+        else {
+            return;
+        };
+        let Some(record) = self.schema_set.element_value_constraint(elem_key) else {
+            return;
+        };
+        let Some(declared) = record.typed_value.as_ref() else {
+            return;
+        };
+        if declared.type_code == XmlTypeCode::UntypedAtomic
+            || super::simple::typed_values_equal(declared, value)
+        {
+            return;
+        }
+        let elem_name = self.schema_set.name_table.resolve(ev_state.local_name);
+        let err = errors::error(
+            "cvc-elt.5.1.1",
+            format!(
+                "Element '{elem_name}' is empty and takes the value '{}', which its xsi:type \
+                 reads as another value than the declaration's",
+                record.lexical_form
+            ),
+            self.current_location.clone(),
+        );
+        self.report_validation_error_to(err, &mut ev_state.error_codes);
+        ev_state.validity = SchemaValidity::Invalid;
+    }
+
     /// F2/B1 step 2: simple-content / text validation.
     ///
     /// For text-only content: substitute default/fixed for an empty element,
@@ -4607,16 +4694,22 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     /// check, and verify any fixed value (cvc-elt.5.2.2). Also enforces the
     /// mixed-content fixed-value rules (cvc-elt.5.2.2.1 / 5.2.2.2.1).
     fn finish_simple_content(&mut self, ev_state: &mut ElementValidationState) {
+        // Clause 5.1.1 for a governing type without simple content.
+        self.check_default_for_complex_override(ev_state);
         // 2. For TextOnly: validate text content against simple type
         if ev_state.content_type == Some(ContentType::TextOnly) && !ev_state.is_nil {
             // Clause 5.1: an empty element takes its value constraint; the
             // fixed-value comparison of clause 5.2.2 is then not made.
             let mut substituted_fixed = false;
+            // Whether another type than the declared one governs the element
+            // that takes its value constraint (`xsi:type`, a type alternative).
+            let mut overridden = false;
             // Handle default value before validation: if the element has no text
             // content and has a default, substitute the default value so that
             // simple-type validation runs against it (not the empty string).
             if let Some(elem_key) = ev_state.element_decl {
-                let elem_data = &self.schema_set.arenas.elements[elem_key];
+                let schema_set: &'a SchemaSet = self.schema_set;
+                let elem_data = &schema_set.arenas.elements[elem_key];
                 if !ev_state.has_text && !ev_state.has_element_children {
                     if let Some(default_value) = &elem_data.default_value {
                         ev_state.is_default = true;
@@ -4629,6 +4722,22 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                         ev_state.is_default = true;
                         ev_state.text_content = fixed_value.clone();
                         substituted_fixed = true;
+                    }
+                    // Clause 5.1.2: "The element information item with D.{value
+                    // constraint}.{lexical form} used as its ·normalized value·
+                    // is locally ·valid· with respect to the ·governing type
+                    // definition·". Under the declared type the attribute as
+                    // written normalizes to that form; under another type the
+                    // form itself is read (its white space may differ: a union
+                    // member's, `xs:anySimpleType`'s).
+                    let declared = elem_data
+                        .resolved_type
+                        .unwrap_or_else(|| TypeKey::Complex(schema_set.any_type_key()));
+                    if ev_state.is_default && ev_state.schema_type != Some(declared) {
+                        if let Some(lexical) = schema_set.value_constraint_lexical_form(elem_data) {
+                            ev_state.text_content = lexical;
+                            overridden = true;
+                        }
                     }
                 }
             }
@@ -4676,7 +4785,21 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                             self.report_expression_warnings(raised);
                             ev_state.member_type = result.member_type;
                             ev_state.typed_value = Some(result.typed_value);
-                            ev_state.normalized_value = result.normalized_value;
+                            // §3.3.5.4 [schema normalized value] clause 1.1:
+                            // "If clause 5.1 … has applied, then the {lexical
+                            // form} of the {value constraint}" — the form read
+                            // above under another type, else the attribute
+                            // normalized for the declared type (as written for
+                            // `xs:anySimpleType`, which normalizes nothing).
+                            ev_state.normalized_value = if overridden {
+                                Some(ev_state.text_content.clone())
+                            } else if ev_state.is_default {
+                                result
+                                    .normalized_value
+                                    .or_else(|| Some(ev_state.text_content.clone()))
+                            } else {
+                                result.normalized_value
+                            };
 
                             // QName/NOTATION prefix-binding check (Datatypes
                             // §3.3.18 / §3.3.19): the simple-type validator
@@ -4775,6 +4898,18 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                         }
                     }
                 }
+            }
+
+            // Clause 5.1.1: under an ·instance-specified type definition· the
+            // value constraint must be a valid default for it (Element Default
+            // Valid (Immediate), §3.3.6.2, clause 1: Simple Default Valid,
+            // §3.2.6.2) — its {lexical form}, valid above, also "maps to
+            // V.{value} in the value space of T".
+            if overridden
+                && ev_state.type_source == Some(TypeSource::XsiType)
+                && ev_state.validity == SchemaValidity::Valid
+            {
+                self.check_default_maps_to_value(ev_state);
             }
 
             // Check fixed value on element — cvc-elt.5.2.2.2.2 (§3.3.4.3).

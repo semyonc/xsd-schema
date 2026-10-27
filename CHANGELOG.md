@@ -369,6 +369,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ValidationFlags::XPATH_TYPES`: an `xsi:type` may name those types where the
   set's XSD version does not define them.
 
+- `SchemaSet::element_value_constraint` and
+  `SchemaSet::element_value_constraint_for_type`: an element declaration's
+  {value constraint} — its variety (`default` / `fixed`), its {lexical form}
+  and its {value}, with `xs:QName` / `xs:NOTATION` values read with the
+  namespace bindings of the schema element the value is written on (Structures
+  §3.3.2.1, Datatypes §3.3.18). Under a governing type (`xsi:type`, an XSD 1.1
+  type alternative) the second gives the {lexical form} read under that type —
+  what validation reports as `SchemaInfo::typed_value` when an empty element
+  takes the value — and whether the value constraint is a valid default for
+  the type (Element Default Valid (Immediate), required for an `xsi:type`). A
+  host that builds and validates an element can now declare the prefixes such
+  a value needs on the start tag. New types `schema::ElementValueConstraint`,
+  `schema::ValueConstraintVariety`.
+
 ### Changed
 
 - The regular-expression engine of the `xsd11` feature is now `regexml-fork`
@@ -615,6 +629,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   become name tests (`self::my:e`) or checks of built-in types. Node type
   annotations still count: a node of a user type derived from `xs:integer`
   matches `element(*, xs:integer)`.
+
+- Documented: `SchemaInfo::typed_value` is kept whatever
+  `ValidationFlags::BUILD_PSVI_TYPED_VALUES` says for an element that took its
+  declaration's `default` / `fixed` value and for elements and attributes
+  whose type is or can hold `xs:ID`, `xs:IDREF`, `xs:QName` or `xs:NOTATION`
+  values.
 
 ### Deprecated
 
@@ -938,6 +958,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `xs:dayTimeDuration` and `xs:yearMonthDuration` accepted literals that are
   not durations (`PT`, `P1DT`, `P+1D`, `P+1Y`) and, for the constructor
   functions, the same.
+
+- An empty element that takes its declaration's `default` / `fixed` value
+  under an `xsi:type` or a type alternative is validated with the value
+  constraint's {lexical form} (Structures §3.3.4.3 clause 5.1.2), as under the
+  declared type: a union whose accepting member collapses white space no
+  longer hands the overriding type the value as written. Its
+  `SchemaInfo::normalized_value` is the {lexical form}, also for
+  `xs:anySimpleType`, and the typed document writes it.
+- Clause 5.1.1 is checked: an empty element whose `xsi:type` has empty or
+  element-only content, or reads the default as another value than the
+  declaration's, is invalid (`cvc-elt.5.1.1`).
 
 ### Performance
 

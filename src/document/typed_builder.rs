@@ -709,31 +709,42 @@ impl<'b, 'a, H> TypedBuilderHandler<'b, 'a, H> {
 
     /// The `default` / `fixed` value of the open element's declaration, if
     /// it has one (the default first, as validation takes it), with the
-    /// schema element it is written on.
-    fn declared_default(
-        &self,
-    ) -> Option<(&'a str, Option<&'a crate::parser::location::SourceRef>)> {
+    /// declaration it is written on.
+    fn declared_default(&self) -> Option<(&'a str, &'a crate::arenas::ElementDeclData)> {
         let decl = (*self.element_decl_stack.last()?)?;
         let element = self.builder.schema_set()?.arenas.elements.get(decl)?;
         let value = element
             .default_value
             .as_deref()
             .or(element.fixed_value.as_deref())?;
-        Some((value, element.source.as_ref()))
+        Some((value, element))
     }
 
-    /// The text an element's value constraint `value` (written on the schema
-    /// element `source`) becomes in the open element: its {lexical form},
-    /// white space normalized for `type_key`, a QName / NOTATION in it written
-    /// again for the instance ([`qname_lexical_in_scope`]).
+    /// The text an element's value constraint `value` (of the declaration
+    /// `decl`) becomes in the open element whose governing type is
+    /// `type_key`: its {lexical form} — under a type other than the declared
+    /// one the form itself, as validation reads it (Structures §3.3.4.3
+    /// clause 5.1.2) —, white space normalized for `type_key`, a QName /
+    /// NOTATION in it written again for the instance
+    /// ([`qname_lexical_in_scope`]).
     ///
     /// [`qname_lexical_in_scope`]: Self::qname_lexical_in_scope
     fn default_text(
         &mut self,
         value: &str,
-        source: Option<&crate::parser::location::SourceRef>,
+        decl: &'a crate::arenas::ElementDeclData,
         type_key: crate::ids::TypeKey,
     ) -> Result<String, BufferDocumentError> {
+        let source = decl.source.as_ref();
+        let overridden = self.builder.schema_set().and_then(|schema_set| {
+            let declared = decl
+                .resolved_type
+                .unwrap_or_else(|| crate::ids::TypeKey::Complex(schema_set.any_type_key()));
+            (declared != type_key)
+                .then(|| schema_set.value_constraint_lexical_form(decl))
+                .flatten()
+        });
+        let value = overridden.as_deref().unwrap_or(value);
         let mode = self.whitespace(type_key);
         let lexical = self
             .normalized(value, type_key, mode)
@@ -895,8 +906,8 @@ impl<'b, 'a, H> TypedBuilderHandler<'b, 'a, H> {
                 if valid && self.builder.has_only_pending_text() {
                     let mode = self.whitespace(type_key);
                     match default(self, saw_text) {
-                        Some((value, source)) => {
-                            let text = self.default_text(value, source, type_key)?;
+                        Some((value, decl)) => {
+                            let text = self.default_text(value, decl, type_key)?;
                             self.builder.replace_pending_text(&text);
                         }
                         None => {
@@ -919,9 +930,9 @@ impl<'b, 'a, H> TypedBuilderHandler<'b, 'a, H> {
                     // text was (or first, for a default); the comments and
                     // instructions in their order.
                     let text: String = match default(self, saw_text) {
-                        Some((value, source)) => {
+                        Some((value, decl)) => {
                             held.insert(0, HeldContent::Text(String::new()));
-                            self.default_text(value, source, type_key)?
+                            self.default_text(value, decl, type_key)?
                         }
                         None => held
                             .iter()
