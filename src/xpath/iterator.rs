@@ -48,10 +48,25 @@ impl<N: DomNavigator> XmlItem<N> {
         }
     }
 
-    /// Try to extract a string from an atomic item.
-    pub fn as_str(&self) -> Option<String> {
+    /// The string of an atomic item that holds one — `xs:string`, a type
+    /// derived from it, or `xs:untypedAtomic` — copied into a new `String`;
+    /// `None` for a node or an atomic value of another type (nothing is
+    /// converted, as with [`XPathValue::to_owned_string`]).
+    ///
+    /// [`XPathValue::to_owned_string`]: crate::xpath::functions::XPathValue::to_owned_string
+    pub fn to_owned_string(&self) -> Option<String> {
         self.as_atomic()
-            .and_then(|v| v.as_string().map(|s| s.to_string()))
+            .and_then(|v| v.as_string().map(str::to_owned))
+    }
+
+    /// The same as [`to_owned_string`](Self::to_owned_string), under a name
+    /// that suggests a borrow: the string is copied.
+    #[deprecated(
+        since = "0.3.0",
+        note = "returns an owned `String`, not a borrow; use `to_owned_string`"
+    )]
+    pub fn as_str(&self) -> Option<String> {
+        self.to_owned_string()
     }
 
     /// Try to extract a boolean from an atomic item.
@@ -629,6 +644,27 @@ mod tests {
         match iter.current() {
             Some(XmlItemRef::Atomic(value)) => value.as_integer().expect("integer value").clone(),
             _ => panic!("expected integer value"),
+        }
+    }
+
+    /// `XmlItem::to_owned_string` copies the string of a string-typed or
+    /// untyped atomic item, and is `None` for any other item; the deprecated
+    /// `as_str` answers the same.
+    #[test]
+    #[allow(deprecated)]
+    fn item_to_owned_string_and_its_deprecated_alias() {
+        type Item = XmlItem<RoXmlNavigator<'static>>;
+        let doc = roxmltree::Document::parse("<a>text</a>").unwrap();
+        let cases: Vec<(XmlItem<RoXmlNavigator<'_>>, Option<&str>)> = vec![
+            (Item::Atomic(XmlValue::string("hello")), Some("hello")),
+            (Item::Atomic(XmlValue::untyped("raw")), Some("raw")),
+            (Item::Atomic(XmlValue::integer(42.into())), None),
+            (XmlItem::Node(RoXmlNavigator::new(&doc)), None),
+        ];
+        for (item, expected) in cases {
+            let expected = expected.map(str::to_string);
+            assert_eq!(item.to_owned_string(), expected);
+            assert_eq!(item.as_str(), expected);
         }
     }
 

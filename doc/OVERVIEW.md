@@ -222,10 +222,10 @@ the document that lexically contained it, not any document sharing the same
 `NameTable` interns strings and returns stable `NameId`s. It holds two of the
 crate's `unsafe` blocks (`resolve_ref` / `try_resolve_ref` return `&str` into
 interned data without allocating, so `DomNavigator` methods don't need to
-allocate). Another lives in `ValidationRuntime::begin_assertion_buffering`,
+allocate). The third lives in `ValidationRuntime::begin_assertion_buffering`,
 which extends the lifetime of a `Bump` arena borrow used by the
-self-referential fragment builder, and one in `DynamicContext::eval_function`.
-Every site and its contract is listed in `doc/UNSAFE.md`.
+self-referential fragment builder. Every site and its contract is listed in
+`doc/UNSAFE.md`.
 
 ---
 
@@ -454,7 +454,8 @@ source-agnostic, so either driver works:
 - *Re-walk a single parse* (`xsd11`): parse the instance once into a
   `BufferDocument`, then validate it against the original and enriched sets by
   re-walking the in-memory tree with `drive_navigator` /
-  `drive_buffer_document` (`src/validation/navigator_driver.rs`). The
+  `drive_buffer_document` (`src/validation/navigator_driver.rs`), iteratively,
+  so a tree of any depth costs heap, not stack. The
   tree-walk driver emits the same push-API sequence as the streaming driver
   (same `NamespaceContextSnapshot`, `xsi:*` discovery, whitespace/character
   split), so both passes produce identical diagnostics from one parse. See
@@ -638,7 +639,10 @@ DOM implementation, and they should not reimplement type machinery — see the
   checked before it recurses (`ParserConfig::max_depth`, `SchemaSet::max_depth`,
   `xpath::MAX_EXPRESSION_DEPTH`); a walk that does not recurse (the directive
   walk) is bounded in work (`ResolverConfig::max_depth`). New recursive passes
-  must sit behind one of them.
+  must sit behind one of them. Walks over an instance tree do not recurse at
+  all — the streaming and tree-walk drivers, `fn:deep-equal` / `TreeComparer`,
+  the copy and the serializer keep their depth on the heap — because a tree a
+  host builds is bounded by no limit; new ones must not recurse either.
 - **Diagnostics are deterministic**: the error a schema or an instance is
   refused with does not vary from run to run — no hash order decides which
   component is checked first, which competing pair `cos-nonambig` names (the
@@ -674,4 +678,4 @@ DOM implementation, and they should not reimplement type machinery — see the
 | Identity constraints | `src/validation/identity.rs` | `src/validation/active_axis.rs`, `src/validation/identity_parser.rs` |
 | XSD 1.1 assertions | `src/validation/assertions.rs` | `src/document/`, `src/xpath/` |
 | XPath engine work | `src/xpath/` | `src/navigator/`, `src/document/` |
-| Unsafe-code review | `doc/UNSAFE.md` | `src/namespace/table.rs`, `src/validation/runtime.rs`, `src/xpath/context.rs` |
+| Unsafe-code review | `doc/UNSAFE.md` | `src/namespace/table.rs`, `src/validation/runtime.rs` |

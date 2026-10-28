@@ -240,7 +240,7 @@ fn eval_xpath(expr: &str) -> Result<XPathValue<RoXmlNavigator<'static>>, XPathEr
 #[test]
 fn test_parse_bind_eval_concat() {
     let result = eval_xpath("concat('a', 'b')").unwrap();
-    assert_eq!(result.as_str(), Some("ab".to_string()));
+    assert_eq!(result.to_owned_string(), Some("ab".to_string()));
 }
 
 #[test]
@@ -255,13 +255,13 @@ fn test_parse_bind_eval_string_length() {
 #[test]
 fn test_parse_bind_eval_substring() {
     let result = eval_xpath("substring('hello', 2, 3)").unwrap();
-    assert_eq!(result.as_str(), Some("ell".to_string()));
+    assert_eq!(result.to_owned_string(), Some("ell".to_string()));
 }
 
 #[test]
 fn test_parse_bind_eval_upper_case() {
     let result = eval_xpath("upper-case('hello')").unwrap();
-    assert_eq!(result.as_str(), Some("HELLO".to_string()));
+    assert_eq!(result.to_owned_string(), Some("HELLO".to_string()));
 }
 
 #[test]

@@ -517,3 +517,24 @@ use xsd_schema::validation::ValidationFlags;
 let flags = ValidationFlags::default(); // identity constraints included
 # let _ = flags;
 ```
+
+`XPathValue::as_str` and `XmlItem::as_str` are deprecated: they return an
+owned `Option<String>` — a copy of the string of a single `xs:string` or
+`xs:untypedAtomic` item — not the borrow the name suggests. `as_str` →
+`to_owned_string`, which returns the same.
+
+```rust,ignore
+// 0.2.x
+let name = args.remove(0).as_str().unwrap_or_default();
+```
+
+```rust
+# #[cfg(feature = "xsd11")] {
+use xsd_schema::xpath::functions::XPathValue;
+use xsd_schema::xpath::RoXmlNavigator;
+
+let mut args: Vec<XPathValue<RoXmlNavigator<'static>>> = vec![XPathValue::string("World")];
+let name = args.remove(0).to_owned_string().unwrap_or_default();
+assert_eq!(name, "World");
+# }
+```

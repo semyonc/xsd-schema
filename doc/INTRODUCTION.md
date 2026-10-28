@@ -657,7 +657,7 @@ there is a tree-walk driver that re-validates an already-parsed document:
 | Driver | Module | Use when |
 | --- | --- | --- |
 | `drive_quick_xml` | `validation::quick_xml_driver` | Streaming from bytes/reader. For two-pass enrichment, call it again over the same bytes — simple, but parses the instance twice. |
-| `drive_navigator` | `validation::navigator_driver` | Re-validate any `DomNavigator` tree (works with `RoXmlNavigator` without `xsd11`). Emits the *same* push-API sequence as the streaming driver. |
+| `drive_navigator` | `validation::navigator_driver` | Re-validate any `DomNavigator` tree (works with `RoXmlNavigator` without `xsd11`). Emits the *same* push-API sequence as the streaming driver. Walks iteratively: a tree of any depth costs heap, not stack. |
 | `drive_buffer_document` | `validation::navigator_driver` (`xsd11`) | Convenience wrapper of `drive_navigator` for a `BufferDocument`. |
 
 The tree-walk drivers read no text: well-formedness is the business of the

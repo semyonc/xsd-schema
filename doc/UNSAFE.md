@@ -1,13 +1,12 @@
 # Unsafe Code
 
-The library contains four `unsafe` blocks, in three places; the tests one more.
+The library contains three `unsafe` blocks, in two places; the tests one more.
 This list is complete: `grep -rnw unsafe src` finds no other.
 
 | # | Where | What |
 | --- | --- | --- |
 | 1 | `src/namespace/table.rs`, `NameTable::resolve_ref` and `try_resolve_ref` | `&str` into interned names without a `RefCell` guard |
 | 2 | `src/validation/runtime.rs`, `begin_assertion_buffering` | the self-referential fragment builder of assertion buffering |
-| 3 | `src/xpath/context.rs`, `DynamicContext::eval_function` | a re-borrow of the context's function evaluator |
 | — | `src/types/mod.rs`, test `test_xml_type_code_roundtrip` | `transmute` of `u8` to `XmlTypeCode` (`#[cfg(test)]` only) |
 
 ## 1. NameTable::resolve_ref / try_resolve_ref
@@ -47,26 +46,6 @@ XSD 1.1 assertion buffering during streaming validation.
 - `Bump` uses interior mutability; builder holds `&Bump`, not `&mut Bump`.
 - `ValidationRuntime` is `!Send + !Sync`.
 
-## 3. DynamicContext::eval_function
-
-**File**: `src/xpath/context.rs`
-
-`eval_function(&mut self, handle, args)` calls the context's custom
-`FunctionEvaluator`, which takes the context mutably. The evaluator is held as
-`Option<&'a dyn FunctionEvaluator<N>>`; the block turns that reference into a
-raw pointer and back before the call.
-
-**Safety invariants**:
-
-- The pointer is made from a `&'a dyn FunctionEvaluator<N>` the context holds
-  and is dereferenced once, within the same call, as a shared reference: no
-  lifetime is extended, and nothing is mutated through it.
-- The evaluator lives outside the context — the context holds only a
-  reference to it — so the shared reference and the `&mut DynamicContext`
-  passed to `eval` do not alias.
-- The reference is `Copy` with the lifetime `'a`, so a plain copy would do the
-  same; the block is a candidate for removal.
-
 ## Test code
 
 **File**: `src/types/mod.rs`, `test_xml_type_code_roundtrip` (`#[cfg(test)]`)
@@ -79,6 +58,15 @@ built-in types. Sound because `XmlTypeCode` is `#[repr(u8)]` and every value
 
 ```bash
 cargo +nightly miri test --lib namespace::table::tests
-cargo +nightly miri test --lib
-cargo +nightly miri test --lib --features xsd11
+MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test --lib --features xsd11 \
+    validation::runtime::tests::assertion_runtime_tests
+MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test --lib --features xsd11 \
+    types::tests::test_xml_type_code_roundtrip
 ```
+
+The first covers block 1, the second block 2, the third the test-only
+`transmute`. `-Zmiri-disable-isolation` lets the XPath engine read the clock
+(`fn:current-dateTime`), which an isolated Miri refuses. The whole library
+can run under Miri as well (`cargo +nightly miri test --lib`, with
+`--features xsd11` and the flag above), but slowly: the 23 assertion tests
+alone take minutes.

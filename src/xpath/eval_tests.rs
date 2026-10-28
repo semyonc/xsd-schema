@@ -2121,13 +2121,13 @@ mod integration_tests {
     #[test]
     fn test_parse_bind_eval_if_expression() {
         let result = eval_xpath("if (true()) then 'yes' else 'no'").unwrap();
-        assert_eq!(result.as_str(), Some("yes".to_string()));
+        assert_eq!(result.to_owned_string(), Some("yes".to_string()));
     }
 
     #[test]
     fn test_parse_bind_eval_nested_functions() {
         let result = eval_xpath("upper-case(concat('a', 'b'))").unwrap();
-        assert_eq!(result.as_str(), Some("AB".to_string()));
+        assert_eq!(result.to_owned_string(), Some("AB".to_string()));
     }
 
     #[test]

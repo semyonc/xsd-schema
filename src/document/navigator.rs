@@ -2118,7 +2118,7 @@ mod tests {
         );
         let result =
             eval(&names, doc.create_navigator(), "string(id(' id3')/title)").expect("evaluates");
-        assert_eq!(result.as_str().as_deref(), Some("Expressions"));
+        assert_eq!(result.to_owned_string().as_deref(), Some("Expressions"));
     }
 
     /// F&O §15.5.2: an is-id node whose value is not a lexical `xs:ID` "will
@@ -2222,7 +2222,7 @@ mod tests {
             "string-join(id('dup'), '|')",
         )
         .expect("evaluates");
-        assert_eq!(result.as_str().as_deref(), Some("first"));
+        assert_eq!(result.to_owned_string().as_deref(), Some("first"));
     }
 
     // ── 13. Virtual parent ───────────────────────────────────────────
@@ -2764,7 +2764,7 @@ mod tests {
             "string(name(id('k')))",
         )
         .expect("evaluates");
-        assert_eq!(result.as_str().as_deref(), Some("leaf"));
+        assert_eq!(result.to_owned_string().as_deref(), Some("leaf"));
     }
 
     /// The same for a parentless node: the orphan's own tree holds `inside`,

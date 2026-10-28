@@ -1141,6 +1141,6 @@ mod tests {
         let handle = FunctionHandle::from(FunctionId::String);
 
         let result = evaluator.eval(handle, &mut dyn_ctx, args).unwrap();
-        assert_eq!(result.as_str(), Some("first".to_string()));
+        assert_eq!(result.to_owned_string(), Some("first".to_string()));
     }
 }

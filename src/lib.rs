@@ -30,6 +30,18 @@
 //! | Validate and build a typed document in one pass (`xsd11`) | `document::build_typed_document_with`, `document::TypedBuildOptions` |
 //! | Evaluate XPath 2.0 (`xsd11`) | `xpath::XPathExpr`, `xpath::XPathContext` |
 //!
+//! # Cargo Features
+//!
+//! Every feature is additive. This documentation is built with all of them,
+//! so it shows items a default build does not have:
+//!
+//! | Feature | Default | Adds |
+//! | --- | --- | --- |
+//! | `xsd11` | no | XSD 1.1 (assertions, type alternatives, open content), the XPath 2.0 engine (`xpath`), the document store and its typed build (`document`), `drive_buffer_document` |
+//! | `compose` | no | XQuery-style composition of XML from Rust (`compose`, the `form!` and `xpath!` macros); implies `xsd11` |
+//! | `async` | no | asynchronous schema loading: `AsyncSchemaLoader`, `SchemaSetBuilder::with_async_loader`, `add_async` and `compile_async`, `load_and_process_schema_async`, `load_schema_async` |
+//! | `unicode-normalization` | yes | the normalization forms of `fn:normalize-unicode` (without it, a call that asks for one, the one-argument form included, raises an error) |
+//!
 //! ## Single Schema
 //!
 //! Use [`load_and_process_schema`] for complete processing of a single schema.

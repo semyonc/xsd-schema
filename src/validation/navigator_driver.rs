@@ -12,11 +12,17 @@
 //! 2. `validate_attribute` for each non-`xmlns` attribute, in document order
 //! 3. `validate_end_of_attributes` (+ `take_deferred_attribute_results` under
 //!    `xsd11`, drained to mirror the streaming driver)
-//! 4. body: `validate_text` / `validate_whitespace` per text node, recurse for
-//!    child elements
+//! 4. body: `validate_text` / `validate_whitespace` per text node, steps 1–5
+//!    for each child element in its place
 //! 5. `validate_end_element`
 //!
 //! and finally `validate_end_validation` once via `end_validation`.
+//!
+//! The walk is iterative — descending into a child element moves the cursor,
+//! it does not call — so a tree of any depth is walked on any thread: its depth
+//! costs heap, in the runtime's element stack, not stack. A tree the host
+//! builds itself is bounded by no parse limit; one parsed from text by the
+//! limits of whatever parsed it.
 //!
 //! # Why
 //!
@@ -70,6 +76,12 @@ use crate::validation::validator::ValidationSink;
 /// Comments and processing instructions are ignored, matching the turn-key
 /// streaming driver.
 ///
+/// The walk is iterative, so the tree may be of any depth whatever the
+/// thread's stack: each open element costs heap in the runtime, as it does in
+/// the streaming driver. No depth limit applies to the walk; a host that wants
+/// one bounds the trees it builds or parses (for text,
+/// [`ParseLimits::max_depth`](crate::xml::ParseLimits::max_depth)).
+///
 /// Returns the [`DriveOutcome`] (root validity + maximum element depth). The
 /// only error path is a failing `end_validation`.
 pub fn drive_navigator<N, S>(
@@ -96,7 +108,6 @@ where
                     &mut nav,
                     runtime,
                     schema_set,
-                    1,
                     &mut max_depth,
                     &mut root_validity,
                 );
@@ -130,7 +141,17 @@ where
     drive_navigator(&doc.create_navigator(), runtime, schema_set)
 }
 
-/// Recursively validate the element the cursor is currently positioned on.
+/// Validate the top-level element the cursor is positioned on, and its whole
+/// subtree.
+///
+/// The walk is iterative: it keeps one cursor and the depth of the element
+/// under it, and descending into a child element is a cursor move, not a call,
+/// so the Rust stack does not grow with the depth of the tree — a tree of any
+/// depth costs heap (the runtime's element stack), not stack. The calls into
+/// `runtime` come in document order, exactly as a recursive walk makes them:
+/// an element's start, its attributes and the end of its attributes, then its
+/// content, a child element's whole subtree in its place, then the element's
+/// end.
 ///
 /// On entry and exit `nav` is positioned on the same element node, so the
 /// caller's sibling walk is unaffected.
@@ -138,17 +159,67 @@ fn walk_element<N, S>(
     nav: &mut N,
     runtime: &mut ValidationRuntime<'_, S>,
     schema_set: &SchemaSet,
-    depth: usize,
     max_depth: &mut usize,
     root_validity: &mut Option<SchemaValidity>,
 ) where
     N: DomNavigator,
     S: ValidationSink,
 {
-    if depth > *max_depth {
-        *max_depth = depth;
-    }
+    // The depth of the element under the cursor; the top-level element is 1.
+    let mut depth: usize = 1;
+    'element: loop {
+        // The cursor is on an element that is not open yet.
+        if depth > *max_depth {
+            *max_depth = depth;
+        }
+        open_element(nav, runtime, schema_set);
 
+        // Its content up to its first child element, which is opened next.
+        if nav.move_to_first_child() {
+            loop {
+                if nav.node_type() == DomNodeType::Element {
+                    depth += 1;
+                    continue 'element;
+                }
+                validate_character_data(nav, runtime);
+                if !nav.move_to_next_sibling() {
+                    break;
+                }
+            }
+            nav.move_to_parent();
+        }
+
+        // The cursor is on an element whose content is done: close it, then
+        // go on with the rest of its parent's content, closing the parent too
+        // when that is done, and so on up.
+        loop {
+            // 5. End element. The DOM driver discards every element's PSVI
+            //    except the root's validity, so use the value-free path (no
+            //    per-element SchemaInfo).
+            let end_validity = runtime.validate_end_element_novalue();
+            if depth == 1 {
+                *root_validity = Some(end_validity);
+                return;
+            }
+            while nav.move_to_next_sibling() {
+                if nav.node_type() == DomNodeType::Element {
+                    continue 'element;
+                }
+                validate_character_data(nav, runtime);
+            }
+            nav.move_to_parent();
+            depth -= 1;
+        }
+    }
+}
+
+/// Steps 1–3 for the element the cursor is on: its start, its attributes and
+/// the end of its attributes. The cursor is restored to the element.
+fn open_element<N, S>(nav: &mut N, runtime: &mut ValidationRuntime<'_, S>, schema_set: &SchemaSet)
+where
+    N: DomNavigator,
+    S: ValidationSink,
+{
     // The namespace / attribute scans both restore the cursor to the element,
     // so the element identity can be read as a borrow *after* them — no clone.
     let ns_ctx = build_ns_snapshot(nav, schema_set);
@@ -188,48 +259,27 @@ fn walk_element<N, S>(
     runtime.validate_end_of_attributes_novalue();
     #[cfg(feature = "xsd11")]
     let _ = runtime.take_deferred_attribute_results();
+}
 
-    // 4. Body: text and child elements in document order.
-    if nav.move_to_first_child() {
-        loop {
-            match nav.node_type() {
-                DomNodeType::Element => {
-                    walk_element(
-                        nav,
-                        runtime,
-                        schema_set,
-                        depth + 1,
-                        max_depth,
-                        root_validity,
-                    );
-                }
-                DomNodeType::Text
-                | DomNodeType::Whitespace
-                | DomNodeType::SignificantWhitespace => {
-                    let text = nav.value_ref();
-                    // Classify by content, exactly as the streaming driver
-                    // does, rather than trusting the node-type label.
-                    if text.chars().all(|c| c.is_whitespace()) {
-                        runtime.validate_whitespace(&text);
-                    } else {
-                        runtime.validate_text(&text);
-                    }
-                }
-                // Comments and PIs carry no validation significance.
-                _ => {}
-            }
-            if !nav.move_to_next_sibling() {
-                break;
+/// Step 4 for a content node that is not an element: text is validated as
+/// text or white space, comments and PIs carry no validation significance.
+fn validate_character_data<N, S>(nav: &N, runtime: &mut ValidationRuntime<'_, S>)
+where
+    N: DomNavigator,
+    S: ValidationSink,
+{
+    match nav.node_type() {
+        DomNodeType::Text | DomNodeType::Whitespace | DomNodeType::SignificantWhitespace => {
+            let text = nav.value_ref();
+            // Classify by content, exactly as the streaming driver does,
+            // rather than trusting the node-type label.
+            if text.chars().all(|c| c.is_whitespace()) {
+                runtime.validate_whitespace(&text);
+            } else {
+                runtime.validate_text(&text);
             }
         }
-        nav.move_to_parent();
-    }
-
-    // 5. End element. The DOM driver discards every element's PSVI except the
-    //    root's validity, so use the value-free path (no per-element SchemaInfo).
-    let end_validity = runtime.validate_end_element_novalue();
-    if depth == 1 {
-        *root_validity = Some(end_validity);
+        _ => {}
     }
 }
 

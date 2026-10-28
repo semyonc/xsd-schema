@@ -22,8 +22,10 @@ cargo test --all-targets --features xsd11     # Run ALL tests
 ```bash
 cargo +nightly miri test --lib namespace::table   # NameTable unsafe verification
 cargo +nightly miri test --lib                     # Full lib under Miri
-cargo +nightly miri test --lib --features xsd11    # Full lib + XSD 1.1 under Miri
+MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test --lib --features xsd11   # + XSD 1.1
 ```
+With `xsd11` the XPath engine reads the clock, which isolated Miri refuses; the
+targeted runs per `unsafe` block are in `doc/UNSAFE.md`.
 
 ### Doctests (the guides in `doc/` are doctested):
 ```bash

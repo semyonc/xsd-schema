@@ -387,6 +387,10 @@ See [Upgrading to 0.3](doc/UPGRADING_0_3.md) for every item below with the
 - `TypeTest`, `ItemType::element`, `ItemType::attribute`, and `Display` for
   `ItemType`, `NameTest`, `TypeTest` and the AST sequence types, kind tests and
   QNames.
+- `XPathValue::to_owned_string` and `XmlItem::to_owned_string`: the string of
+  a single atomic item of type `xs:string` (or a type derived from it) or
+  `xs:untypedAtomic`, copied; `None` for any other value. They replace
+  `as_str` (deprecated, below), whose name suggests a borrow.
 
 **Hosts of the XPath data model**
 
@@ -477,6 +481,10 @@ See [Upgrading to 0.3](doc/UPGRADING_0_3.md) for every item below with the
 - XPath 1.0 compatibility mode: general comparisons follow XPath 2.0 §3.5.2
   after atomization. `XPathMode::XPath10`: `number()` reads strings as XPath
   1.0 does (no exponent, `+` or `INF`).
+- `DynamicContext::eval_function` calls the context's function evaluator
+  without `unsafe` code (it turned the evaluator reference into a raw pointer
+  and back). The library has three `unsafe` blocks left, in two places
+  ([Unsafe Code](doc/UNSAFE.md)).
 
 **Schema documents**
 
@@ -683,12 +691,20 @@ See [Upgrading to 0.3](doc/UPGRADING_0_3.md) for every item below with the
 - The guides in `doc/` are compiled and run with the crate's doctests, and
   two are new: [What's New in 0.3](doc/WHATS_NEW.md) and
   [Upgrading to 0.3](doc/UPGRADING_0_3.md).
+- docs.rs builds the documentation with every feature (`all-features = true`),
+  so the asynchronous loading API (`async`: `AsyncSchemaLoader`,
+  `SchemaSetBuilder::compile_async`, `load_and_process_schema_async`, …) is
+  documented there too; it was left out. The crate documentation lists the
+  Cargo features and what each adds.
 
 ### Deprecated
 
 - `ValidationFlags::PROCESS_IDENTITY_CONSTRAINTS`. Identity constraints are
   always enforced — they are part of an element's validity (Structures
   §3.3.4.3 clause 6) — and the bit never had an effect; remove it.
+- `XPathValue::as_str` and `XmlItem::as_str`: they return an owned
+  `Option<String>`, not the borrow the name suggests. Use `to_owned_string`,
+  which returns the same.
 
 ### Fixed
 
@@ -1032,6 +1048,20 @@ See [Upgrading to 0.3](doc/UPGRADING_0_3.md) for every item below with the
 - XSD 1.1 type alternatives see all of the element's attributes, `xsi:type`,
   `xsi:nil` and the schema location hints included (Structures §3.12.4 clause
   1.1.2), and `xml:` attributes accepted under `ALLOW_XML_ATTRIBUTES`.
+
+**Deep instance trees**
+
+- `drive_navigator` and `drive_buffer_document` validate a tree of any depth:
+  the walk is iterative, so an open element costs heap (the runtime's element
+  stack, as in the streaming drivers), not stack. They recursed once per
+  element level, and a tree about 4,800 levels deep overflowed a 2 MiB thread
+  stack in an optimized build (about 2,700 in an unoptimized one) — an abort.
+  A tree a host builds itself is bounded by no parse limit. The runtime sees
+  the same calls in the same order, so diagnostics are unchanged.
+- `fn:deep-equal` and `TreeComparer::deep_equal` / `deep_equal_iter` compare
+  trees of any depth the same way (they overflowed a 2 MiB stack at about
+  1,500 to 2,800 levels in an optimized build); the result and the order of
+  the comparison are unchanged.
 
 **Content models and schema documents**
 

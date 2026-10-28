@@ -63,7 +63,8 @@ area.
 
 - **No stack overflow on deep input.** Schema documents, component chains,
   directive chains and XPath expressions are bounded in nesting and refused
-  with `LimitExceeded` instead of crashing.
+  with `LimitExceeded` instead of crashing; the tree-walk drivers and
+  `fn:deep-equal` walk an instance tree of any depth.
   [Implementation Limits §6](IMPLEMENTATION_LIMITS.md#6-nesting)
 - **Parse limits for instances.** `ParseLimits` bounds depth, names, attributes,
   namespaces, text and nodes before anything is interned.

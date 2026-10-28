@@ -2977,7 +2977,7 @@ mod tests {
             .evaluator(&ctx)
             .run_with_node(doc.create_navigator())
             .unwrap();
-        assert_eq!(result.as_str().as_deref(), Some("a|b"));
+        assert_eq!(result.to_owned_string().as_deref(), Some("a|b"));
     }
 
     // ── xml:id registration ───────────────────────────────────────────

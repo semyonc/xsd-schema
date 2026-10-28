@@ -199,13 +199,15 @@ fn the_default_collation_is_codepoint_and_survives_being_set_explicitly() {
 fn fn_default_collation_returns_the_static_context_property() {
     let resolver = Recording::default();
     assert_eq!(
-        eval(&resolver, "default-collation()").unwrap().as_str(),
+        eval(&resolver, "default-collation()")
+            .unwrap()
+            .to_owned_string(),
         Some(CODEPOINT_COLLATION_URI.to_string())
     );
     assert_eq!(
         eval_caseless(&resolver, "default-collation()")
             .unwrap()
-            .as_str(),
+            .to_owned_string(),
         Some(CASELESS.to_string())
     );
     // Reading the property never asks the resolver for anything.
@@ -462,7 +464,7 @@ fn a_collation_without_collation_units_still_serves_the_ordering_functions() {
         Some(true)
     );
     assert_eq!(
-        order_only("min(('B', 'a'))").unwrap().as_str(),
+        order_only("min(('B', 'a'))").unwrap().to_owned_string(),
         Some("a".into())
     );
     assert_eq!(
@@ -537,7 +539,7 @@ fn render(value: &XPathValue<Nav>) -> String {
     match value {
         XPathValue::Empty => String::new(),
         XPathValue::Item(XmlItem::Atomic(atom)) => atom.to_string_value(),
-        other => other.as_str().unwrap_or_default(),
+        other => other.to_owned_string().unwrap_or_default(),
     }
 }
 

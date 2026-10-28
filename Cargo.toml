@@ -11,9 +11,11 @@ keywords = ["xsd", "xml", "schema", "validation", "xpath"]
 categories = ["parser-implementations", "data-structures"]
 
 [package.metadata.docs.rs]
-# Build docs with the full feature set so XPath, XSD 1.1 and composition APIs
-# are documented (`compose` implies `xsd11`).
-features = ["compose"]
+# Document every public API: XSD 1.1 and XPath (`xsd11`), composition
+# (`compose`) and the asynchronous loading API (`async`). Every feature is
+# additive, so all of them build together; `all-features` also covers a
+# feature added later, which an explicit list would leave out.
+all-features = true
 
 [dependencies]
 # XML parsing

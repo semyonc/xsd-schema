@@ -246,9 +246,18 @@ shape and entry point); an unoptimized build needs about 40 KiB a level, so a
 larger thread near the limit. A tree a host builds into an `AstArena` itself is
 not checked; `xpath::expression_depth` measures one.
 
-Instance documents are not bounded by default. The streaming drivers keep
-their element stack on the heap; the tree-walk driver (`drive_navigator`,
-`drive_buffer_document`) recurses once per element level. A host that reads
-documents of untrusted depth sets `ParseLimits::max_depth` on the runtime or
-the document builder (§4), which bounds the trees it builds as well.
+Instance documents are not bounded by default, and need no bound for the
+stack: every walk over an instance keeps its depth on the heap. The streaming
+drivers keep their element stack there; the tree-walk drivers
+(`drive_navigator`, `drive_buffer_document`) and the tree comparison
+(`fn:deep-equal`, `TreeComparer`) walk iteratively, with an explicit stack, as
+do `BufferDocumentBuilder::copy_subtree` and the serializer
+(`document::serialize`). A tree of any depth —
+one a host builds with `BufferDocumentBuilder` included, which no parse limit
+covers — is validated and compared on an ordinary 2 MiB thread. A host that
+reads documents of untrusted depth sets `ParseLimits::max_depth` on the runtime
+or the document builder (§4), which bounds the depth of the text it reads and
+so of the trees it builds. The parser of a third-party tree is its own: roxmltree
+0.19, behind `RoXmlNavigator`, recurses once per element level as it parses
+(about 3,000 levels fit in 2 MiB in an optimized build).
 

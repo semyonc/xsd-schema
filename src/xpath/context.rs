@@ -1458,37 +1458,24 @@ impl<'a, N: DomNavigator> DynamicContext<'a, N> {
 
     /// Evaluate a function using the configured evaluator.
     ///
-    /// This method exists to work around borrow checker issues with calling
-    /// `self.function_evaluator().eval(handle, self, args)` where the evaluator
-    /// borrow conflicts with the mutable self borrow.
+    /// Calls the evaluator set with
+    /// [`with_function_evaluator`](Self::with_function_evaluator) (or the built-in
+    /// functions when none is set), passing this context mutably. Prefer it to
+    /// `self.function_evaluator().eval(handle, self, args)`, which does not compile:
+    /// [`function_evaluator`](Self::function_evaluator) borrows `self` for the
+    /// evaluator it returns.
     pub fn eval_function(
         &mut self,
         handle: super::functions::FunctionHandle,
         args: Vec<super::functions::XPathValue<N>>,
     ) -> Result<super::functions::XPathValue<N>, super::error::XPathError> {
-        // Fast path: built-in handles with no custom evaluator go directly to BuiltinEvaluator
-        if handle.is_builtin() && self.function_evaluator.is_none() {
-            return BuiltinEvaluator.eval(handle, self, args);
-        }
-
         // Route through the custom evaluator (e.g. XPath10Evaluator intercepts builtins).
-        // For custom handles, we need to call through the configured evaluator.
-        // Get the evaluator pointer before borrowing self mutably.
+        // The field holds a `Copy` reference with the lifetime `'a`, not a borrow
+        // of `self`, so copying it out leaves `self` free to be passed mutably.
         match self.function_evaluator {
-            Some(evaluator) => {
-                // SAFETY: The evaluator reference has lifetime 'a which is valid
-                // for the duration of this DynamicContext. We're converting to a
-                // raw pointer and back to work around the borrow checker, but the
-                // reference is valid for this call.
-                let evaluator_ptr = evaluator as *const dyn FunctionEvaluator<N>;
-                // Re-borrow as shared reference for the call
-                let evaluator_ref = unsafe { &*evaluator_ptr };
-                evaluator_ref.eval(handle, self, args)
-            }
-            None => {
-                // Fallback for custom handles without a configured evaluator
-                BuiltinEvaluator.eval(handle, self, args)
-            }
+            Some(evaluator) => evaluator.eval(handle, self, args),
+            // Built-in handles, and custom handles without a configured evaluator.
+            None => BuiltinEvaluator.eval(handle, self, args),
         }
     }
 }
@@ -2023,7 +2010,7 @@ mod xpath10_compatibility_tests {
         assert_eq!(
             run("string(('a', 'b'))", &compat)
                 .unwrap()
-                .as_str()
+                .to_owned_string()
                 .as_deref(),
             Some("a")
         );

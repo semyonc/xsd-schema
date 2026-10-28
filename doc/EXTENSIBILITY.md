@@ -1084,7 +1084,7 @@ let sig = DynamicFunctionSignature::new(
     SequenceType::string(),
 );
 functions.register(sig, |_ctx, mut args| {
-    let name = args.remove(0).as_str().unwrap_or_default();
+    let name = args.remove(0).to_owned_string().unwrap_or_default();
     Ok(XPathValue::string(format!("Hello, {}!", name)))
 });
 
@@ -1112,7 +1112,7 @@ let result = expr.evaluator(&ctx)
     .run_with_node_and_setup(Some(nav), |te| {
         te.context().set_function_evaluator(Some(&functions));  // eval-time dispatch
     })?;
-assert_eq!(result.as_str().as_deref(), Some("Hello, World!"));
+assert_eq!(result.to_owned_string().as_deref(), Some("Hello, World!"));
 # }
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
@@ -1203,8 +1203,8 @@ XPathValue::integer(42)
 XPathValue::boolean(true)
 XPathValue::empty()  // empty sequence
 
-// Extractors
-value.as_str() -> Option<String>
+// Extractors (a single atomic item of the type, else None)
+value.to_owned_string() -> Option<String>   // xs:string, derived, xs:untypedAtomic; copied
 value.as_f64() -> Option<f64>
 value.as_integer() -> Option<BigInt>
 value.as_bool() -> Option<bool>
@@ -1363,7 +1363,7 @@ let sig = DynamicFunctionSignature::new(
     SequenceType::integer(),
 );
 functions.register(sig, |_ctx, mut args| {
-    let s = args.remove(0).as_str().unwrap_or_default();
+    let s = args.remove(0).to_owned_string().unwrap_or_default();
     Ok(XPathValue::integer(s.len() as i64))
 });
 # }
