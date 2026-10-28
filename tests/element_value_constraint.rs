@@ -1286,3 +1286,457 @@ fn the_typed_build_writes_the_lexical_form_under_the_governing_type() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// A fixed value with content, under another governing type.
+//
+// Structures 1.1 §3.3.4.3 clause 5.2.2: "If D.{value constraint}.{variety} =
+// fixed and E is not ·nilled· with respect to D, then … 5.2.2.2.2 If E's
+// ·governing type definition· is a Simple Type Definition or a Complex Type
+// Definition with {content type}.{variety} = simple, then the ·actual value·
+// of E is equal or identical to D.{value constraint}.{value}" — the {value}
+// is the declaration's (§3.3.2.1: "the ·actual value· (with respect to the
+// ·effective simple type definition·) of the [attribute]"), whatever type
+// governs E.
+//
+// XSD 1.0 §3.3.4 clause 5.2.2.2.2: "If the {content type} of the ·actual type
+// definition· is a simple type definition, then the ·actual value· of the
+// item must match the canonical lexical representation of the {value
+// constraint} value" — the value with respect to the declared {type
+// definition} (§3.3.2), written in its canonical form (Datatypes 1.0: an
+// integer without leading zeros, a decimal with its decimal point, a float as
+// mantissa and exponent), and read as the item's own type reads it.
+// ---------------------------------------------------------------------------
+
+const FIXED_GOVERNED: &str = r###"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+    xmlns:t="urn:t" targetNamespace="urn:t" elementFormDefault="qualified">
+  <xs:simpleType name="intOrStr"><xs:union memberTypes="xs:integer xs:string"/></xs:simpleType>
+  <xs:simpleType name="decOrStr"><xs:union memberTypes="xs:decimal xs:string"/></xs:simpleType>
+  <xs:simpleType name="fltOrStr"><xs:union memberTypes="xs:float xs:string"/></xs:simpleType>
+  <xs:element name="nf" type="t:intOrStr" fixed="01"/>
+  <xs:element name="df" type="t:decOrStr" fixed="1"/>
+  <xs:element name="ff" type="t:fltOrStr" fixed="100"/>
+  <xs:element name="sf" type="xs:anySimpleType" fixed=" a "/>
+  <xs:element name="af" fixed="1"/>
+  <xs:element name="awf" fixed=" a "/>
+  <xs:simpleType name="twoDec"><xs:restriction base="xs:decimal">
+    <xs:pattern value="[0-9]+\.[0-9]{2}"/>
+  </xs:restriction></xs:simpleType>
+  <xs:simpleType name="fd0"><xs:restriction base="xs:decimal">
+    <xs:fractionDigits value="0"/>
+  </xs:restriction></xs:simpleType>
+  <xs:simpleType name="td1"><xs:restriction base="xs:decimal">
+    <xs:totalDigits value="1"/>
+  </xs:restriction></xs:simpleType>
+  <xs:simpleType name="tok"><xs:restriction base="xs:token">
+    <xs:pattern value="[a-z]"/>
+  </xs:restriction></xs:simpleType>
+  <xs:simpleType name="ints"><xs:list itemType="xs:integer"/></xs:simpleType>
+  <xs:simpleType name="ints2"><xs:restriction base="t:ints">
+    <xs:length value="2"/>
+  </xs:restriction></xs:simpleType>
+  <xs:simpleType name="dt"><xs:restriction base="xs:dateTime"/></xs:simpleType>
+  <xs:simpleType name="tm"><xs:restriction base="xs:time"/></xs:simpleType>
+  <xs:simpleType name="du"><xs:restriction base="xs:duration"/></xs:simpleType>
+  <xs:element name="pf" type="xs:decimal" fixed="1.00"/>
+  <xs:element name="zf" type="xs:decimal" fixed="1"/>
+  <xs:element name="lf" type="t:ints" fixed="1 2"/>
+  <xs:element name="tf" type="xs:dateTime" fixed="2000-01-01T00:00:00.123456789012345678901234567891"/>
+  <xs:element name="tzf" type="xs:dateTime" fixed="2000-01-01T12:00:00+01:00"/>
+  <xs:element name="tmf" type="xs:time" fixed="00:00:00.123456789012345678901234567891"/>
+  <xs:element name="duf" type="xs:duration" fixed="PT0.123456789012345678901234567891S"/>
+  <xs:simpleType name="listOrStr"><xs:union memberTypes="t:ints xs:string"/></xs:simpleType>
+  <xs:simpleType name="strOrList"><xs:union memberTypes="xs:string t:ints"/></xs:simpleType>
+  <xs:simpleType name="dtOrStr"><xs:union memberTypes="xs:dateTime xs:string"/></xs:simpleType>
+  <xs:simpleType name="dateOrStr"><xs:union memberTypes="xs:date xs:string"/></xs:simpleType>
+  <xs:simpleType name="durOrStr"><xs:union memberTypes="xs:duration xs:string"/></xs:simpleType>
+  <xs:element name="al" fixed="1 2"/>
+  <xs:element name="lu" type="t:listOrStr" fixed="1 2"/>
+  <xs:element name="su" type="t:strOrList" fixed="1 2"/>
+  <xs:element name="dtu" type="t:dtOrStr" fixed="2000-01-01T00:00:00Z"/>
+  <xs:element name="dtz" type="t:dtOrStr" fixed="2000-01-01T12:00:00+01:00"/>
+  <xs:element name="dtl" type="t:dtOrStr" fixed="2000-01-01T00:00:00.123456789012345678901234567891Z"/>
+  <xs:element name="dau" type="t:dateOrStr" fixed="2002-10-10+13:00"/>
+  <xs:element name="dau5" type="t:dateOrStr" fixed="2002-10-10+05:00"/>
+  <xs:element name="duu" type="t:durOrStr" fixed="PT60M"/>
+</xs:schema>"###;
+
+/// A row: element, `xsi:type` or none, content (`""`: none — the element
+/// takes the value constraint, clause 5.1), validity in XSD 1.0 and in XSD
+/// 1.1, and the error code of an invalid one.
+struct FixedRow {
+    element: &'static str,
+    xsi_type: Option<&'static str>,
+    content: &'static str,
+    valid_10: bool,
+    valid_11: bool,
+    code: &'static str,
+}
+
+const fn row(
+    element: &'static str,
+    xsi_type: Option<&'static str>,
+    content: &'static str,
+    valid_10: bool,
+    valid_11: bool,
+) -> FixedRow {
+    FixedRow {
+        element,
+        xsi_type,
+        content,
+        valid_10,
+        valid_11,
+        code: "cvc-elt.5.2.2",
+    }
+}
+
+const FIXED_GOVERNED_ROWS: &[FixedRow] = &[
+    // The declaration's {value} is the integer 1 (canonical "1"); under
+    // xs:string the element's actual value is a string. 1.1: never equal or
+    // identical to an integer. 1.0: "1" matches the canonical form, "01" not.
+    row("nf", Some("xs:string"), "01", false, false),
+    row("nf", Some("xs:string"), "1", true, false),
+    // Under xs:integer both are the integer 1.
+    row("nf", Some("xs:integer"), "1", true, true),
+    row("nf", Some("xs:integer"), "001", true, true),
+    row("nf", Some("xs:integer"), "2", false, false),
+    // The declared type governs.
+    row("nf", None, "01", true, true),
+    row("nf", None, "1", true, true),
+    row("nf", None, "x", false, false),
+    // xs:anyType declared: the ·effective simple type definition· is xs:string
+    // (§3.3.2.1), so the {value} is the string "1". 1.0: its canonical form
+    // "1" read as xs:integer is the integer 1, the item's actual value.
+    row("af", Some("xs:string"), "1", true, true),
+    row("af", Some("xs:integer"), "1", true, false),
+    row("af", Some("xs:integer"), "01", true, false),
+    row("af", Some("xs:integer"), "2", false, false),
+    row("af", Some("xs:string"), "01", false, false),
+    // A decimal {value} 1: the 1.0 canonical form is "1.0".
+    row("df", Some("xs:string"), "1.0", true, false),
+    row("df", Some("xs:string"), "1", false, false),
+    row("df", Some("xs:decimal"), "1.00", true, true),
+    row("df", None, "1.0", true, true),
+    // A float {value} 100: the 1.0 canonical form is "1.0E2".
+    row("ff", Some("xs:string"), "1.0E2", true, false),
+    row("ff", Some("xs:string"), "100", false, false),
+    row("ff", Some("xs:float"), "1E2", true, true),
+    // xs:anySimpleType declared: its {value} has no primitive type of its own;
+    // the fixed literal is read under the governing type.
+    row("sf", Some("xs:token"), "a", true, true),
+    row("sf", Some("xs:token"), " a  ", true, true),
+    row("sf", Some("xs:token"), "b", false, false),
+    row("sf", None, " a ", true, true),
+    // Fix round 2: the comparison is by value, with no facet of the governing
+    // type applied to a generated spelling. A pattern that the canonical form
+    // `1.0` would fail (the reviewer's case), `fractionDigits` / `totalDigits`
+    // that `1.0` would exceed lexically, and their invalid neighbours.
+    row("pf", Some("t:twoDec"), "1.00", true, true),
+    row("pf", Some("t:twoDec"), "1.10", false, false),
+    row("zf", Some("t:fd0"), "1", true, true),
+    row("zf", Some("t:fd0"), "2", false, false),
+    row("zf", Some("t:td1"), "1", true, true),
+    row("zf", Some("t:td1"), "2", false, false),
+    // A list with a `length`: item by item.
+    row("lf", Some("t:ints2"), "01 2", true, true),
+    row("lf", Some("t:ints2"), "1 3", false, false),
+    // xs:anyType declared (a string {value} " a ") under a pattern-restricted
+    // token: 1.0 reads " a " as the token "a"; 1.1 compares the string " a "
+    // with the token value "a".
+    row("awf", Some("t:tok"), "a", true, false),
+    row("awf", Some("t:tok"), "b", false, false),
+    // Seconds beyond 28 fraction digits are compared as written: the same
+    // value is accepted, the value that differs in the 29th and 30th digits
+    // refused (the reviewer's second case), for a dateTime, a time and a
+    // duration.
+    row(
+        "tf",
+        Some("t:dt"),
+        "2000-01-01T00:00:00.123456789012345678901234567891",
+        true,
+        true,
+    ),
+    row(
+        "tf",
+        Some("t:dt"),
+        "2000-01-01T00:00:00.1234567890123456789012345678",
+        false,
+        false,
+    ),
+    row(
+        "tmf",
+        Some("t:tm"),
+        "00:00:00.123456789012345678901234567891",
+        true,
+        true,
+    ),
+    row(
+        "tmf",
+        Some("t:tm"),
+        "00:00:00.1234567890123456789012345678",
+        false,
+        false,
+    ),
+    row(
+        "duf",
+        Some("t:du"),
+        "PT0.123456789012345678901234567891S",
+        true,
+        true,
+    ),
+    row(
+        "duf",
+        Some("t:du"),
+        "PT0.1234567890123456789012345678S",
+        false,
+        false,
+    ),
+    // A time zone: the same instant is the same value.
+    row("tzf", Some("t:dt"), "2000-01-01T11:00:00Z", true, true),
+    row("tzf", Some("t:dt"), "2000-01-01T12:00:00Z", false, false),
+    // Fix round 3: every value has its XSD 1.0 canonical form, lists and
+    // date/time values included. A string {value} "1 2" (xs:anyType declared)
+    // under a list of integers is read as that list; a list {value} under
+    // xs:string is its canonical form "1 2" (the reviewer's first case, both
+    // ways).
+    row("al", Some("t:ints"), "1 2", true, false),
+    row("al", Some("t:ints"), "01 2", true, false),
+    row("al", Some("t:ints"), "1 3", false, false),
+    row("lu", Some("xs:string"), "1 2", true, false),
+    row("lu", Some("xs:string"), "01 2", false, false),
+    row("su", Some("t:ints"), "1 2", true, false),
+    row("su", Some("t:ints"), "01 2", true, false),
+    // A dateTime member under the string member: the canonical form, in Z
+    // (Datatypes 1.0 §3.2.7.2) — the reviewer's second case, a non-Z time
+    // zone, and 30 fraction digits.
+    row(
+        "dtu",
+        Some("xs:string"),
+        "2000-01-01T00:00:00Z",
+        true,
+        false,
+    ),
+    row(
+        "dtu",
+        Some("xs:string"),
+        "2000-01-01T00:00:00.0Z",
+        false,
+        false,
+    ),
+    row(
+        "dtz",
+        Some("xs:string"),
+        "2000-01-01T11:00:00Z",
+        true,
+        false,
+    ),
+    row(
+        "dtz",
+        Some("xs:string"),
+        "2000-01-01T12:00:00+01:00",
+        false,
+        false,
+    ),
+    row(
+        "dtz",
+        Some("xs:dateTime"),
+        "2000-01-01T11:00:00Z",
+        true,
+        true,
+    ),
+    row(
+        "dtl",
+        Some("xs:string"),
+        "2000-01-01T00:00:00.123456789012345678901234567891Z",
+        true,
+        false,
+    ),
+    row(
+        "dtl",
+        Some("xs:string"),
+        "2000-01-01T00:00:00.1234567890123456789012345678Z",
+        false,
+        false,
+    ),
+    // A date with a time zone (§3.2.9.2: the date of the interval midpoint
+    // and the ·recoverable timezone·, between -11:59 and +12:00).
+    row("dau", Some("xs:string"), "2002-10-09-11:00", true, false),
+    row("dau", Some("xs:string"), "2002-10-10+13:00", false, false),
+    row("dau5", Some("xs:string"), "2002-10-10+05:00", true, false),
+    // A duration member (XSD 1.0 defines no canonical form for duration; its
+    // value space has six components, so the form is the literal's fields).
+    row("duu", Some("xs:string"), "PT60M", true, false),
+    row("duu", Some("xs:string"), "PT1H", false, false),
+    row("duu", Some("xs:duration"), "PT1H", true, true),
+    // No content: the element takes the value constraint (clause 5.1), and
+    // under an xs:string `xsi:type` the {lexical form} "01" does not map to
+    // the {value} 1 (clause 5.1.1, Simple Default Valid 2; batch (q) D-q8, the
+    // 1.1 rule in both versions).
+    FixedRow {
+        element: "nf",
+        xsi_type: Some("xs:string"),
+        content: "",
+        valid_10: false,
+        valid_11: false,
+        code: "cvc-elt.5.1.1",
+    },
+    row("nf", Some("xs:integer"), "", true, true),
+];
+
+fn fixed_governed_set(version: XsdVersion) -> SchemaSet {
+    SchemaSetBuilder::with_version(version)
+        .add_source(FIXED_GOVERNED, "file:///element_value_constraint_fixed.xsd")
+        .expect("schema source accepted")
+        .compile()
+        .unwrap_or_else(|e| panic!("{version:?}: {e}"))
+        .into_schema_set()
+}
+
+/// `<t:element xsi:type="…">content</t:element>` on the push API (with and
+/// without PSVI typed values), the streaming driver (both) and the navigator
+/// driver: per driver, whether it is valid and the errors' codes.
+fn validate_fixed_governed(
+    ss: &SchemaSet,
+    element: &str,
+    xsi_type: Option<&str>,
+    content: &str,
+) -> Vec<(String, bool, Vec<String>)> {
+    let mut runs = Vec::new();
+    let xsi_attr = xsi_type
+        .map(|t| format!(r#" xsi:type="{t}""#))
+        .unwrap_or_default();
+    let xml = format!(r#"<t:{element} {XSI_DECLS}{xsi_attr}>{content}</t:{element}>"#);
+    for psvi in [true, false] {
+        let validator = SchemaValidator::new(ss, flags(psvi));
+        // Push API.
+        let (mut errors, mut warnings) = (Vec::new(), Vec::new());
+        let mut rt = validator.start_run(CollectingValidationSink {
+            errors: &mut errors,
+            warnings: &mut warnings,
+        });
+        let ns = snapshot(
+            ss,
+            &[("t", "urn:t"), ("xs", "http://www.w3.org/2001/XMLSchema")],
+        );
+        let _ = rt.validate_element(element, "urn:t", xsi_type, None, &ns);
+        if let Some(t) = xsi_type {
+            let _ = rt.validate_attribute("type", "http://www.w3.org/2001/XMLSchema-instance", t);
+        }
+        let _ = rt.validate_end_of_attributes();
+        if !content.is_empty() {
+            rt.validate_text(content);
+        }
+        let info = rt.validate_end_element();
+        rt.end_validation().expect("no operational failure");
+        drop(rt);
+        runs.push((
+            format!("push psvi={psvi}"),
+            info.validity == SchemaValidity::Valid,
+            errors.iter().map(|e| e.constraint.to_string()).collect(),
+        ));
+        // Streaming driver.
+        let (mut errors, mut warnings) = (Vec::new(), Vec::new());
+        let mut rt = validator.start_run(CollectingValidationSink {
+            errors: &mut errors,
+            warnings: &mut warnings,
+        });
+        let outcome = xsd_schema::validation::drive_quick_xml(xml.as_bytes(), &mut rt, ss)
+            .expect("the pass completes");
+        drop(rt);
+        runs.push((
+            format!("streaming psvi={psvi}"),
+            outcome.root_validity == Some(SchemaValidity::Valid) && errors.is_empty(),
+            errors.iter().map(|e| e.constraint.to_string()).collect(),
+        ));
+    }
+    let validator = SchemaValidator::new(ss, flags(true));
+    let doc = roxmltree::Document::parse(&xml).expect("well-formed");
+    let nav = xsd_schema::RoXmlNavigator::new(&doc);
+    let (mut errors, mut warnings) = (Vec::new(), Vec::new());
+    let mut rt = validator.start_run(CollectingValidationSink {
+        errors: &mut errors,
+        warnings: &mut warnings,
+    });
+    let outcome =
+        xsd_schema::validation::drive_navigator(&nav, &mut rt, ss).expect("the pass completes");
+    drop(rt);
+    runs.push((
+        "navigator".to_string(),
+        outcome.root_validity == Some(SchemaValidity::Valid) && errors.is_empty(),
+        errors.iter().map(|e| e.constraint.to_string()).collect(),
+    ));
+    runs
+}
+
+#[test]
+fn a_fixed_value_is_compared_with_the_declarations_value() {
+    for version in VERSIONS {
+        let ss = fixed_governed_set(version);
+        let mut wrong = Vec::new();
+        for r in FIXED_GOVERNED_ROWS {
+            let valid = if version == XsdVersion::V1_0 {
+                r.valid_10
+            } else {
+                r.valid_11
+            };
+            for (driver, got, codes) in
+                validate_fixed_governed(&ss, r.element, r.xsi_type, r.content)
+            {
+                let label = format!(
+                    "{} xsi:type={:?} {:?} {driver}",
+                    r.element, r.xsi_type, r.content
+                );
+                if got != valid {
+                    wrong.push(format!("{label}: valid={got} {codes:?}"));
+                } else if !valid && codes.first().map(String::as_str) != Some(r.code) {
+                    wrong.push(format!("{label}: codes {codes:?}"));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{version:?}: {wrong:#?}");
+    }
+}
+
+/// A complex type with simple content and, in XSD 1.1, a type alternative
+/// govern the same way.
+#[cfg(feature = "xsd11")]
+#[test]
+fn a_fixed_value_under_simple_content_is_compared_with_the_declarations_value() {
+    const SC: &str = r###"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+        xmlns:t="urn:t" targetNamespace="urn:t" elementFormDefault="qualified">
+      <xs:simpleType name="intOrStr"><xs:union memberTypes="xs:integer xs:string"/></xs:simpleType>
+      <xs:complexType name="S"><xs:simpleContent>
+        <xs:extension base="t:intOrStr"><xs:attribute name="a"/></xs:extension>
+      </xs:simpleContent></xs:complexType>
+      <xs:complexType name="SI"><xs:simpleContent>
+        <xs:extension base="t:S"/>
+      </xs:simpleContent></xs:complexType>
+      <xs:element name="cf" type="t:S" fixed="01"/>
+      <xs:element name="sel" type="t:intOrStr" fixed="01">
+        <xs:alternative type="xs:string"/>
+      </xs:element>
+    </xs:schema>"###;
+    let ss = SchemaSetBuilder::with_version(XsdVersion::V1_1)
+        .add_source(SC, "file:///element_value_constraint_fixed_sc.xsd")
+        .expect("schema source accepted")
+        .compile()
+        .unwrap_or_else(|e| panic!("{e}"))
+        .into_schema_set();
+    // (element, xsi:type, content, valid): a type alternative selects
+    // xs:string for `sel` — the governing type, not an instance-specified one;
+    // clause 5.2.2.2.2 compares all the same.
+    for (element, xsi_type, content, valid) in [
+        ("cf", Some("t:SI"), "1", true),
+        ("cf", None, "01", true),
+        ("cf", None, "y", false),
+        ("sel", None, "01", false),
+        ("sel", None, "1", false),
+    ] {
+        for (driver, got, codes) in validate_fixed_governed(&ss, element, xsi_type, content) {
+            assert_eq!(
+                got, valid,
+                "{element} xsi:type={xsi_type:?} {content:?} {driver}: {codes:?}"
+            );
+        }
+    }
+}

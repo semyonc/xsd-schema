@@ -970,6 +970,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   element-only content, or reads the default as another value than the
   declaration's, is invalid (`cvc-elt.5.1.1`).
 
+- An element with `xsi:nil="true"` whose declaration has a `fixed` value is
+  invalid (`cvc-elt.3.2.2`, Structures §3.3.4.3 clause 3.2.3.2), and its [nil]
+  property is false.
+- Under an `xsi:type` or an XSD 1.1 type alternative, an element's content is
+  compared by value with the declaration's fixed {value} (Structures 1.1
+  §3.3.4.3 clause 5.2.2.2.2: equal or identical), not with the fixed literal
+  read under the governing type. In XSD 1.0 mode a {value} of another
+  primitive datatype, a string {value}, or a list against an atomic value
+  matches through its canonical lexical representation (XSD 1.0 §3.3.4 clause
+  5.2.2.2.2; Datatypes 1.0 §2.5.1 and §3.2.x.2, a dateTime in `Z`, the seconds
+  as written) read with the element type's white space; no facet of the
+  element's type is applied to that form.
+- XSD 1.1 type alternatives see all of the element's attributes, `xsi:type`,
+  `xsi:nil` and the schema location hints included (Structures §3.12.4 clause
+  1.1.2), and `xml:` attributes accepted under `ALLOW_XML_ATTRIBUTES`.
+- `xs:duration` refuses fields out of order (`P1M1Y`, `PT1M1H`), in schema
+  validation and in XPath casts and constructor functions (Datatypes
+  §3.3.6.2).
+- A QName or NOTATION `default` / `fixed` value whose prefix the declaration
+  does not bind is a schema error (`e-props-correct.2`, `a-props-correct`), as
+  it already was at validation.
+- XSD 1.1: All Group Limited is enforced — an `xs:all` group (or a reference
+  to one) as the content type's particle must have `maxOccurs` 0 or 1, and a
+  reference to an all group may not appear in a sequence or choice
+  (`cos-all-limited`). In both versions a reference with
+  `minOccurs="0" maxOccurs="0"` is no component and places no all group
+  anywhere (XSD 1.0 refused one inside a sequence or choice, and as the
+  content type); in XSD 1.0 a type whose only particle has
+  `minOccurs="0" maxOccurs="0"` has empty content, so white space is refused
+  there too.
+- XSD 1.1: `<xs:import>` of the enclosing schema document's own target
+  namespace is an error (`src-import`, §4.2.6.2 clause 1.1).
+- An extension of a type without content by an `xs:all` group (inline or
+  referenced) is validated as that all group: required members are required
+  and each member occurs at most its `maxOccurs` (both versions). XSD 1.1: an
+  extension of a base whose content is an empty `<xs:all/>` takes its own
+  content (`<xs:group ref>` to an all group, an inline all group, a sequence),
+  a mixed one keeps its empty sequence, and an `<xs:group ref>` to an all
+  group extends an all-group base by merging (§3.4.2.3.3 clauses 4.2.1,
+  4.2.3.2).
+- A simple-content restriction may restrict a built-in member type of the
+  base's union content (Type Derivation OK (Simple) clause 2.2.4).
+
 ### Performance
 
 - Each `xs:pattern` is compiled once: XSD 1.1 patterns were compiled two to

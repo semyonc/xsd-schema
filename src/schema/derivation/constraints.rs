@@ -155,7 +155,9 @@ pub fn validate_attribute_value_constraints(schema_set: &SchemaSet) -> SchemaRes
         let Some(type_key @ TypeKey::Simple(_)) = attr.resolved_type else {
             continue;
         };
-        if crate::validation::simple::validate_simple_type(value, type_key, schema_set).is_err() {
+        // Simple Default Valid (§3.2.6.2): a QName / NOTATION in the value is
+        // read with the bindings of the declaration it is written on.
+        if !schema_set.value_constraint_literal_has_value(value, type_key, attr.source.as_ref()) {
             let attr_name = attr
                 .name
                 .map(|n| schema_set.name_table.resolve(n).to_string())
@@ -187,7 +189,9 @@ pub fn validate_attribute_value_constraints(schema_set: &SchemaSet) -> SchemaRes
             // otherwise the global declaration's. au-props-correct.2 says
             // a use's fixed must equal the declaration's, but here we only
             // need to check that *some* effective value-constraint parses.
-            let value_constraint: Option<(&str, bool)> = attr_use
+            // The schema element the value is written on goes with it: its
+            // bindings read a QName / NOTATION value.
+            let value_constraint: Option<(&str, bool, Option<&SourceRef>)> = attr_use
                 .attribute
                 .fixed_value
                 .as_deref()
@@ -199,12 +203,14 @@ pub fn validate_attribute_value_constraints(schema_set: &SchemaSet) -> SchemaRes
                         .as_deref()
                         .map(|v| (v, false))
                 })
+                .map(|(v, fixed)| (v, fixed, attr_use.attribute.source.as_ref()))
                 .or_else(|| {
                     ref_decl.and_then(|d| {
                         d.fixed_value
                             .as_deref()
                             .map(|v| (v, true))
                             .or_else(|| d.default_value.as_deref().map(|v| (v, false)))
+                            .map(|(v, fixed)| (v, fixed, d.source.as_ref()))
                     })
                 });
 
@@ -291,7 +297,7 @@ pub fn validate_attribute_value_constraints(schema_set: &SchemaSet) -> SchemaRes
                 ));
             }
 
-            let Some((value, is_fixed)) = value_constraint else {
+            let Some((value, is_fixed, value_source)) = value_constraint else {
                 continue;
             };
 
@@ -301,8 +307,7 @@ pub fn validate_attribute_value_constraints(schema_set: &SchemaSet) -> SchemaRes
             let Some(type_key @ TypeKey::Simple(_)) = attr_type else {
                 continue;
             };
-            if crate::validation::simple::validate_simple_type(value, type_key, schema_set).is_err()
-            {
+            if !schema_set.value_constraint_literal_has_value(value, type_key, value_source) {
                 let attr_name = attr_use
                     .attribute
                     .name
@@ -429,8 +434,11 @@ pub fn validate_element_value_constraints(schema_set: &SchemaSet) -> SchemaResul
             }),
         };
 
+        // A QName / NOTATION in the value is read with the bindings of the
+        // declaration it is written on (Datatypes §3.3.18), as the {value}
+        // is (`SchemaSet::element_value_constraint`).
         if let Some(st_key) = effective_type {
-            if crate::validation::simple::validate_simple_type(value, st_key, schema_set).is_err() {
+            if !schema_set.value_constraint_literal_has_value(value, st_key, elem.source.as_ref()) {
                 return Err(SchemaError::structural(
                     "e-props-correct.2",
                     format!(

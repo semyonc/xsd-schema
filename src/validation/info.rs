@@ -364,7 +364,8 @@ pub struct SchemaInfo {
     /// "true if clause 3.2.3 of Element Locally Valid (Element) … is
     /// satisfied, otherwise false"), so also `false` for a nilled element
     /// that has character or element \[children\] (clause 3.2.3.1; the
-    /// element is invalid, `cvc-elt.3.2.1`).
+    /// element is invalid, `cvc-elt.3.2.1`) or whose declaration has a fixed
+    /// value (clause 3.2.3.2; invalid, `cvc-elt.3.2.2`).
     pub is_nil: bool,
     /// Content type of the element (Empty, TextOnly, ElementOnly, Mixed)
     pub content_type: Option<ContentType>,

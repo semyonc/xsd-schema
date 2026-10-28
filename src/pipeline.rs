@@ -732,18 +732,19 @@ fn check_particle_all_group_constraints(
     Ok(())
 }
 
-/// Validate XSD 1.0 cos-all-limited.1.2 placement: an `xs:all` model group
-/// (whether inline or reached through a named-group reference) may only
-/// appear as the top-level particle of a complex type's content. It must
-/// not appear nested inside `xs:sequence` / `xs:choice`, nor reached via a
-/// chain of group references that pass through a non-all compositor.
+/// Validate cos-all-limited placement: an `xs:all` model group (whether
+/// inline or reached through a named-group reference) may only appear as the
+/// top-level particle of a complex type's content. It must not appear nested
+/// inside `xs:sequence` / `xs:choice`, nor reached via a chain of group
+/// references that pass through a non-all compositor.
+///
+/// XSD 1.0 §3.8.6 clauses 1–2; XSD 1.1 §3.8.6.2 All Group Limited clause 1,
+/// which also admits an all group inside another all group (clause 1.3, a
+/// group reference with minOccurs = maxOccurs = 1) — checked when the all
+/// group is compiled, as the top-level particle below is not walked.
 fn validate_all_group_placement(schema_set: &SchemaSet) -> SchemaResult<()> {
     use crate::compiler::{is_top_level_all_group, resolve_top_level_all_group_ref};
     use crate::parser::frames::ComplexContentResult;
-
-    if !schema_set.is_xsd10() {
-        return Ok(());
-    }
 
     for (_, type_def) in schema_set.arenas.complex_types.iter() {
         let ComplexContentResult::Complex(content) = &type_def.content else {
@@ -785,18 +786,54 @@ fn check_no_nested_all_group(
             .or_else(|| schema_set.locate(group.source.as_ref()))
     }
 
+    // A particle with minOccurs = maxOccurs = 0 is no component (1.1 §3.7.2:
+    // "Otherwise, the <group> has minOccurs=maxOccurs=0, in which case it maps
+    // to no component at all"; §3.8.2 likewise for <all>, <choice> and
+    // <sequence>; XSD 1.0 §3.7.2 / §3.8.2 the same): it places no all group.
+    if particle.min_occurs == 0 && particle.max_occurs == Some(0) {
+        return Ok(());
+    }
     let ParticleTerm::Group(group) = &particle.term else {
         return Ok(());
     };
 
-    if group.compositor == Some(Compositor::All) && group.ref_name.is_none() {
-        return Err(crate::error::SchemaError::structural(
+    // XSD 1.1 §3.8.6.2 clause 1: "It appears only as the value of one or more
+    // of the following properties: 1.1 the {model group} property of a model
+    // group definition. 1.2 the {term} property of a Particle with {max
+    // occurs} = 1 which is the {particle} of the {content type} of a complex
+    // type definition. 1.3 the {term} property of a Particle P with {min
+    // occurs} = {max occurs} = 1, where P is among the {particles} of a Model
+    // Group whose {compositor} is all."
+    let misplaced = |reference: bool| {
+        let message = match (schema_set.is_xsd10(), reference) {
+            (true, false) => {
+                "In XSD 1.0, an xs:all model group may only appear as the top-level \
+                 particle of a complex type definition"
+            }
+            (true, true) => {
+                "In XSD 1.0, a reference to a named xs:all group may only \
+                 appear as the top-level particle of a complex type definition"
+            }
+            (false, false) => {
+                "An xs:all model group may only appear as the top-level particle of a \
+                 complex type definition or inside another xs:all group (All Group \
+                 Limited, clause 1)"
+            }
+            (false, true) => {
+                "A reference to a named xs:all group may only appear as the top-level \
+                 particle of a complex type definition or inside another xs:all group \
+                 (All Group Limited, clause 1)"
+            }
+        };
+        crate::error::SchemaError::structural(
             "cos-all-limited",
-            "In XSD 1.0, an xs:all model group may only appear as the top-level \
-             particle of a complex type definition"
-                .to_string(),
+            message.to_string(),
             placement_location(particle, group, schema_set),
-        ));
+        )
+    };
+
+    if group.compositor == Some(Compositor::All) && group.ref_name.is_none() {
+        return Err(misplaced(false));
     }
 
     if let Some(ref_name) = group.ref_name.as_ref() {
@@ -805,13 +842,7 @@ fn check_no_nested_all_group(
         {
             if let Some(group_data) = schema_set.arenas.get_model_group(group_key) {
                 if group_data.compositor == Some(Compositor::All) {
-                    return Err(crate::error::SchemaError::structural(
-                        "cos-all-limited",
-                        "In XSD 1.0, a reference to a named xs:all group may only \
-                         appear as the top-level particle of a complex type definition"
-                            .to_string(),
-                        placement_location(particle, group, schema_set),
-                    ));
+                    return Err(misplaced(true));
                 }
                 if visited.insert(group_key) {
                     for child in &group_data.particles {

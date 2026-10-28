@@ -274,6 +274,18 @@ impl SchemaSet {
         self.value_constraint_record(decl).map(|r| r.lexical_form)
     }
 
+    /// D.{value constraint}.{lexical form} and D.{value constraint}.{value} of
+    /// `decl` — the value a fixed value constraint compares an element's
+    /// ·actual value· with (§3.3.4.3 clause 5.2.2.2.2) — `None` without a
+    /// value constraint or when its {value} is not known.
+    pub(crate) fn value_constraint_value(
+        &self,
+        decl: &ElementDeclData,
+    ) -> Option<(String, XmlValue)> {
+        self.value_constraint_record(decl)
+            .and_then(|r| r.value.map(|value| (r.lexical_form, value)))
+    }
+
     /// The declaration `element` names: itself, or the one a reference entry
     /// resolves to.
     fn element_declaration(&self, element: ElementKey) -> Option<&ElementDeclData> {
@@ -384,7 +396,40 @@ impl SchemaSet {
         literal: &str,
         type_key: TypeKey,
     ) -> Option<crate::validation::simple::SimpleTypeResult> {
-        let bindings = self.value_constraint_namespaces(decl.source.as_ref());
+        self.read_literal_at(decl.source.as_ref(), literal, type_key)
+    }
+
+    /// Whether the `default` / `fixed` value `literal`, written on the schema
+    /// element at `source` (an element declaration, an attribute declaration
+    /// or an attribute use), has a value in `type_key` — Simple Default Valid
+    /// (§3.2.6.2): "1 V.{lexical form} is ·valid· with respect to T … 2
+    /// V.{lexical form} maps to V.{value} in the value space of T". A QName /
+    /// NOTATION in it maps to a value only with the bindings of that schema
+    /// element (Datatypes §3.3.18), so a prefix bound nowhere there leaves it
+    /// without one. Without those bindings (a declaration not read from a
+    /// schema document) a QName is taken as written.
+    pub(crate) fn value_constraint_literal_has_value(
+        &self,
+        literal: &str,
+        type_key: TypeKey,
+        source: Option<&crate::parser::location::SourceRef>,
+    ) -> bool {
+        let Some(result) = self.read_literal_at(source, literal, type_key) else {
+            return false;
+        };
+        self.value_constraint_namespaces(source).is_none()
+            || !crate::validation::simple::holds_lexical_qname(&result.typed_value)
+    }
+
+    /// `literal` validated against `type_key` with the namespace bindings of
+    /// the schema element at `source`.
+    fn read_literal_at(
+        &self,
+        source: Option<&crate::parser::location::SourceRef>,
+        literal: &str,
+        type_key: TypeKey,
+    ) -> Option<crate::validation::simple::SimpleTypeResult> {
+        let bindings = self.value_constraint_namespaces(source);
         let resolver =
             bindings.map(|ns| crate::validation::simple::snapshot_prefixes(ns, &self.name_table));
         crate::validation::simple::validate_simple_type_in(

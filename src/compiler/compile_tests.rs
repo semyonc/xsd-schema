@@ -752,11 +752,12 @@ fn test_extension_all_group_base_with_sequence() {
 
     // XSD 1.1: extending an xs:all base with a non-all particle violates
     // cos-all-limited.1.2 — the result would wrap the all-group inside a
-    // sequence, which the spec forbids.
+    // sequence, which the spec forbids (§3.4.2.3.3 clause 4.2.3.3).
     let result = compile_content_model_matcher(&schema_set, &ext_type);
     assert!(matches!(
         result,
-        Err(crate::compiler::NfaCompileError::InvalidAllGroupContent { .. })
+        Err(crate::compiler::NfaCompileError::InvalidAllGroupOccurs { ref reason, .. })
+            if reason.starts_with("cos-all-limited.1:")
     ));
 }
 

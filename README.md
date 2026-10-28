@@ -28,11 +28,11 @@ constructor — use the composition layer:
 
 | Suite | Command | Total | Passed | Failed | Skipped | Errors | Pass rate |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| W3C XSD 1.0  | `cargo test --test conformance --features xsd11 --release -- --test-suite ../../xsdtests --version 1.0` | 39,510 | 39,459 | 17 | 34 | 0 | 99.96% |
+| W3C XSD 1.0  | `cargo test --test conformance --features xsd11 --release -- --test-suite ../../xsdtests --version 1.0` | 39,510 | 39,461 | 15 | 34 | 0 | 99.96% |
 | W3C XSD 1.1  | `cargo test --test conformance --features xsd11 --release -- --test-suite ../../xsdtests --version 1.1` | 2,319 | 2,313 | 6 | 0 | 0 | 99.7% |
 | XQTS XPath 2.0 | `cargo test --test xqts_xpath --features xsd11 --release -- -s ../../XQTS_1_0_2 --all -v -f` | 8,047 | 8,047 | 0 | 0 | 0 | 100.0% |
 
-All 17 remaining XSD 1.0 failures and all 6 XSD 1.1 failures are documented
+All 15 remaining XSD 1.0 failures and all 6 XSD 1.1 failures are documented
 disputes: W3C-queried tests (Bugzilla 4146/4680/4957/6901/29085), tests that
 contradict other accepted tests in the same suite (the `elemM002` /
 `xsd015.e` family vs. Saxon's `Missing` group), or documented waivers.

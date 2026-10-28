@@ -624,6 +624,13 @@ pub struct ValidationRuntime<'a, S: ValidationSink> {
     /// alternatives, not validated after them (XSD 1.1).
     #[cfg(feature = "xsd11")]
     skipped_collected: Vec<usize>,
+    /// The attributes of the current element that type alternatives see but
+    /// that are not deferred to after the selection: the `xsi:` attributes
+    /// and, under `ALLOW_XML_ATTRIBUTES`, the `xml:` ones (Structures 1.1
+    /// §3.12.4 clause 1.1.2, "E's [attributes]"). Collected only for an
+    /// element whose declaration has type alternatives (XSD 1.1).
+    #[cfg(feature = "xsd11")]
+    cta_unlisted_attributes: Vec<(Option<NameId>, NameId, String)>,
     /// Final identity constraint tables after root element close (PSVI exposure).
     final_ic_tables: Option<HashMap<IdentityConstraintKey, KeyTable>>,
     /// Accumulated `xsi:schemaLocation` hints with base URI context.
@@ -801,6 +808,9 @@ struct DeclaredElementBinding {
     is_nil: bool,
     /// `xsi:nil` present on a non-nillable declaration (cvc-elt.3.1).
     nillable_violation: bool,
+    /// The element is ·nilled· but its declaration has a fixed value
+    /// constraint (cvc-elt.3.2.2).
+    nil_fixed_violation: bool,
     /// The declaration carries type alternatives, so the governing type is only
     /// final after conditional type assignment (§3.12.4).
     #[cfg(feature = "xsd11")]
@@ -885,6 +895,12 @@ impl DeclaredElementBinding {
     /// neither clause 3.1 nor clause 3.2, so E is not locally valid and its
     /// `[validity]` is `invalid` from the start event onward.
     ///
+    /// So is `nil_fixed_violation` (cvc-elt.3.2.2): "3.2 D.{nillable} = true
+    /// and one of the following is true … 3.2.3 E has xsi:nil = true (that
+    /// is, E is ·nilled·), and all of the following are true: … 3.2.3.2 D has
+    /// no {value constraint} with {variety} = fixed." A ·nilled· element of a
+    /// declaration with a fixed value satisfies none of 3.2.1 – 3.2.3.
+    ///
     /// So is `is_abstract` (cvc-elt.2): the same rule's "2 D.{abstract} =
     /// false." `start_invalid` carries the verdicts found beside the binding:
     /// a dynamic EDC violation (XSD 1.1), and a declaration stipulated for the
@@ -895,6 +911,7 @@ impl DeclaredElementBinding {
             || self.is_abstract
             || self.abstract_type_invalid
             || self.nillable_violation
+            || self.nil_fixed_violation
             || self.has_deferred_type_error
             || start_invalid
         {
@@ -1016,11 +1033,16 @@ pub(crate) fn determine_content_type(
             // are allowed). Only apply the relaxed §3.4.2.3 step 2.1.x
             // particle-shape recognition under XSD 1.1; XSD 1.0 tests
             // historically rely on `def.particle.is_none()` strictness.
+            // XSD 1.0 has no clause 2.1.4, but a particle with minOccurs =
+            // maxOccurs = 0 "corresponds to no component at all" there too
+            // (§3.7.2, §3.8.2): no particle, empty content (white space is
+            // refused, as the content model matcher has nothing to match).
             let particle_empty = match &def.particle {
                 None => true,
-                Some(p) => {
-                    schema_set.is_xsd11() && crate::parser::frames::particle_is_explicit_empty(p)
+                Some(p) if schema_set.is_xsd11() => {
+                    crate::parser::frames::particle_is_explicit_empty(p)
                 }
+                Some(p) => p.min_occurs == 0 && p.max_occurs == Some(0),
             };
             let has_open_content = type_has_effective_open_content(schema_set, ct_data, def);
             if particle_empty && !ct_data.mixed && !def.mixed && !has_open_content {
@@ -1167,6 +1189,8 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             default_attributes: Vec::new(),
             #[cfg(feature = "xsd11")]
             skipped_collected: Vec::new(),
+            #[cfg(feature = "xsd11")]
+            cta_unlisted_attributes: Vec::new(),
             cached_xsd10_id_key,
             #[cfg(feature = "xsd11")]
             has_inheritable_attributes,
@@ -2116,6 +2140,9 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         if self.operational_failure.is_some() {
             return false;
         }
+        // The parent's attributes are behind; none of them is this element's.
+        #[cfg(feature = "xsd11")]
+        self.cta_unlisted_attributes.clear();
         // 1. State machine check
         if !self.current_state.can_start_element() {
             self.report_error(
@@ -2930,6 +2957,9 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         // declaration's {nillable} property must be true wherever xsi:nil
         // appears.
         let nillable_violation = xsi_nil.is_some() && !elem_data.nillable;
+        // cvc-elt.3.2.2 (§3.3.4.3 clause 3.2.3.2; XSD 1.0 §3.3.4 clause
+        // 3.2.2): a ·nilled· element's declaration must have no fixed value.
+        let nil_fixed_violation = is_nil && elem_data.fixed_value.is_some();
 
         DeclaredElementBinding {
             type_key,
@@ -2941,6 +2971,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             has_deferred_type_error,
             is_nil,
             nillable_violation,
+            nil_fixed_violation,
             #[cfg(feature = "xsd11")]
             has_type_alternatives,
         }
@@ -2948,7 +2979,8 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
 
     /// Element-start step 9 (cont.): the element-start diagnostics deferred
     /// until after the push, so their codes land on the child element rather
-    /// than the parent — cvc-elt.2, cvc-type.2, cvc-elt.3.1 and §src-resolve.
+    /// than the parent — cvc-elt.2, cvc-type.2, cvc-elt.3.1, cvc-elt.3.2.2
+    /// and §src-resolve.
     fn report_declared_element_start_errors(
         &mut self,
         local_name: NameId,
@@ -2960,6 +2992,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             is_abstract,
             has_deferred_type_error,
             nillable_violation,
+            nil_fixed_violation,
             ..
         } = binding;
         if is_abstract {
@@ -3008,6 +3041,16 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 "cvc-elt.3.1",
                 format!(
                     "Element '{}' is not nillable but xsi:nil was specified",
+                    elem_name,
+                ),
+            );
+        }
+        if nil_fixed_violation {
+            let elem_name = self.schema_set.name_table.resolve(local_name);
+            self.report_error(
+                "cvc-elt.3.2.2",
+                format!(
+                    "Element '{}' has xsi:nil=\"true\" but its declaration has a fixed value",
                     elem_name,
                 ),
             );
@@ -3298,6 +3341,13 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
 
         // Validate xsi:* built-in attributes with proper type information
         if namespace == Some(well_known::XSI_NAMESPACE) {
+            // Among E's [attributes], which type alternatives see (§3.12.4
+            // clause 1.1.2).
+            #[cfg(feature = "xsd11")]
+            if ev_state.has_type_alternatives {
+                self.cta_unlisted_attributes
+                    .push((namespace, local_name, value.to_string()));
+            }
             let result = self.validate_xsi_attribute_on_element(local_name, namespace, value);
             self.fold_attribute_validity(&result);
             #[cfg(feature = "xsd11")]
@@ -3309,6 +3359,11 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         if namespace == Some(well_known::XML_NAMESPACE)
             && self.flags.contains(ValidationFlags::ALLOW_XML_ATTRIBUTES)
         {
+            #[cfg(feature = "xsd11")]
+            if ev_state.has_type_alternatives {
+                self.cta_unlisted_attributes
+                    .push((namespace, local_name, value.to_string()));
+            }
             self.current_state = ValidatorState::Attribute;
             return SchemaInfo::empty();
         }
@@ -3840,7 +3895,8 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     /// End-of-attributes step: conditional type assignment (§3.12.4).
     ///
     /// Evaluates the element declaration's type alternatives against the
-    /// collected (and CTA-visible inherited) attributes; when an alternative
+    /// element's attributes — the collected ones, the `xsi:` (and accepted
+    /// `xml:`) ones, and the CTA-visible inherited ones; when an alternative
     /// selects a different type, the governing type and content model on the
     /// stack top are switched. Returns the (possibly switched) governing type,
     /// whether it changed, and whether an alternative was selected at all.
@@ -3852,14 +3908,19 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         let mut st = schema_type;
         let mut switched = false;
         let mut selected = false;
+        let unlisted = std::mem::take(&mut self.cta_unlisted_attributes);
         if let Some(ev_state) = self.validation_stack.last() {
             if let Some(elem_key) = ev_state.element_decl {
-                // §3.12.4 clause 1.1.3: include [inherited attributes]
+                // §3.12.4 clause 1.1.2: "E's [attributes]" — those
+                // collected for validation after the selection, and the
+                // `xsi:` (and accepted `xml:`) ones, validated already.
+                // Clause 1.1.3: include [inherited attributes]
                 // that do not have the same expanded name as any of
                 // E's [attributes] when building the CTA XDM instance.
                 // Use incoming_inherited (the PSVI view) with the
                 // CTA-specific same-name exclusion.
                 let mut cta_attrs = ev_state.collected_attributes.clone();
+                cta_attrs.extend(unlisted);
                 let explicit_names: HashSet<(Option<NameId>, NameId)> =
                     cta_attrs.iter().map(|(ns, name, _)| (*ns, *name)).collect();
                 for ((ns, name), val) in &ev_state.incoming_inherited {
@@ -4918,10 +4979,55 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             // are treated as matching. Reuses `ev_state.typed_value` parsed above
             // (line ~1778) to avoid a second parse of the same text content.
             if let Some(elem_key) = ev_state.element_decl {
-                let elem_data = &self.schema_set.arenas.elements[elem_key];
+                let schema_set: &'a SchemaSet = self.schema_set;
+                let elem_data = &schema_set.arenas.elements[elem_key];
                 if let Some(fixed) = &elem_data.fixed_value {
+                    // Clause 5.2.2.2.2: "the ·actual value· of E is equal or
+                    // identical to D.{value constraint}.{value}" — the
+                    // declaration's {value}, read under its ·effective simple
+                    // type definition· (§3.3.2.1), also when another type
+                    // governs E (`xsi:type`, a type alternative). XSD 1.0's
+                    // clause 5.2.2.2.2 instead: "the ·actual value· of the
+                    // item must match the canonical lexical representation of
+                    // the {value constraint} value" — a comparison by value,
+                    // with no facet applied to that form
+                    // (`xsd10_fixed_matches`). Under the declared type,
+                    // reading the literal there gives that {value} (both
+                    // versions). An untyped {value} (`xs:anySimpleType`
+                    // declared: no primitive type of its own) is read under
+                    // the governing type instead.
+                    let declared = elem_data
+                        .resolved_type
+                        .unwrap_or_else(|| TypeKey::Complex(schema_set.any_type_key()));
+                    let declared_value = ev_state
+                        .typed_value
+                        .as_ref()
+                        .filter(|_| !substituted_fixed && ev_state.schema_type != Some(declared))
+                        .and_then(|_| schema_set.value_constraint_value(elem_data))
+                        .filter(|(_, value)| value.type_code != XmlTypeCode::UntypedAtomic);
                     let matches = if substituted_fixed {
                         true
+                    } else if let (Some((lexical, value)), Some(typed)) =
+                        (&declared_value, &ev_state.typed_value)
+                    {
+                        if schema_set.is_xsd10() {
+                            super::simple::xsd10_fixed_matches(
+                                typed,
+                                &ev_state.text_content,
+                                value,
+                                lexical,
+                                ev_state.schema_type,
+                                schema_set.value_constraint_namespaces(elem_data.source.as_ref()),
+                                schema_set,
+                            )
+                        } else {
+                            super::simple::typed_literals_equal(
+                                typed,
+                                &ev_state.text_content,
+                                value,
+                                lexical,
+                            )
+                        }
                     } else if let Some(ref typed) = ev_state.typed_value {
                         // The fixed literal is read with the declaration's
                         // namespace bindings (an `xs:QName` value by
@@ -5376,8 +5482,14 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             // [nil] (§3.3.5.3): "true if clause 3.2.3 of Element Locally
             // Valid (Element) … is satisfied" — not for a nilled element with
             // character or element [children], whose clause 3.2.3.1 failed
-            // (`cvc-elt.3.2.1`, recorded on the element's own codes).
-            is_nil: ev_state.is_nil && !ev_state.error_codes.contains(&"cvc-elt.3.2.1"),
+            // (`cvc-elt.3.2.1`), nor for one whose declaration has a fixed
+            // value, clause 3.2.3.2 (`cvc-elt.3.2.2`); both are recorded on
+            // the element's own codes.
+            is_nil: ev_state.is_nil
+                && !ev_state
+                    .error_codes
+                    .iter()
+                    .any(|c| matches!(*c, "cvc-elt.3.2.1" | "cvc-elt.3.2.2")),
             content_type: ev_state.content_type,
             typed_value: ev_state.typed_value.take(),
             normalized_value: ev_state.normalized_value.take(),

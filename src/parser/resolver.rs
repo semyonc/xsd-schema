@@ -2233,28 +2233,36 @@ pub fn resolve_all_directives(
 
     // Process imports
     for (i, import) in imports.iter().enumerate() {
-        // src-import §4.2.3 (XSD 1.0): the namespace of an `<xs:import>`
-        // must not be the same as the enclosing schema's targetNamespace.
-        // XSD 1.1 explicitly relaxed this — own-namespace imports are
-        // permitted (errata, W3C bug 4126 / cleanup).
-        if schema_set.is_xsd10() {
-            if let Some(import_ns_str) = import.namespace.as_deref() {
-                let tns_str = target_namespace.map(|n| schema_set.name_table.resolve(n));
-                if Some(import_ns_str) == tns_str.as_deref() {
-                    result.errors.push(SchemaError::structural(
-                        "src-import",
-                        format!(
-                            "xs:import namespace '{}' must not equal the enclosing \
-                             schema's targetNamespace in XSD 1.0",
-                            import_ns_str
-                        ),
-                        import
-                            .source
-                            .as_ref()
-                            .and_then(|s| schema_set.source_maps.locate(s)),
-                    ));
-                    continue;
-                }
+        // src-import §4.2.3 clause 1.1 (XSD 1.0) / §4.2.6.2 clause 1.1 (XSD
+        // 1.1): "If the namespace [attribute] is present, then its ·actual
+        // value· does not match the ·actual value· of the enclosing
+        // <schema>'s targetNamespace [attribute]." Both versions.
+        if let Some(import_ns_str) = import.namespace.as_deref() {
+            let tns_str = target_namespace.map(|n| schema_set.name_table.resolve(n));
+            if Some(import_ns_str) == tns_str.as_deref() {
+                let message = if schema_set.is_xsd10() {
+                    format!(
+                        "xs:import namespace '{}' must not equal the enclosing \
+                         schema's targetNamespace in XSD 1.0",
+                        import_ns_str
+                    )
+                } else {
+                    format!(
+                        "xs:import namespace '{}' must not equal the enclosing \
+                         schema's targetNamespace (Import Constraints and Semantics, \
+                         clause 1.1)",
+                        import_ns_str
+                    )
+                };
+                result.errors.push(SchemaError::structural(
+                    "src-import",
+                    message,
+                    import
+                        .source
+                        .as_ref()
+                        .and_then(|s| schema_set.source_maps.locate(s)),
+                ));
+                continue;
             }
         }
         // src-import §4.2.3 clause 1.2 (XSD 1.0) / §4.2.6.1 clause 1.2 (XSD

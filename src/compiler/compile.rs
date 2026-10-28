@@ -1042,6 +1042,14 @@ pub(crate) fn is_top_level_all_group(
     None
 }
 
+/// Whether `particle` has minOccurs = maxOccurs = 0 — an `<element>`, `<group
+/// ref>`, `<all>`, `<choice>`, `<sequence>` or `<any>` that "corresponds to no
+/// component at all" (Structures §3.3.2, §3.7.2, §3.8.2, §3.10.2; XSD 1.0
+/// alike).
+pub(crate) fn is_zero_occurrence(particle: &ParticleResult) -> bool {
+    particle.min_occurs == 0 && particle.max_occurs == Some(0)
+}
+
 /// Detect a named model group reference at the top level that resolves to
 /// an `xs:all` group.
 ///
@@ -1066,13 +1074,26 @@ pub(crate) fn resolve_top_level_all_group_ref<'a>(
 /// Validate the outer occurrence constraints on a particle whose term is an all-group.
 ///
 /// XSD 1.0 (cos-all-limited.2): minOccurs must be 0 or 1, maxOccurs must be 1.
-/// XSD 1.1: more relaxed, but minOccurs > maxOccurs is always invalid.
+/// XSD 1.1 (All Group Limited, §3.8.6.2 clause 1.2: "the {term} property of a
+/// Particle with {max occurs} = 1 which is the {particle} of the {content
+/// type} of a complex type definition"; §3.8.2 `<all maxOccurs = (0 | 1)>`):
+/// maxOccurs must not exceed 1. minOccurs > maxOccurs is always invalid.
 pub(crate) fn validate_outer_all_group_occurs(
     particle: &ParticleResult,
     xsd_version: XsdVersion,
 ) -> NfaCompileResult<()> {
     let min = particle.min_occurs;
     let max = particle.max_occurs; // Option<u32>, None means unbounded
+
+    // A reference with minOccurs = maxOccurs = 0 "maps to no component at
+    // all" (§3.7.2, both versions): it is no all-group particle. (An inline
+    // <xs:all> is bound by §3.8.2's own minOccurs / maxOccurs: XSD 1.0 allows
+    // only maxOccurs="1".)
+    if is_zero_occurrence(particle)
+        && matches!(&particle.term, ParticleTerm::Group(group) if group.ref_name.is_some())
+    {
+        return Ok(());
+    }
 
     // XSD 1.0 specific constraints (check first for more specific error messages)
     if xsd_version == XsdVersion::V1_0 {
@@ -1104,6 +1125,15 @@ pub(crate) fn validate_outer_all_group_occurs(
                 });
             }
         }
+    } else if max.is_none_or(|n| n > 1) {
+        return Err(NfaCompileError::InvalidAllGroupOccurs {
+            reason: format!(
+                "cos-all-limited.1.2: an xs:all group that is the particle of a content type \
+                 must have maxOccurs 0 or 1, found {}",
+                max.map_or_else(|| "unbounded".to_string(), |n| n.to_string())
+            ),
+            location: particle.source.clone(),
+        });
     }
 
     // Universal: minOccurs > maxOccurs is always invalid
@@ -1362,6 +1392,14 @@ fn compile_top_level_all_group_ref_matcher(
     particle: &ParticleResult,
     group_data: &ModelGroupData,
 ) -> NfaCompileResult<ContentModelMatcher> {
+    // No component (§3.7.2): the content is empty.
+    if is_zero_occurrence(particle) {
+        return Ok(attach_own_open_content(
+            schema_set,
+            type_def,
+            ContentModelMatcher::Nfa(empty_nfa()),
+        ));
+    }
     validate_outer_all_group_occurs(particle, schema_set.xsd_version)?;
     ctx.resolved_particle_types = group_data.resolved_particle_types.clone();
     ctx.resolved_particle_elements = group_data.resolved_particle_elements.clone();
@@ -1443,6 +1481,16 @@ fn compile_all_group_matcher(
 
     if let Some((all_particles, all_source)) = is_top_level_all_group(particle) {
         validate_outer_all_group_occurs(particle, schema_set.xsd_version)?;
+        // `<xs:all minOccurs="0" maxOccurs="0">` (XSD 1.1, §3.8.2: "unless
+        // minOccurs=maxOccurs=0, in which case the item corresponds to no
+        // component at all"): the content is empty.
+        if is_zero_occurrence(particle) {
+            return Ok(Some(attach_own_open_content(
+                schema_set,
+                type_def,
+                ContentModelMatcher::Nfa(empty_nfa()),
+            )));
+        }
         ctx.resolved_particle_types = type_def.resolved_content_particle_types.to_vec();
         ctx.resolved_particle_elements = type_def.resolved_content_particle_elements.to_vec();
         ctx.content_flat_idx = Some(0);
@@ -1522,11 +1570,14 @@ fn compile_all_group_extension_matcher(
         type_def.source.as_ref(),
     );
 
-    // Determine what the extension adds
+    // Determine what the extension adds — nothing for a particle with
+    // minOccurs = maxOccurs = 0 (no component, §3.7.2 / §3.8.2; its explicit
+    // content is empty, §3.4.2.3.3 clause 2.1.4).
     let own_particle = match &type_def.content {
         ComplexContentResult::Complex(def) => def.particle.as_ref(),
         _ => None,
-    };
+    }
+    .filter(|particle| !is_zero_occurrence(particle));
 
     match own_particle {
         None => {
@@ -1535,8 +1586,44 @@ fn compile_all_group_extension_matcher(
             Ok(Some(attach_open_content(schema_set, matcher, open_content)))
         }
         Some(particle) => {
-            // Check if extension's own particle is an inline all-group
-            if let Some((ext_particles, ext_source)) = is_top_level_all_group(particle) {
+            // The extension's own particle is an all group: inline, or a
+            // reference to a named one (§3.4.2.3.3 clause 2.2: "the particle
+            // corresponding to the <all>, <choice>, <group> or <sequence>
+            // among the [children]" — a <group> particle's {term} is the
+            // referenced group's model group).
+            let ext_all = match is_top_level_all_group(particle) {
+                Some((ext_particles, ext_source)) => Some((ext_particles, ext_source, None)),
+                None => resolve_top_level_all_group_ref(particle, schema_set).map(|group| {
+                    (
+                        group.particles.as_slice(),
+                        group.source.as_ref(),
+                        Some(group),
+                    )
+                }),
+            };
+
+            // An empty all group in the base is no all-group particle: the
+            // base's explicit content is empty (clause 2.1.2), so its
+            // particle is the empty sequence of a mixed type (clause 3.1.1)
+            // or of open content (clause 6.2) — an extension that is not
+            // an all group follows it in a sequence (clause 4.2.3.3), and
+            // one that is would be an all group inside a sequence. (A base
+            // with {variety} empty never gets here: clause 4.2.1.)
+            if base_all_model.particles.is_empty() {
+                if ext_all.is_none() {
+                    return Ok(None);
+                }
+                return Err(NfaCompileError::InvalidAllGroupOccurs {
+                    reason: "cos-all-limited.1: the base type's content is an empty \
+                             sequence (mixed or open content), so an extension by an xs:all \
+                             group would place it inside a sequence (Structures \
+                             §3.4.2.3.3 clause 4.2.3.3)"
+                        .to_string(),
+                    location: particle.source.clone(),
+                });
+            }
+
+            if let Some((ext_particles, ext_source, group)) = ext_all {
                 // §3.4.2.3 / cos-ct-extends: when both base and extension
                 // are all-groups, their outer {min occurs} must match.
                 let base_outer_optional = base_all_model.outer_optional;
@@ -1553,26 +1640,34 @@ fn compile_all_group_extension_matcher(
                         location: particle.source.clone().or_else(|| ext_source.cloned()),
                     });
                 }
-
-                // Reject extending an empty xs:all — there is no
-                // base content to extend and the resulting type would
-                // collapse to the extension's own all-group, which is
-                // not a true extension. (W3C bug 6202; Saxon allows
-                // this but conformance tests treat it as invalid.)
-                if base_all_model.particles.is_empty() {
-                    return Err(NfaCompileError::InvalidAllGroupContent {
-                        location: particle.source.clone().or_else(|| ext_source.cloned()),
-                    });
-                }
+                validate_outer_all_group_occurs(particle, schema_set.xsd_version)?;
 
                 let mut ctx = if upa_mode {
                     CompileContext::new_for_upa(schema_set, type_def.target_namespace)
                 } else {
                     CompileContext::new(schema_set, type_def.target_namespace)
                 };
-                ctx.resolved_particle_types = type_def.resolved_content_particle_types.to_vec();
-                ctx.resolved_particle_elements =
-                    type_def.resolved_content_particle_elements.to_vec();
+                match group {
+                    // Clause 4.2.3.2 with a referenced group: its particles
+                    // are resolved on the group definition.
+                    Some(group_data) => {
+                        ctx.resolved_particle_types = group_data.resolved_particle_types.clone();
+                        ctx.resolved_particle_elements =
+                            group_data.resolved_particle_elements.clone();
+                        if let (Some(original_key), Some(name)) =
+                            (group_data.redefine_original, group_data.name)
+                        {
+                            ctx.redefine_redirect =
+                                Some((name, group_data.target_namespace, original_key));
+                        }
+                    }
+                    None => {
+                        ctx.resolved_particle_types =
+                            type_def.resolved_content_particle_types.to_vec();
+                        ctx.resolved_particle_elements =
+                            type_def.resolved_content_particle_elements.to_vec();
+                    }
+                }
                 ctx.content_flat_idx = Some(0);
                 let ext_model = ctx.compile_all_group_model(ext_particles, ext_source)?;
 
@@ -1585,11 +1680,14 @@ fn compile_all_group_extension_matcher(
                 return Ok(Some(attach_open_content(schema_set, matcher, open_content)));
             }
 
-            // Extension is sequence/choice/group-ref — invalid per
-            // cos-all-limited.1.2: an xs:all may only appear at the top
-            // of a content model. Wrapping the base's all-group inside
-            // a sequence(base, extension) violates that constraint.
-            Err(NfaCompileError::InvalidAllGroupContent {
+            // Extension is a sequence, a choice or a reference to one —
+            // clause 4.2.3.3 puts the base's all group in a sequence, which
+            // All Group Limited (§3.8.6.2) clause 1 forbids.
+            Err(NfaCompileError::InvalidAllGroupOccurs {
+                reason: "cos-all-limited.1: an extension of a type whose content is an \
+                         xs:all group must add an xs:all group or nothing (Structures \
+                         §3.4.2.3.3 clause 4.2.3)"
+                    .to_string(),
                 location: particle.source.clone(),
             })
         }
@@ -1735,6 +1833,22 @@ fn compile_content_model_matcher_impl(
         return Ok(matcher);
     }
 
+    // An extension of a base whose {content type} has {variety} empty takes
+    // its own content as a restriction would: Structures 1.1 §3.4.2.3.3
+    // clause "4.2.1 If the {base type definition} is a simple type definition
+    // or is a complex type definition whose {content type}.{variety} = empty
+    // or simple, then a Content Type as per clause 4.1.1 and clause 4.1.2
+    // above" (XSD 1.0 §3.4.2 clause 3.2.2, "a pair as per clause 3.1.2
+    // above"). An all group there — inline or referenced — is the
+    // {particle} of the content type (All Group Limited clause 1.2), not a
+    // member of a sequence after the base's (empty) particle.
+    if is_extension && extends_empty_content(schema_set, type_def) {
+        if let Some(matcher) = compile_all_group_matcher(&mut ctx, schema_set, type_def, false)? {
+            return Ok(matcher);
+        }
+        return compile_nfa_matcher(&mut ctx, schema_set, type_def, false, &mut base);
+    }
+
     // XSD 1.0: empty-base xs:all extended via a top-level group reference to
     // an xs:all. Without this branch the xsd11-feature path below would
     // reject the schema even when the SchemaSet runs in XSD 1.0 mode
@@ -1762,6 +1876,25 @@ fn compile_content_model_matcher_impl(
 
     // Standard NFA path (sequences, choices, named group refs, extensions)
     compile_nfa_matcher(&mut ctx, schema_set, type_def, is_extension, &mut base)
+}
+
+/// Whether `type_def`'s {base type definition} is a complex type whose
+/// {content type} has {variety} empty — no particle, and neither mixed nor
+/// widened by open content (`determine_content_type`; in XSD 1.1 an `<all>`
+/// or `<sequence>` without children, Structures 1.1 §3.4.2.3.3 clause 2.1.2,
+/// is no particle either).
+fn extends_empty_content(schema_set: &SchemaSet, type_def: &ComplexTypeDefData) -> bool {
+    let Some(TypeKey::Complex(base_key)) = type_def.resolved_base_type else {
+        return false;
+    };
+    schema_set
+        .arenas
+        .complex_types
+        .get(base_key)
+        .is_some_and(|base| {
+            crate::validation::runtime::determine_content_type(schema_set, base)
+                == crate::validation::info::ContentType::Empty
+        })
 }
 
 /// §3.4.2.3 clauses 5–6: effective open content for an XSD 1.1 extension type.

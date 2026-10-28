@@ -557,6 +557,438 @@ pub(crate) fn typed_values_equal(a: &XmlValue, b: &XmlValue) -> bool {
     a == b || super::identity::values_equal_or_identical(a, b)
 }
 
+/// XSD 1.0's Element Locally Valid (Element) clause 5.2.2.2.2 under a
+/// governing type other than the declared one: "the ·actual value· of the
+/// item must match the canonical lexical representation of the {value
+/// constraint} value". The canonical form ([`xsd10_canonical_form`]) only
+/// *names* the {value}; the comparison is by value, in the value space of the
+/// item's type, and no facet of the governing type (`pattern`, `length`,
+/// digits, `enumeration`, …) is applied to any spelling:
+///
+/// - two atomic values of one primitive datatype other than `string` are
+///   compared as XSD 1.1 compares them ([`typed_literals_equal`], equal or
+///   identical, the seconds of a date/time or duration as written) — the
+///   canonical form of a value, read back in its own value space, is that
+///   value;
+/// - otherwise — a `string` {value}, values of two primitive datatypes, a list
+///   against an atomic value either way — the {value}'s canonical form is
+///   read by the governing type's lexical mapping (its white-space
+///   normalization, then the built-in datatype of the item's value or of each
+///   of its list members; a QName with the bindings of the declaration
+///   `value_ns`) and the values compared.
+///
+/// This is what the 1.0 text adds over 1.1's "equal or identical to D.{value
+/// constraint}.{value}": a {value} of another datatype (the string "1" of an
+/// `xs:anyType` declaration, the integer 1 or the list `1 2` of a union
+/// member, a dateTime member in `Z`) matches the item's value through its
+/// canonical form, and a string {value} is read with the governing type's
+/// white space. `actual_text` and `value_lexical` are the literals the two
+/// values were read from (the element's text, D.{lexical form}).
+pub(crate) fn xsd10_fixed_matches(
+    actual: &XmlValue,
+    actual_text: &str,
+    value: &XmlValue,
+    value_lexical: &str,
+    governing: Option<TypeKey>,
+    value_ns: Option<&NamespaceContextSnapshot>,
+    schema_set: &SchemaSet,
+) -> bool {
+    fn member(v: &XmlValue) -> &XmlValue {
+        match &v.value {
+            XmlValueKind::Union(inner) => member(inner),
+            _ => v,
+        }
+    }
+    fn items(v: &XmlValue) -> Option<&[XmlValue]> {
+        match &v.value {
+            XmlValueKind::List { items, .. } => Some(items),
+            _ => None,
+        }
+    }
+    let collapse = |c: &str| normalize_whitespace(c, WhitespaceMode::Collapse).into_owned();
+    let (a, v) = (member(actual), member(value));
+    let a_texts: Vec<&str> = actual_text.split_ascii_whitespace().collect();
+    match (items(a), items(v)) {
+        (Some(a_items), Some(v_items)) => {
+            let v_texts: Vec<&str> = value_lexical.split_ascii_whitespace().collect();
+            a_items.len() == v_items.len()
+                && a_texts.len() == a_items.len()
+                && v_texts.len() == v_items.len()
+                && (0..a_items.len()).all(|i| {
+                    atomic_matches_10(
+                        member(&a_items[i]),
+                        a_texts[i],
+                        member(&v_items[i]),
+                        v_texts[i],
+                        value_ns,
+                        schema_set,
+                        collapse,
+                    )
+                })
+        }
+        // An atomic {value} (a string "1 2") against a list: its canonical
+        // form, read as the list reads it (collapsed, member by member).
+        (Some(a_items), None) => {
+            let canonical = xsd10_canonical_form(v, value_lexical);
+            let forms: Vec<&str> = canonical.split_ascii_whitespace().collect();
+            a_items.len() == forms.len()
+                && a_texts.len() == a_items.len()
+                && (0..a_items.len()).all(|i| {
+                    read_and_compare_10(
+                        member(&a_items[i]),
+                        a_texts[i],
+                        forms[i],
+                        value_ns,
+                        schema_set,
+                    )
+                })
+        }
+        // A list {value} against an atomic value: the list's canonical form
+        // (its members' forms joined by single spaces).
+        (None, Some(_)) => {
+            let canonical = xsd10_canonical_form(v, value_lexical);
+            let normalized = governing_normalized(&canonical, governing, schema_set);
+            read_and_compare_10(a, actual_text, &normalized, value_ns, schema_set)
+        }
+        (None, None) => atomic_matches_10(
+            a,
+            actual_text,
+            v,
+            value_lexical,
+            value_ns,
+            schema_set,
+            |c| governing_normalized(c, governing, schema_set),
+        ),
+    }
+}
+
+/// `literal` normalized with the white space of the governing type.
+fn governing_normalized(
+    literal: &str,
+    governing: Option<TypeKey>,
+    schema_set: &SchemaSet,
+) -> String {
+    match governing {
+        Some(tk) => normalized_literal(literal, tk, schema_set)
+            .map(|n| n.into_owned())
+            .unwrap_or_else(|| literal.to_owned()),
+        None => literal.to_owned(),
+    }
+}
+
+/// [`xsd10_fixed_matches`] for two atomic values; `normalize` is the
+/// governing type's white-space normalization.
+fn atomic_matches_10(
+    actual: &XmlValue,
+    actual_text: &str,
+    value: &XmlValue,
+    value_lexical: &str,
+    value_ns: Option<&NamespaceContextSnapshot>,
+    schema_set: &SchemaSet,
+    normalize: impl Fn(&str) -> String,
+) -> bool {
+    let qname = |v: &XmlValue| {
+        holds_qname_value(v) || matches!(v.type_code, XmlTypeCode::QName | XmlTypeCode::Notation)
+    };
+    let primitive = actual.primitive_type();
+    if (qname(actual) && qname(value))
+        || (primitive.is_some()
+            && primitive == value.primitive_type()
+            && primitive != Some(crate::types::PrimitiveTypeCode::String))
+    {
+        return typed_literals_equal(actual, actual_text, value, value_lexical);
+    }
+    let canonical = normalize(&xsd10_canonical_form(value, value_lexical));
+    read_and_compare_10(actual, actual_text, &canonical, value_ns, schema_set)
+}
+
+/// Whether `form`, read by the built-in datatype of the atomic value `actual`
+/// (no facet of a derived type), is that value; a QName with the bindings
+/// `value_ns` of the declaration the form names a value of.
+fn read_and_compare_10(
+    actual: &XmlValue,
+    actual_text: &str,
+    form: &str,
+    value_ns: Option<&NamespaceContextSnapshot>,
+    schema_set: &SchemaSet,
+) -> bool {
+    if let XmlValueKind::UntypedAtomic(s) = &actual.value {
+        return s == form;
+    }
+    let Some(builtin) = schema_set
+        .builtin_types()
+        .get_by_type_code(actual.type_code)
+    else {
+        return false;
+    };
+    let names = &schema_set.name_table;
+    let resolver = value_ns.map(|ns| snapshot_prefixes(ns, names));
+    match validate_simple_type_in(
+        form,
+        TypeKey::Simple(builtin),
+        schema_set,
+        resolver.as_ref().map(|r| r as PrefixResolver<'_>),
+    ) {
+        Ok(read) => typed_literals_equal(actual, actual_text, &read.typed_value, form),
+        Err(_) => false,
+    }
+}
+
+/// The canonical lexical representation XSD 1.0 gives `value`, read from the
+/// literal `lexical` — built from the value, with the fraction of a seconds
+/// field taken from the literal as written (no digit lost to the stored
+/// value's capacity). Datatypes 1.0:
+///
+/// - §3.2.2.2 boolean `true` / `false`; §3.3.13.2 (and the integer types)
+///   "the preceding optional "+" sign is prohibited and leading zeroes are
+///   prohibited";
+/// - §3.2.3.2 decimal: "The decimal point is required. Leading and trailing
+///   zeroes are prohibited subject to the following: there must be at least one
+///   digit to the right and to the left of the decimal point which may be a
+///   zero";
+/// - §3.2.4.2 / §3.2.5.2 float, double: "the exponent must be indicated by "E".
+///   Leading zeroes and the preceding optional "+" sign are prohibited in the
+///   exponent. If the exponent is zero, it must be indicated by "E0". For the
+///   mantissa, the preceding optional "+" sign is prohibited and the decimal
+///   point is required … The canonical representation for zero is 0.0E0";
+/// - §3.2.7.2 dateTime: "The 2-digit numeral representing the hour must not be
+///   '24'; The fractional second string, if present, must not end in '0'; for
+///   timezoned values, the timezone must be represented with 'Z'"; §3.2.8.2
+///   time: "the time zone must be Coordinated Universal Time (UTC) indicated by
+///   a "Z". Additionally, the canonical representation for midnight is
+///   00:00:00"; §3.2.9.2 date: "the date portion of the dateTime canonical
+///   representation of the interval midpoint … For timezoned values, append the
+///   canonical representation of the ·recoverable timezone·" (between -11:59
+///   and +12:00, §3.2.9.1);
+/// - §3.2.15.2 hexBinary: "the lower case hexadecimal digits ([a-f]) are not
+///   allowed";
+/// - §2.5.1.2 list: "each item in the ·list· has the canonical lexical
+///   representation of its ·itemType·" (joined by single spaces); §2.5.1.3
+///   union: "the values have the canonical lexical representation of the
+///   appropriate ·memberTypes·".
+///
+/// Datatypes 1.0 defines none for the other datatypes. A string, `anyURI`,
+/// `base64Binary` or Gregorian (`gYear` …) value is written as its string
+/// value (its literals map one to one, a time zone `Z` for zero); a duration
+/// as its six fields as given (§3.2.6: its value space is six-dimensional),
+/// zero fields omitted, `PT0S` for zero; a QName / NOTATION as the literal,
+/// whose prefix the declaration's bindings read.
+pub(crate) fn xsd10_canonical_form(value: &XmlValue, lexical: &str) -> String {
+    fn exponent_form(formatted: String) -> String {
+        // Rust's `{:E}` writes the shortest mantissa that reads back as the
+        // same value, with a bare exponent ("1E2", "-2.5E-3", "0E0").
+        match formatted.split_once('E') {
+            Some((mantissa, exponent)) if !mantissa.contains('.') => {
+                format!("{mantissa}.0E{exponent}")
+            }
+            _ => formatted,
+        }
+    }
+    use crate::types::PrimitiveTypeCode as P;
+    match &value.value {
+        XmlValueKind::Union(inner) => xsd10_canonical_form(inner, lexical),
+        XmlValueKind::List { items, .. } => {
+            let texts: Vec<&str> = lexical.split_ascii_whitespace().collect();
+            items
+                .iter()
+                .enumerate()
+                .map(|(i, item)| xsd10_canonical_form(item, texts.get(i).copied().unwrap_or("")))
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+        XmlValueKind::UntypedAtomic(s) => s.clone(),
+        XmlValueKind::Atomic(atom) => match atom {
+            XmlAtomicValue::Float(v) if v.is_finite() => exponent_form(format!("{v:E}")),
+            XmlAtomicValue::Double(v) if v.is_finite() => exponent_form(format!("{v:E}")),
+            XmlAtomicValue::DateTime(dt) => xsd10_date_time_form(dt, lexical),
+            XmlAtomicValue::Time(t) => xsd10_time_form(t, lexical),
+            XmlAtomicValue::Date(d) => xsd10_date_form(d),
+            XmlAtomicValue::Duration(d) => xsd10_duration_form(d, lexical),
+            _ => match value.primitive_type() {
+                Some(P::QName | P::Notation) => {
+                    normalize_whitespace(lexical, WhitespaceMode::Collapse).into_owned()
+                }
+                Some(P::Decimal) if value.type_code == XmlTypeCode::Decimal => {
+                    // The decimal point is required ("1" is "1.0").
+                    let form = value.to_string_value();
+                    if form.contains('.') {
+                        form
+                    } else {
+                        format!("{form}.0")
+                    }
+                }
+                _ => value.to_string_value(),
+            },
+        },
+    }
+}
+
+/// The fraction digits of the seconds of a date/time or duration literal as
+/// written, without trailing zeros (empty for none).
+fn literal_seconds_fraction(lexical: &str) -> &str {
+    // The seconds are the last number of a time or duration literal; a date
+    // part has no decimal point.
+    let Some(dot) = lexical.rfind('.') else {
+        return "";
+    };
+    let digits = &lexical[dot + 1..];
+    let end = digits
+        .bytes()
+        .position(|b| !b.is_ascii_digit())
+        .unwrap_or(digits.len());
+    digits[..end].trim_end_matches('0')
+}
+
+/// Whole seconds of `second`, and the canonical seconds field: two digits,
+/// then the literal's fraction (if any digit is left).
+fn seconds_field(second: rust_decimal::Decimal, lexical: &str, width: usize) -> String {
+    let whole = second.trunc();
+    let fraction = literal_seconds_fraction(lexical);
+    let whole = format!("{whole:0width$}");
+    if fraction.is_empty() {
+        whole
+    } else {
+        format!("{whole}.{fraction}")
+    }
+}
+
+/// The days from 1970-01-01 of `year-month-day` with the XSD 1.0 year (no year
+/// 0: -0001 precedes 0001) read astronomically.
+fn days_10(year: i32, month: u8, day: u8) -> i128 {
+    let astronomical = if year < 0 { year + 1 } else { year };
+    crate::types::value_order::days_from_civil(i128::from(astronomical), i128::from(month))
+        + i128::from(day)
+        - 1
+}
+
+/// The XSD 1.0 year, month and day of the day `days` from 1970-01-01.
+fn civil_10(days: i128) -> (i128, u8, u8) {
+    // H. Hinnant's civil_from_days, proleptic Gregorian.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u8;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u8;
+    let year = yoe + era * 400 + i128::from(month <= 2);
+    // Back to the 1.0 numbering: astronomical 0 is -0001.
+    (if year <= 0 { year - 1 } else { year }, month, day)
+}
+
+fn year_field(year: i128) -> String {
+    if year < 0 {
+        format!("-{:04}", year.unsigned_abs())
+    } else {
+        format!("{year:04}")
+    }
+}
+
+fn timezone_field(minutes: i16) -> String {
+    crate::types::value::TimezoneOffset(minutes).to_string()
+}
+
+/// §3.2.7.2: a timezoned value in `Z` (the instant moved by its offset), the
+/// fraction as written without trailing zeros.
+fn xsd10_date_time_form(dt: &crate::types::value::DateTimeValue, lexical: &str) -> String {
+    let offset = dt.timezone.map_or(0, |tz| i128::from(tz.0));
+    let minutes = i128::from(dt.hour) * 60 + i128::from(dt.minute) - offset;
+    let days = days_10(dt.year, dt.month, dt.day) + minutes.div_euclid(1440);
+    let minutes = minutes.rem_euclid(1440);
+    let (year, month, day) = civil_10(days);
+    let mut form = format!(
+        "{}-{month:02}-{day:02}T{:02}:{:02}:{}",
+        year_field(year),
+        minutes / 60,
+        minutes % 60,
+        seconds_field(dt.second, lexical, 2)
+    );
+    if dt.timezone.is_some() {
+        form.push('Z');
+    }
+    form
+}
+
+/// §3.2.8.2: a timezoned time in `Z`, midnight `00:00:00`.
+fn xsd10_time_form(t: &crate::types::value::TimeValue, lexical: &str) -> String {
+    let offset = t.timezone.map_or(0, |tz| i128::from(tz.0));
+    let minutes = (i128::from(t.hour) * 60 + i128::from(t.minute) - offset).rem_euclid(1440);
+    let mut form = format!(
+        "{:02}:{:02}:{}",
+        minutes / 60,
+        minutes % 60,
+        seconds_field(t.second, lexical, 2)
+    );
+    if t.timezone.is_some() {
+        form.push('Z');
+    }
+    form
+}
+
+/// §3.2.9.2: the date of the interval midpoint with the ·recoverable
+/// timezone· (between -11:59 and +12:00: an offset beyond moves the date by a
+/// day and the offset by 24 hours).
+fn xsd10_date_form(d: &crate::types::value::DateValue) -> String {
+    let mut days = days_10(d.year, d.month, d.day);
+    let timezone = d.timezone.map(|tz| {
+        let mut minutes = tz.0;
+        if minutes > 720 {
+            days -= 1;
+            minutes -= 1440;
+        } else if minutes < -719 {
+            days += 1;
+            minutes += 1440;
+        }
+        minutes
+    });
+    let (year, month, day) = civil_10(days);
+    let mut form = format!("{}-{month:02}-{day:02}", year_field(year));
+    if let Some(minutes) = timezone {
+        form.push_str(&timezone_field(minutes));
+    }
+    form
+}
+
+/// A duration as its six fields as given, zero fields omitted (`PT0S` for
+/// zero), the seconds' fraction as written.
+fn xsd10_duration_form(d: &crate::types::value::DurationValue, lexical: &str) -> String {
+    let seconds = seconds_field(d.seconds, lexical, 1);
+    let zero_seconds = d.seconds.is_zero() && literal_seconds_fraction(lexical).is_empty();
+    let mut form = String::new();
+    if d.years > 0 {
+        form.push_str(&format!("{}Y", d.years));
+    }
+    if d.months > 0 {
+        form.push_str(&format!("{}M", d.months));
+    }
+    if d.days > 0 {
+        form.push_str(&format!("{}D", d.days));
+    }
+    let mut time = String::new();
+    if d.hours > 0 {
+        time.push_str(&format!("{}H", d.hours));
+    }
+    if d.minutes > 0 {
+        time.push_str(&format!("{}M", d.minutes));
+    }
+    if !zero_seconds {
+        time.push_str(&format!("{seconds}S"));
+    }
+    if !time.is_empty() {
+        form.push('T');
+        form.push_str(&time);
+    }
+    if form.is_empty() {
+        return "PT0S".to_string();
+    }
+    if d.negative {
+        format!("-P{form}")
+    } else {
+        format!("P{form}")
+    }
+}
+
 /// [`typed_values_equal`] of two values read from the literals `a_lexical`
 /// and `b_lexical`: a date/time or duration literal whose seconds have more
 /// fraction digits than its typed value holds is compared with the fraction
@@ -2207,6 +2639,103 @@ mod tests {
         schema_set.arenas.elements[elem_key]
             .resolved_type
             .expect("element has no resolved type")
+    }
+
+    /// XSD 1.0's canonical forms (Datatypes 1.0 §2.5.1, §3.2.x.2): built from
+    /// the value, the seconds' fraction as written.
+    #[test]
+    fn xsd10_canonical_forms() {
+        let ss = SchemaSet::new();
+        let builtin = |code: XmlTypeCode| {
+            TypeKey::Simple(ss.builtin_types().get_by_type_code(code).expect("built-in"))
+        };
+        let form = |literal: &str, code: XmlTypeCode| {
+            let value = validate_simple_type(literal, builtin(code), &ss)
+                .expect("valid")
+                .typed_value;
+            xsd10_canonical_form(&value, literal)
+        };
+        for (literal, code, want) in [
+            ("1", XmlTypeCode::Decimal, "1.0"),
+            ("+001.500", XmlTypeCode::Decimal, "1.5"),
+            ("-0.50", XmlTypeCode::Decimal, "-0.5"),
+            ("0", XmlTypeCode::Decimal, "0.0"),
+            ("007", XmlTypeCode::Integer, "7"),
+            ("100", XmlTypeCode::Float, "1.0E2"),
+            ("0.5", XmlTypeCode::Double, "5.0E-1"),
+            ("-1234.5", XmlTypeCode::Double, "-1.2345E3"),
+            ("1", XmlTypeCode::Double, "1.0E0"),
+            ("0", XmlTypeCode::Double, "0.0E0"),
+            ("INF", XmlTypeCode::Double, "INF"),
+            ("NaN", XmlTypeCode::Float, "NaN"),
+            ("1", XmlTypeCode::Boolean, "true"),
+            (" a  b ", XmlTypeCode::Token, "a b"),
+            ("0fb7", XmlTypeCode::HexBinary, "0FB7"),
+            (
+                "2000-01-01T00:00:00Z",
+                XmlTypeCode::DateTime,
+                "2000-01-01T00:00:00Z",
+            ),
+            (
+                "2000-01-01T12:30:00+01:00",
+                XmlTypeCode::DateTime,
+                "2000-01-01T11:30:00Z",
+            ),
+            (
+                "2000-01-01T00:30:00+01:00",
+                XmlTypeCode::DateTime,
+                "1999-12-31T23:30:00Z",
+            ),
+            (
+                "2000-01-01T24:00:00",
+                XmlTypeCode::DateTime,
+                "2000-01-02T00:00:00",
+            ),
+            (
+                "2000-01-01T00:00:01.500",
+                XmlTypeCode::DateTime,
+                "2000-01-01T00:00:01.5",
+            ),
+            (
+                "2000-01-01T00:00:00.000",
+                XmlTypeCode::DateTime,
+                "2000-01-01T00:00:00",
+            ),
+            (
+                "2000-01-01T00:00:00.123456789012345678901234567891Z",
+                XmlTypeCode::DateTime,
+                "2000-01-01T00:00:00.123456789012345678901234567891Z",
+            ),
+            (
+                "-0001-12-31T23:00:00-02:00",
+                XmlTypeCode::DateTime,
+                "0001-01-01T01:00:00Z",
+            ),
+            (
+                "0001-01-01T00:00:00+01:00",
+                XmlTypeCode::DateTime,
+                "-0001-12-31T23:00:00Z",
+            ),
+            ("23:30:00-01:00", XmlTypeCode::Time, "00:30:00Z"),
+            ("24:00:00", XmlTypeCode::Time, "00:00:00"),
+            ("2002-10-10+13:00", XmlTypeCode::Date, "2002-10-09-11:00"),
+            ("2002-10-10-12:00", XmlTypeCode::Date, "2002-10-11+12:00"),
+            ("2002-10-10+12:00", XmlTypeCode::Date, "2002-10-10+12:00"),
+            ("2002-10-10+00:00", XmlTypeCode::Date, "2002-10-10Z"),
+            ("PT60M", XmlTypeCode::Duration, "PT60M"),
+            ("P0Y1M", XmlTypeCode::Duration, "P1M"),
+            ("PT0.000S", XmlTypeCode::Duration, "PT0S"),
+            ("-PT1.50S", XmlTypeCode::Duration, "-PT1.5S"),
+            (
+                "PT0.123456789012345678901234567891S",
+                XmlTypeCode::Duration,
+                "PT0.123456789012345678901234567891S",
+            ),
+            ("2000-01+00:00", XmlTypeCode::GYearMonth, "2000-01Z"),
+        ] {
+            assert_eq!(form(literal, code), want, "{literal} as {code:?}");
+        }
+        assert_eq!(form(" p:x ", XmlTypeCode::QName), "p:x");
     }
 
     /// The expanded-name index of a QName enumeration is built once, shared

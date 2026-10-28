@@ -2218,6 +2218,14 @@ fn parse_duration(s: &str) -> ValidationResult<DurationValue> {
             "Time designator 'T' requires at least one time component".to_string(),
         ));
     }
+    // Datatypes 1.1 §3.3.6.2: "a durationLexicalRep consists of one or more
+    // of a duYearFrag, duMonthFrag, duDayFrag, duHourFrag, duMinuteFrag,
+    // and/or duSecondFrag, in order".
+    if !duration_fields_in_order(s) {
+        return Err(bad(
+            "the fields of a duration are in the order Y, M, D, T, H, M, S".to_string(),
+        ));
+    }
 
     Ok(out)
 }
@@ -2886,8 +2894,8 @@ fn parse_gmonth(s: &str) -> ValidationResult<GMonthValue> {
 
 /// Whether the designators of a duration literal come in the order of
 /// Datatypes 1.1 §3.3.6.2's grammar — `Y`, `M`, `D`, then after `T` `H`, `M`,
-/// `S`. [`parse_duration`] does not check the order (it accepts `P1M1Y` for
-/// `xs:duration`); the two duration subtypes do.
+/// `S` — checked by [`parse_duration`] for `xs:duration` and its two
+/// subtypes alike.
 fn duration_fields_in_order(s: &str) -> bool {
     let mut last = 0u8;
     let mut in_time = false;
@@ -2931,9 +2939,6 @@ fn parse_year_month_duration(s: &str) -> ValidationResult<YearMonthDurationValue
             "yearMonthDuration cannot contain day or time components",
         ));
     }
-    if !duration_fields_in_order(s) {
-        return Err(bad("the fields of a duration are in the order Y, M"));
-    }
     Ok(YearMonthDurationValue {
         negative: duration.negative,
         years: duration.years,
@@ -2964,11 +2969,6 @@ fn parse_day_time_duration(s: &str) -> ValidationResult<DayTimeDurationValue> {
     }
     if !s.contains(['D', 'T']) {
         return Err(bad("dayTimeDuration needs a day or a time component"));
-    }
-    if !duration_fields_in_order(s) {
-        return Err(bad(
-            "the fields of a duration are in the order D, T, H, M, S",
-        ));
     }
     Ok(DayTimeDurationValue {
         negative: duration.negative,
