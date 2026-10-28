@@ -11,7 +11,9 @@ Use
 * [`EXTENSIBILITY.md`](EXTENSIBILITY.md) for
 extension points, 
 * [`BUFFER_DOCUMENT_OVERVIEW.md`](BUFFER_DOCUMENT_OVERVIEW.md) for the schema-aware
-  XPath/assertion document store, and 
+  XPath/assertion document store, 
+* [`IMPLEMENTATION_LIMITS.md`](IMPLEMENTATION_LIMITS.md) for the bounds of the value
+  types and of nesting, and 
 * [`UNSAFE.md`](UNSAFE.md) for unsafe-code invariants.
 
 ---
@@ -56,17 +58,27 @@ compares values as Structures 1.1 says — "equal or identical" (element and
 attribute `fixed`, and the `fixed` checks of a restriction), and "identical"
 for an attribute use against its declaration in XSD 1.1 (equal in 1.0 mode):
 `NaN` matches `NaN`, `0` matches `-0`, two date/time spellings of one instant
-in different time zones match, durations compare by months and seconds, and
-values of different primitive types never match. In XSD 1.0 mode this departs
-from the letter of two XSD 1.0 clauses that compare strings — Attribute Locally
-Valid (Use): "its ·normalized value· must match the canonical lexical
-representation of the attribute use's {value constraint} value"; and
-derivation-ok-restriction 2.1.3.2: "R's ·effective value constraint· is fixed
-with the same string as B's" — so values equal in value space but spelled
-differently (`13:00:00+01:00` against `fixed="12:00:00Z"`, `PT60S` against
-`fixed="PT1M"`) are accepted there too. No W3C XSD 1.0 test tells the two
-readings apart. `xs:QName` / `xs:NOTATION` `fixed` values still compare
-lexically.
+in different time zones match, durations compare by months and seconds,
+`xs:QName` / `xs:NOTATION` values compare by expanded name (each read with the
+namespace bindings where it is written), and values of different primitive
+types never match. In XSD 1.0 mode this departs from the letter of two XSD 1.0
+clauses that compare strings — Attribute Locally Valid (Use): "its ·normalized
+value· must match the canonical lexical representation of the attribute use's
+{value constraint} value"; and derivation-ok-restriction 2.1.3.2: "R's
+·effective value constraint· is fixed with the same string as B's" — so values
+equal in value space but spelled differently (`13:00:00+01:00` against
+`fixed="12:00:00Z"`, `PT60S` against `fixed="PT1M"`) are accepted there too.
+No W3C XSD 1.0 test tells the two readings apart.
+
+One case follows each version's own text: an element's content under an
+`xsi:type` or a type alternative against its declaration's `fixed` {value}
+(Element Locally Valid (Element) clause 5.2.2.2.2). XSD 1.1 requires the
+actual value to be equal or identical to the {value}; XSD 1.0 requires it to
+match the {value}'s canonical lexical representation, so in 1.0 mode a {value}
+of another primitive datatype, a string {value}, or a list against an atomic
+value matches through that form (Datatypes 1.0 §2.5.1, §3.2.x.2: a dateTime in
+`Z`, the seconds as written), read with the element type's white space and no
+facet of the element's type applied to it.
 
 ---
 
@@ -108,13 +120,18 @@ inline type and local particle allocation
 src/schema/inline.rs
         |
         v
+nesting check (SchemaSet::max_depth)
+src/schema/nesting.rs
+        |
+        v
 QName reference resolution
 src/schema/resolver.rs
         |
         v
 schema-time checks and content model compilation
 src/pipeline.rs
-src/schema/derivation.rs
+src/schema/derivation/
+src/schema/cta.rs (XPath of assertions and type alternatives)
 src/compiler/
         |
         v
@@ -135,17 +152,28 @@ src/xml/
 instance bytes
 ```
 
+**One walk, one sequence.** Every entry point — `load_and_process_schema`,
+`SchemaSetBuilder::compile`, `process_loaded_schemas` and the asynchronous
+variants — runs the same phases in the same order (`process_loaded_schemas` in
+`src/pipeline.rs`), and directive resolution is one walk over the directives
+(`src/parser/resolver.rs`) that applies the same rules whether the documents are
+read synchronously or prefetched by an `AsyncSchemaLoader`. The walk does not
+recurse: `ResolverConfig::max_depth` bounds the work, not the stack. Locations
+are identified as normalized RFC 3986 references, after the location rewriter
+(if any) has answered, so one document is loaded once however it is named.
+
 ### Phase Ownership
 
 | Phase | Main code | Input | Output / mutation |
 | --- | --- | --- | --- |
 | Parse | `src/parser/parse.rs`, `src/parser/frames/` | XML schema bytes | Frame results with names, namespace snapshots, source locations. |
 | Assemble | `src/parser/assemble.rs` | Parser frame results | `SchemaDocument`, top-level arena components, namespace tables, unresolved `QNameRef`s. |
-| Directive resolution | `src/parser/resolver.rs` | `xs:include`, `xs:import`, `xs:redefine`, `xs:override` | Additional documents, loaded-location caches, composition edges. |
+| Directive resolution | `src/parser/resolver.rs`, `src/parser/uri.rs` | `xs:include`, `xs:import`, `xs:redefine`, `xs:override` | Additional documents, loaded-location caches, composition edges, `DirectiveFailure`s for documents that could not be read. |
 | Composition | `src/schema/redefine.rs`, `src/schema/override_dir.rs`, `src/schema/composition.rs` | Parsed documents and edges | Effective component graph after redefine/override rules. |
 | Inline allocation | `src/schema/inline.rs` | Inline type definitions and local particles | Arena keys for inline types and local element declarations. |
+| Nesting check | `src/schema/nesting.rs` | Components and their references | `SchemaLimit::ComponentDepth` refusals before any pass recurses along a reference chain. |
 | Reference resolution | `src/schema/resolver.rs` | `QNameRef`s | Typed keys in `resolved_*` fields, plus `src-resolve` diagnostics. |
-| Schema checks | `src/pipeline.rs`, `src/schema/derivation.rs`, `src/schema/edc.rs` | Resolved schema model | Derivation, value constraint, EDC, UPA, and structural errors. |
+| Schema checks | `src/pipeline.rs`, `src/schema/derivation/`, `src/schema/edc.rs`, `src/schema/cta.rs` | Resolved schema model | Derivation (restriction with exact occurrence counts, `derivation/counts.rs`), value constraint, EDC, UPA, the XPath of assertions and type alternatives, and structural errors. |
 | Compilation | `src/compiler/` | Resolved particles and groups | `NfaTable`, `AllGroupModel`, substitution-group maps, open-content matchers. |
 | Validation | `src/validation/` | Compiled `SchemaSet` + XML events | `SchemaInfo`, typed values, validation diagnostics, ID/IDREF and identity-constraint state. |
 
@@ -191,13 +219,13 @@ the document that lexically contained it, not any document sharing the same
 
 ### NameTable
 
-`NameTable` interns strings and returns stable `NameId`s. It holds one of the
-crate's two `unsafe` blocks (`resolve_ref` returns `&str` into interned data
-without allocating, so `DomNavigator` methods don't need to allocate). The
-other lives in `ValidationRuntime::begin_assertion_buffering`, which extends
-the lifetime of a `Bump` arena borrow used by the self-referential fragment
-builder. Both contracts are documented in `doc/UNSAFE.md` and verified with
-Miri.
+`NameTable` interns strings and returns stable `NameId`s. It holds two of the
+crate's `unsafe` blocks (`resolve_ref` / `try_resolve_ref` return `&str` into
+interned data without allocating, so `DomNavigator` methods don't need to
+allocate). Another lives in `ValidationRuntime::begin_assertion_buffering`,
+which extends the lifetime of a `Bump` arena borrow used by the
+self-referential fragment builder, and one in `DynamicContext::eval_function`.
+Every site and its contract is listed in `doc/UNSAFE.md`.
 
 ---
 
@@ -221,6 +249,21 @@ ValidationRuntime
     +-- optional XSD 1.1 assertion buffering
 ```
 
+**The validation root.** A run assesses its root as `ValidationRoot` says
+(Structures 1.1 §5.2): by the declaration of its name (the default), against a
+stipulated element declaration or type definition, or laxly. The mode only
+decides the root's governing declaration and type in
+`ValidationRuntime::validate_element`; everything below the root is validated
+as usual, and every driver that takes the caller's runtime honours it.
+
+**Attribute uses.** The end-of-attributes step walks the governing type's
+{attribute uses} as Structures §3.4.2.4 builds them — inherited uses, attribute
+groups, a restriction's prohibitions — once, for every consumer: missing
+required attributes (`cvc-complex-type.4`), defaulted attributes (reported to
+the caller and added to the PSVI), and the defaulted values that take part in
+identity constraints and in the ID/IDREF and ENTITY checks. The schema-time
+restriction check reads the same {attribute uses} on both sides.
+
 Important runtime modules:
 
 | Path | Responsibility |
@@ -231,7 +274,7 @@ Important runtime modules:
 | `src/validation/quick_xml_driver.rs` | The streaming driver on that layer: turns its checked events into the runtime push API (namespace scope, `xsi:` attributes, namespace snapshots, text runs) and calls the `ValidationEventHandler` hooks. |
 | `src/validation/content.rs` | Content-model state transitions. |
 | `src/validation/simple.rs` | Simple type, list/union, atomic value, and facet validation. |
-| `src/validation/identity.rs` | Streaming `key`, `unique`, and `keyref` evaluation. |
+| `src/validation/identity.rs` | Streaming `key`, `unique`, and `keyref` evaluation; each keyref is checked against the identity-constraint table of the element that declares it (its own and its descendants' keys, Structures §3.11.4 clause 4.3), through hashed tables. |
 | `src/validation/active_axis.rs` | Efficient selector/field axis matching for identity constraints. |
 | `src/validation/assertions.rs` | XSD 1.1 assertion evaluation. |
 | `src/validation/alternatives.rs` | XSD 1.1 type alternative selection. |
@@ -345,22 +388,26 @@ locations, so the caller need not track file paths — adds the hinted schemas,
 and compiles once:
 
 ```rust
-use xsd_schema::enrich_schema_set;
+use xsd_schema::validation::{ValidationRuntime, ValidationSink};
+use xsd_schema::{enrich_schema_set, SchemaSet};
 
-// First pass: validate and collect hints
-let sl = runtime.schema_location_hints().to_vec();
-let nnsl = runtime.no_namespace_schema_location_hints().to_vec();
+fn second_pass<S: ValidationSink>(schema_set: &SchemaSet, runtime: &ValidationRuntime<'_, S>) {
+    // First pass: validate and collect hints
+    let sl = runtime.schema_location_hints().to_vec();
+    let nnsl = runtime.no_namespace_schema_location_hints().to_vec();
 
-let outcome = enrich_schema_set(&schema_set, &sl, &nnsl);
-if let Some(enriched) = outcome.schema_set.as_ref() {
-    // Second pass: re-validate with the enriched schema set
-} else if let Some(err) = outcome.compile_error.as_ref() {
-    eprintln!("hint enrichment failed at recompile: {err}");
-} else if !outcome.hint_errors.is_empty() {
-    // Hints were given but every one failed to load; the original
-    // SchemaSet is still usable without enrichment.
-    for e in &outcome.hint_errors {
-        eprintln!("hint load failure: {e}");
+    let outcome = enrich_schema_set(schema_set, &sl, &nnsl);
+    if let Some(enriched) = outcome.schema_set.as_ref() {
+        // Second pass: re-validate with the enriched schema set
+        let _ = enriched;
+    } else if let Some(err) = outcome.compile_error.as_ref() {
+        eprintln!("hint enrichment failed at recompile: {err}");
+    } else if !outcome.hint_errors.is_empty() {
+        // Hints were given but every one failed to load; the original
+        // SchemaSet is still usable without enrichment.
+        for e in &outcome.hint_errors {
+            eprintln!("hint load failure: {e}");
+        }
     }
 }
 ```
@@ -374,12 +421,22 @@ For finer control, drive a `SchemaSetBuilder` directly and inspect
 `HintLoadResult::errors`:
 
 ```rust
-use xsd_schema::{SchemaSetBuilder, load_hints_into_builder};
+use xsd_schema::validation::{NoNamespaceSchemaLocationHint, SchemaLocationHint};
+use xsd_schema::{load_hints_into_builder, CompiledSchemaSet, SchemaSet, SchemaSetBuilder};
 
-let mut builder = SchemaSetBuilder::new();
-builder.add_from(&schema_set);       // re-load original schemas
-load_hints_into_builder(&mut builder, &sl_hints, &nnsl_hints);
-let compiled = builder.compile()?;   // re-validate with compiled.schema_set()
+fn enrich_by_hand(
+    schema_set: &SchemaSet,
+    sl_hints: &[SchemaLocationHint],
+    nnsl_hints: &[NoNamespaceSchemaLocationHint],
+) -> Result<CompiledSchemaSet, xsd_schema::SchemaError> {
+    let mut builder = SchemaSetBuilder::new();
+    builder.add_from(schema_set); // re-load original schemas
+    let loaded = load_hints_into_builder(&mut builder, sl_hints, nnsl_hints);
+    for e in &loaded.errors {
+        eprintln!("hint load failure: {e}");
+    }
+    builder.compile() // re-validate with compiled.schema_set()
+}
 ```
 
 **Base URI.** Set an absolute (canonicalized) path via
@@ -479,9 +536,14 @@ structural DOM. Each node carries schema type information through the
 entry pins down the resolved type, the governing element/attribute
 declaration, and the content type. Because of this, `BufferDocNavigator`
 exposes *typed* values — `XmlAtomicValue` / `XmlValue` from `src/types/`,
-not just lexical strings — and `typed_value()` honours declaration-level
-default and fixed values for empty elements (cvc-elt.5.2) without
-synthetic text nodes. Consequences for callers:
+not just lexical strings. A typed build makes the document the XDM instance
+of the PSVI: defaulted attributes are attribute nodes, an empty element that
+takes its declaration's default or fixed value has a text node with it,
+white space in element-only content is no text node, and simple values have
+their schema normalized value as their string value (`TypedBuildOptions`).
+`typed_value()` still reads the declaration's default for an empty element
+that has no such text node (a tree built with defaults as nodes off).
+Consequences for callers:
 
 - XPath 2.0 expressions and XSD 1.1 assertions consume schema-typed values
   directly; no re-parsing per query, and no separate cast layer.
@@ -519,22 +581,30 @@ DOM implementation, and they should not reimplement type machinery — see the
 | `src/lib.rs` | Public API surface and re-exports. |
 | `src/builder.rs` | `SchemaSetBuilder` fluent load/compile API. |
 | `src/pipeline.rs` | High-level orchestration for parse, load, compose, resolve, and checks. |
-| `src/error.rs` | `SchemaError`, `ValidationError`, and diagnostic codes. |
+| `src/error.rs` | `SchemaError`, `SchemaLimit`, `FacetError`, and diagnostic codes (instance errors are `validation::ValidationError`, `src/validation/errors.rs`). |
 | `src/ids.rs` | Typed arena keys. |
 | `src/arenas.rs` | Flat component storage. |
 | `src/embedded.rs` | Embedded catalog schemas such as XML and XLink. |
 | `src/regex_convert.rs` | XSD regex translation for the Rust `regex` backend. |
 | `src/regex_xsd_unicode.rs` | Unicode 3.0 tables for XSD 1.0 regex compatibility. |
 | `src/xml/` | The well-formedness layer over `quick-xml` shared by every text reader; `ParseLimits`. |
-| `src/parser/` | Schema XML parsing, frame state machine, assembly, loaders, source maps. |
+| `src/parser/` | Schema XML parsing, frame state machine, assembly, loaders, the location rewriter and `DirectiveFailure`, source maps. |
+| `src/parser/uri.rs` | RFC 3986 reference resolution and normalization of schema locations (crate-private). |
 | `src/schema/` | Schema model, composition, inline allocation, reference resolution, derivation, EDC. |
+| `src/schema/nesting.rs` | The component nesting check (`SchemaSet::max_depth`). |
+| `src/schema/derivation/` | Type derivation and restriction checks; `counts.rs` keeps the exact occurrence counts of repeated particles. |
+| `src/schema/cta.rs` | Type alternatives, and the schema-time XPath Valid check of assertions and type alternatives (built-in components only). |
+| `src/schema/value_constraint.rs` | `SchemaSet::element_value_constraint(_for_type)`: an element declaration's {value constraint} for hosts. |
 | `src/types/` | Built-in type registry, XSD atomic values, facets, conversions, equality. |
+| `src/types/value_order.rs` | The order of the date/time and duration value spaces, exact, shared by facets, value constraints and identity constraints. |
 | `src/compiler/` | Content-model compilation, UPA, all-groups, substitution groups, open content. |
 | `src/validation/` | Push-event instance validation and PSVI output. |
 | `src/namespace/` | `NameTable`, QName helpers, namespace context snapshots. |
 | `src/navigator/` | DOM adapters exposed outside the XPath module. |
 | `src/xpath/` | XPath 2.0 parser, binder, evaluator, functions, operators (`xsd11`). |
+| `src/xpath/depth.rs` | `MAX_EXPRESSION_DEPTH` and the iterative depth measure every parse checks. |
 | `src/document/` | `BufferDocument` and typed document support (`xsd11`). |
+| `src/compose/` | `Composer`, `xpath!`, `form!` and the pipeline adapters (`compose`). |
 | `tests/conformance/` | W3C XSD conformance driver and reporting. |
 | `tests/xqts/` | XPath/XQuery test-suite driver (`xsd11`). |
 
@@ -563,6 +633,17 @@ DOM implementation, and they should not reimplement type machinery — see the
   `#[cfg(feature = "xsd11")]`.
 - **Unsafe code is exceptional**: new unsafe blocks require a documented invariant
   in `doc/UNSAFE.md` and Miri coverage.
+- **Nesting is bounded everywhere**: every pass that recurses along a schema
+  document, a component chain or an XPath expression is protected by a limit
+  checked before it recurses (`ParserConfig::max_depth`, `SchemaSet::max_depth`,
+  `xpath::MAX_EXPRESSION_DEPTH`); a walk that does not recurse (the directive
+  walk) is bounded in work (`ResolverConfig::max_depth`). New recursive passes
+  must sit behind one of them.
+- **Diagnostics are deterministic**: the error a schema or an instance is
+  refused with does not vary from run to run — no hash order decides which
+  component is checked first, which competing pair `cos-nonambig` names (the
+  first in content-model order), or which enumeration value an error names
+  (sorted). Iterate hash maps only where the order cannot reach a message.
 - **One datatype layer for both engines**: `src/types/` is the single source of
   atomic values, type codes, casting, equality, facets, and the validator
   registry — shared by the XSD validator and the XPath 2.0 engine. XPath does
@@ -582,15 +663,15 @@ DOM implementation, and they should not reimplement type machinery — see the
 | Task | Start with | Usually also inspect |
 | --- | --- | --- |
 | Public API use or examples | `doc/INTRODUCTION.md` | `src/lib.rs`, `src/builder.rs` |
-| Schema loading/import bugs | `src/parser/resolver.rs` | `src/pipeline.rs`, `src/schema/composition.rs`, `src/embedded.rs` |
+| Schema loading/import bugs | `src/parser/resolver.rs` | `src/parser/uri.rs`, `src/pipeline.rs`, `src/schema/composition.rs`, `src/embedded.rs` |
 | Parser support for an XSD element | `src/parser/frames/` | `src/parser/assemble.rs`, `src/schema/model.rs` |
 | QName resolution / `src-resolve` | `src/schema/resolver.rs` | `src/parser/location.rs`, `src/schema/model.rs` |
 | Inline type or local particle issues | `src/schema/inline.rs` | `src/schema/resolver.rs`, `src/compiler/compile.rs` |
-| Type derivation or value constraints | `src/schema/derivation.rs` | `src/types/`, `src/validation/simple.rs` |
+| Type derivation or value constraints | `src/schema/derivation/` | `src/types/`, `src/validation/simple.rs` |
 | Content model or UPA failures | `src/compiler/` | `src/validation/content.rs`, `src/pipeline.rs` |
 | Instance validation behavior | `src/validation/runtime.rs` | `src/validation/simple.rs`, `src/validation/info.rs` |
 | Well-formedness or parse limits | `src/xml/reader.rs` | `src/xml/chars.rs`, `src/validation/quick_xml_driver.rs`, `tests/well_formedness.rs` |
 | Identity constraints | `src/validation/identity.rs` | `src/validation/active_axis.rs`, `src/validation/identity_parser.rs` |
 | XSD 1.1 assertions | `src/validation/assertions.rs` | `src/document/`, `src/xpath/` |
 | XPath engine work | `src/xpath/` | `src/navigator/`, `src/document/` |
-| Unsafe-code review | `doc/UNSAFE.md` | `src/namespace/table.rs`, `src/validation/runtime.rs` |
+| Unsafe-code review | `doc/UNSAFE.md` | `src/namespace/table.rs`, `src/validation/runtime.rs`, `src/xpath/context.rs` |

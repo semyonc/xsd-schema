@@ -56,7 +56,7 @@ The module is behind one feature flag, which implies `xsd11`:
 
 ```toml
 [dependencies]
-xsd-schema = { version = "0.1", features = ["compose"] }
+xsd-schema = { version = "0.3", features = ["compose"] }
 bumpalo = "3"
 ```
 
@@ -114,9 +114,15 @@ gymnastics. The name table is not synchronized, so a `Composer` is neither
 ## 3. Loading Documents
 
 ```rust
-let items = c.load_file("TestSources/items.xml")?;         // from a path
-let inline = c.load_str("<stock><part>bolt</part></stock>")?;  // from a string
-let piped = c.load_reader(std::io::BufReader::new(handle))?;   // from a reader
+use xsd_schema::compose::{ComposeError, Composer};
+
+fn load_three(c: &Composer<'_>, handle: std::fs::File) -> Result<(), ComposeError> {
+    let items = c.load_file("TestSources/items.xml")?;            // from a path
+    let inline = c.load_str("<stock><part>bolt</part></stock>")?; // from a string
+    let piped = c.load_reader(std::io::BufReader::new(handle))?;  // from a reader
+    let _ = (items, inline, piped);
+    Ok(())
+}
 ```
 
 All three parse into the composer's arena and return `Doc<'a>`. A `Doc` gives
@@ -132,8 +138,12 @@ you:
 
 What the parse keeps and drops is the document buffer's contract, not this
 module's: whitespace text is kept, CDATA and entity references are merged into
-text, comments and processing instructions are kept, and the XML declaration
-and any doctype are dropped.
+text, comments and processing instructions are kept, the XML declaration is
+kept on the document (`inner().xml_declaration()`) but not written back out
+unless the serialization options ask for one, and a document type declaration
+is checked and dropped. The text is read through the crate's well-formedness
+layer, so a document that is not well-formed is refused
+(`ComposeError::Document`).
 
 ## 4. RQ2 From Start To Finish
 
@@ -153,10 +163,11 @@ element.
 }</result>
 ```
 
-```rust
+```rust,no_run
+// Not run: reads items.xml and bids.xml of the XQuery 1.0 test suite.
 use bumpalo::Bump;
 use xsd_schema::compose::order::{Direction, EmptyOrder};
-use xsd_schema::compose::{pipe, ComposeError, Composer};
+use xsd_schema::compose::{pipe, Composer};
 use xsd_schema::document::SerializeOptions;
 use xsd_schema::namespace::NameTable;
 use xsd_schema::{form, xpath};
@@ -192,6 +203,7 @@ let rows = pipe::nodes(xpath!(c, "//item_tuple", items)?)
 
 let doc = c.build(form! { (result ..?^{ rows }) })?;
 println!("{}", doc.to_xml(&SerializeOptions::default())?);
+# Ok::<(), xsd_schema::compose::ComposeError>(())
 ```
 
 ```xml
@@ -215,17 +227,29 @@ The whole use case — all eighteen queries — is written this way in
 `tests/compose_usecase_r.rs` and compared with the suite's own expected
 results. `examples/xquery_without_xquery.rs` runs three of them:
 
-```
+```bash
 cargo run --example xquery_without_xquery --features compose -- ../../XQTS_1_0_2
 ```
 
 ## 5. `xpath!` — Evaluating With Rust Values Bound
 
 ```rust
-xpath!(c, "expr")                            // no context item, no variables
-xpath!(c, "expr", node)                      // a context item
-xpath!(c, "expr", i = &item, b = &bids)      // the external variables $i and $b
-xpath!(c, "expr", items, i = &item)          // a context item, then variables
+use xsd_schema::compose::{ComposeError, Composer, Doc, Nav};
+use xsd_schema::xpath;
+
+fn four_shapes<'a>(
+    c: &Composer<'a>,
+    node: Nav<'a>,
+    item: Nav<'a>,
+    items: Doc<'a>,
+    bids: Doc<'a>,
+) -> Result<(), ComposeError> {
+    xpath!(c, "1 + 1")?;                             // no context item, no variables
+    xpath!(c, "name()", node)?;                      // a context item
+    xpath!(c, "($i, $b)", i = &item, b = &bids)?;    // the external variables $i and $b
+    xpath!(c, "//item_tuple[. = $i]", items, i = &item)?; // a context item, then variables
+    Ok(())
+}
 ```
 
 The macro is exported at the crate root, so the import is
@@ -295,7 +319,10 @@ guessing:
 ### Caching
 
 Each call site's expression is compiled once per composer and then only
-evaluated. The cache key is the expression text *and* the external variable
+evaluated. The composer also keeps one regular-expression cache
+(`xpath::RegexCache`) for all its evaluations, so a pattern of `fn:matches`,
+`fn:replace` or `fn:tokenize` is compiled once per composer, not once per
+evaluation. The cache key is the expression text *and* the external variable
 names, both `'static` literals coming straight from the macro, so the cost per
 evaluation is a short string hash, a small `Vec` of bindings and a dynamic
 context — no parsing. A call site inside a nested loop is therefore fine. The
@@ -385,6 +412,14 @@ attribute is always in no namespace. A prefix nothing binds is
 ### Namespaces, and the fixup
 
 ```rust
+use bumpalo::Bump;
+use xsd_schema::compose::Composer;
+use xsd_schema::document::SerializeOptions;
+use xsd_schema::form;
+use xsd_schema::namespace::NameTable;
+
+let arena = Bump::new();
+let names = NameTable::new();
 let c = Composer::new(&arena, &names).with_namespace("q", "urn:q");
 
 let doc = c.build(form! {
@@ -392,9 +427,16 @@ let doc = c.build(form! {
         (q::child :xmlns "urn:d" (leaf "text"))
     )
 })?;
-// <e:root xmlns:e="urn:e" xml:lang="en">
-//   <q:child xmlns="urn:d" xmlns:q="urn:q"><leaf>text</leaf></q:child>
-// </e:root>
+let pretty = SerializeOptions { indent: Some(2), ..SerializeOptions::default() };
+assert_eq!(
+    doc.to_xml(&pretty)?,
+    r#"<e:root xmlns:e="urn:e" xml:lang="en">
+  <q:child xmlns="urn:d" xmlns:q="urn:q">
+    <leaf>text</leaf>
+  </q:child>
+</e:root>"#
+);
+# Ok::<(), xsd_schema::compose::ComposeError>(())
 ```
 
 The declarations are not written where you declared them — they are written
@@ -413,9 +455,24 @@ An attribute value from a sequence is atomized and joined with single spaces,
 which is the constructor rule for attribute content:
 
 ```rust
+use bumpalo::Bump;
+use xsd_schema::compose::Composer;
+use xsd_schema::document::SerializeOptions;
+use xsd_schema::namespace::NameTable;
+use xsd_schema::{form, xpath};
+
+let arena = Bump::new();
+let names = NameTable::new();
+let c = Composer::new(&arena, &names);
+let stock = c.load_str("<stock><part name='bolt'/><part name='nut'/><part name='washer'/></stock>")?;
+
 let tags = xpath!(c, "//part/@name", stock)?;
 let summary = form! { (parts :count @{ tags.len() } :names ^{ &tags }) };
-// <parts count="3" names="bolt nut washer"/>
+assert_eq!(
+    c.build(summary)?.to_xml(&SerializeOptions::default())?,
+    r#"<parts count="3" names="bolt nut washer"/>"#
+);
+# Ok::<(), xsd_schema::compose::ComposeError>(())
 ```
 
 A conditional constructor is a Rust `if` that chooses between two forms — this
@@ -423,12 +480,17 @@ is the sixteenth use-case query, whose XQuery reads
 `if (empty($b)) then <status>inactive</status> else <status>active</status>`:
 
 ```rust
-let status = if b.is_empty() {
-    form! { (status "inactive") }
-} else {
-    form! { (status "active") }
-};
-let user = form! { (user ^{ xpath!(c, "userid", &u)? } ^{ status }) };
+use xsd_schema::compose::{ComposeError, Composer, Form, Nav, Value};
+use xsd_schema::{form, xpath};
+
+fn user_status<'a>(c: &Composer<'a>, u: Nav<'a>, b: &Value<'a>) -> Result<Form<'a>, ComposeError> {
+    let status = if b.is_empty() {
+        form! { (status "inactive") }
+    } else {
+        form! { (status "active") }
+    };
+    Ok(form! { (user ^{ xpath!(c, "userid", &u)? } ^{ status }) })
+}
 ```
 
 An `Option<Form>` works the same way, with `None` contributing nothing.
@@ -502,7 +564,17 @@ and two plain Rust string literals still concatenate with nothing between them.
 ## 8. Ordering
 
 ```rust
-pipe.order_by(Direction::Ascending, EmptyOrder::Least, |row| { /* key */ })?
+use xsd_schema::compose::order::{Direction, EmptyOrder};
+use xsd_schema::compose::{pipe, ComposeError, Composer, Doc, Nav};
+use xsd_schema::xpath;
+
+fn by_itemno<'a>(c: &Composer<'a>, items: Doc<'a>) -> Result<Vec<Nav<'a>>, ComposeError> {
+    pipe::nodes(xpath!(c, "//item_tuple", items)?)
+        .order_by(Direction::Ascending, EmptyOrder::Least, |row| {
+            xpath!(c, "itemno", row)?.key() // the key
+        })?
+        .collect()
+}
 ```
 
 The key closure returns `Result<Option<XmlValue>, ComposeError>` — `None` is
@@ -533,8 +605,17 @@ are numbers of unequal length. Ask for a number when you want numeric order:
 ## 9. Building And Re-Querying
 
 ```rust
-let doc = c.build(form)?;                       // exactly one top-level element
-let seq = c.build_sequence(vec![a, b, c])?;     // any number of top-level nodes
+use xsd_schema::compose::{ComposeError, Composer, Doc, Form};
+
+fn build_both<'a>(
+    c: &Composer<'a>,
+    form: Form<'a>,
+    rows: Vec<Form<'a>>,
+) -> Result<(Doc<'a>, Doc<'a>), ComposeError> {
+    let doc = c.build(form)?;            // exactly one top-level element
+    let seq = c.build_sequence(rows)?;   // any number of top-level nodes
+    Ok((doc, seq))
+}
 ```
 
 `build` is the common case and refuses anything else with
@@ -546,6 +627,9 @@ That is the twelfth use-case query, whose XQuery declares
 `local:bid_summary() as element()*` and then queries `$bid_counts/nbids`:
 
 ```rust
+use xsd_schema::compose::{pipe, ComposeError, Composer, Doc, Value};
+use xsd_schema::{form, xpath};
+
 fn bid_summary<'a>(c: &Composer<'a>, bids: Doc<'a>) -> Result<Doc<'a>, ComposeError> {
     let rows = pipe::from(xpath!(c, "distinct-values(//itemno)", bids)?.atomics()?)
         .try_map(|i| {
@@ -560,9 +644,11 @@ fn bid_summary<'a>(c: &Composer<'a>, bids: Doc<'a>) -> Result<Doc<'a>, ComposeEr
     c.build_sequence(rows)
 }
 
-let summary = bid_summary(&c, bids)?;
-let bid_counts = summary.children();                    // Vec<Nav>
-let maxbids = xpath!(c, "max($bid_counts/nbids)", bid_counts = bid_counts.as_slice())?;
+fn max_bids<'a>(c: &Composer<'a>, bids: Doc<'a>) -> Result<Value<'a>, ComposeError> {
+    let summary = bid_summary(c, bids)?;
+    let bid_counts = summary.children();                // Vec<Nav>
+    xpath!(c, "max($bid_counts/nbids)", bid_counts = bid_counts.as_slice())
+}
 ```
 
 The constructed nodes are ordinary nodes: they can be bound as variables,
@@ -581,11 +667,16 @@ with one space and contribute nothing at all for an empty sequence.
 ## 10. Serialization
 
 ```rust
+use xsd_schema::compose::{ComposeError, Doc};
 use xsd_schema::document::SerializeOptions;
 
-let compact = doc.to_xml(&SerializeOptions::default())?;
-let pretty = doc.to_xml(&SerializeOptions { indent: Some(2), ..Default::default() })?;
-doc.write_xml(&mut file, &SerializeOptions::default())?;    // no intermediate String
+fn write_out(doc: Doc<'_>, file: &mut std::fs::File) -> Result<(), ComposeError> {
+    let compact = doc.to_xml(&SerializeOptions::default())?;
+    let pretty = doc.to_xml(&SerializeOptions { indent: Some(2), ..Default::default() })?;
+    doc.write_xml(file, &SerializeOptions::default())?;    // no intermediate String
+    let _ = (compact, pretty);
+    Ok(())
+}
 ```
 
 | Option | Default | Meaning |

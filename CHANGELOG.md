@@ -9,60 +9,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking changes
 
+See [Upgrading to 0.3](doc/UPGRADING_0_3.md) for every item below with the
+0.2.x and the 0.3 code, and the verdict changes users will see;
+[What's New in 0.3](doc/WHATS_NEW.md) is the short overview.
+
+**Error and view types**
+
 - `XPathError`, `FunctionId` and `ItemType` are `#[non_exhaustive]`: a `match`
-  on them needs a wildcard arm, and later variants are additive.
-- Errors identified by an error QName — what `fn:error` raises, a host's own
-  codes, and the specification codes without a variant of their own — are the
-  new variant `XPathError::Raised(RaisedErrorInfo)` instead of an `Internal`
-  message. `XPathError::raised`, `raised_error` and `error_code` keep working;
-  the `Display` of such an error is `[CODE] description`.
-- `XPathError::XPDY0050` carries a message (`XPDY0050 { message }`), and
-  XPST0080 is a variant of its own (`XPST0080 { type_name }`, no longer in
-  `QNAMED_ERROR_CODES`). `XPathError::more_than_one_item()` returns `XPTY0004`
-  (XPath 2.0 §3.1.5); `XPDY0050` is the code of `treat as` and of a leading `/`
-  outside a document.
-- `FunctionId` has a new variant, `Error`.
-- `ItemType::Element` and `ItemType::Attribute` are struct variants,
-  `Element { name, type_test, nillable }` and `Attribute { name, type_test }`,
-  built with `ItemType::element` / `ItemType::attribute`. Their type is a
-  `TypeTest` (`#[non_exhaustive]`): a schema type key — simple or complex —, a
-  predefined `xs` type by its code, or `xs:untyped`; `TypeTest::canonical` gives
-  the spelling the binder produces. `ItemType::element` without a type ignores
-  `nillable`. The element and attribute tests of a host-built `ItemType` read
-  the node's type annotation (complex types included) and the untyped rules
-  (`xs:untyped`, `xs:untypedAtomic`).
-- `xpath::ast::TypeExprNode` has a crate-private field, so it cannot be built
-  with a struct literal outside the crate: use `TypeExprNode::new`. Bind a node
-  again after editing it.
-- `XmlAtomicValue::QName` and `XmlAtomicValue::Notation` hold a `QNameValue`
-  instead of a `QualifiedName`: the expanded name (`QNameValue::name()`)
-  together with its string form, so such a value converts to a string without
-  a name table. Build one with `QNameValue::new(name, &name_table)`.
-- `XmlValueKind::List::items` is a `Vec<XmlValue>` (it was a
-  `Vec<XmlAtomicValue>`): each member carries its own type code and
-  `schema_type` — the item type's or, for a list whose item type is a union,
-  those of the member type that validated that member. `item_type` is the code
-  of the declared item type (`xs:anySimpleType` for a union); it was the type
-  of the last member. `XmlValue::to_xpath_value` takes no argument.
-- `SequenceType`'s `Display` prints element, attribute, document and schema
-  tests in SequenceType syntax.
-- `SchemaValidator::new` (and `with_substitution_groups`) honour
-  `ValidationFlags::PROCESS_ASSERTIONS`: with the flag set, XSD 1.1 `xs:assert`
-  is evaluated inline while streaming, as with `new_fragment_buffer`. The flag
-  used to be removed silently, so assertions never ran. `new_main_document`
-  still removes it; that mode evaluates no assertion at all (now documented).
+  on them needs a wildcard arm, and later variants are additive. `FunctionId`
+  has the new variants `Error` and `Idref`.
+- `DriveError`, `DriveWithError` and `BufferDocumentError` are
+  `#[non_exhaustive]`, have `NotWellFormed` and `LimitExceeded` variants, and
+  report an I/O error of the source as `Io(std::io::Error)`. The variants
+  `Parse(quick_xml::Error)`, `Utf8`, `UnboundPrefix` and (`DriveError`,
+  `DriveWithError`) `UnexpectedEof` are removed, with their `From`
+  conversions; no quick-xml type is left in these error types.
 - `ValidationError` and `ValidationWarning` are `#[non_exhaustive]`.
   `ValidationError::element_path` is a method (`element_path() ->
   Option<&str>`, the same local-name path as before) instead of a field.
   `Display` is unchanged. Build warnings with `ValidationWarning::new`.
-- `build_typed_document`: input that ends inside an element is reported as the
-  XML error `BufferDocumentError::Parse(IllFormed(MissingEndTag(..)))` instead
-  of an internal error.
-- `XPathError::FOCA0002 { qname }` is `XPathError::FOCA0002 { value }`: the
-  error is also raised for the special float / double values cast to
-  `xs:decimal` / `xs:integer` (see *Fixed*), so the field holds the offending
-  lexical form, not only a QName. Its message is "[FOCA0002] Invalid lexical
-  value: '…'".
+- `SchemaError` and `xpath::parser::ParseError` are `#[non_exhaustive]`; a
+  `match` needs a wildcard arm. `SchemaError::location()` gives any variant's
+  location.
+- `TypeSource` is `#[non_exhaustive]` and has a new variant,
+  `TypeSource::Stipulated`: the governing type a `ValidationRoot::Type` run
+  stipulates for the validation root. A `match` on `TypeSource` needs a
+  wildcard arm.
+- `EndOfAttributesView` is `#[non_exhaustive]` and has a new field,
+  `default_attributes`: the attributes the element's attribute uses default.
+  It can no longer be built with a struct literal outside the crate.
+- `EndElementInfo` is `#[non_exhaustive]` and has a new field,
+  `validation_attempted`: the element's `[validation attempted]` beside its
+  `[validity]`.
+- `DefaultAttribute::attribute_key` is an `Option<AttributeKey>` (`None` for a
+  local attribute declaration), and `DefaultAttribute` has a new field
+  `type_key: Option<TypeKey>`, the declaration's type; `DefaultAttribute` is
+  `#[non_exhaustive]`.
+- `parser::frames::AttributeFrameResult::inheritable` is an `Option<bool>`:
+  `None` when the schema document does not write `inheritable`, so that an
+  attribute reference takes its declaration's `{inheritable}` (XSD 1.1
+  §3.2.2.3).
+
+**Reading XML text**
+
 - Every reader of XML text — the quick-xml validation drivers, the typed
   build, `BufferDocument::from_reader` / `BufferDocumentBuilder::build` and
   the schema-document parser — goes through one well-formedness layer
@@ -83,7 +72,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - What was refused before is now refused as `xml::NotWellFormed` too:
   duplicate attributes, unbound prefixes, undeclared entities, bytes that are
   not UTF-8, mismatched end tags, unclosed markup and input that ends inside
-  an element (which names the innermost open element and how many are open).
+  an element (which names the innermost open element and how many are open) —
+  `build_typed_document` reported the last as an internal error.
 - `BufferDocument::from_reader` / `BufferDocumentBuilder::build` refuse input
   that ends inside an element and input without a root element (both were
   accepted).
@@ -100,32 +90,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `BufferDocument` source spans, `TrackedReader` spans — count a leading
   byte-order mark (they were offsets after it), and `TrackedReader` spans
   start where their event starts.
-- `DriveError`, `DriveWithError` and `BufferDocumentError` are
-  `#[non_exhaustive]`, have `NotWellFormed` and `LimitExceeded` variants, and
-  report an I/O error of the source as `Io(std::io::Error)`. The variants
-  `Parse(quick_xml::Error)`, `Utf8`, `UnboundPrefix` and (`DriveError`,
-  `DriveWithError`) `UnexpectedEof` are removed, with their `From`
-  conversions; no quick-xml type is left in these error types.
-- `DefaultAttribute::attribute_key` is an `Option<AttributeKey>` (`None` for a
-  local attribute declaration), and `DefaultAttribute` has a new field
-  `type_key: Option<TypeKey>`, the declaration's type; `DefaultAttribute` is
-  `#[non_exhaustive]`.
-- `TypeSource` is `#[non_exhaustive]` and has a new variant,
-  `TypeSource::Stipulated`: the governing type a `ValidationRoot::Type` run
-  stipulates for the validation root. A `match` on `TypeSource` needs a
-  wildcard arm.
 
-- `EndOfAttributesView` is `#[non_exhaustive]` and has a new field,
-  `default_attributes`: the attributes the element's attribute uses default.
-  It can no longer be built with a struct literal outside the crate.
+**XPath**
 
-- `EndElementInfo` is `#[non_exhaustive]` and has a new field,
-  `validation_attempted`: the element's `[validation attempted]` beside its
-  `[validity]`.
-- `parser::frames::AttributeFrameResult::inheritable` is an `Option<bool>`:
-  `None` when the schema document does not write `inheritable`, so that an
-  attribute reference takes its declaration's `{inheritable}` (XSD 1.1
-  §3.2.2.3).
+- Errors identified by an error QName — what `fn:error` raises, a host's own
+  codes, and the specification codes without a variant of their own — are the
+  new variant `XPathError::Raised(RaisedErrorInfo)` instead of an `Internal`
+  message. `XPathError::raised`, `raised_error` and `error_code` keep working;
+  the `Display` of such an error is `[CODE] description`.
+- `XPathError::XPDY0050` carries a message (`XPDY0050 { message }`), and
+  XPST0080 is a variant of its own (`XPST0080 { type_name }`, no longer in
+  `QNAMED_ERROR_CODES`). `XPathError::more_than_one_item()` returns `XPTY0004`
+  (XPath 2.0 §3.1.5); `XPDY0050` is the code of `treat as` and of a leading `/`
+  outside a document.
+- `XPathError::FOCA0002 { qname }` is `XPathError::FOCA0002 { value }`: the
+  error is also raised for the special float / double values cast to
+  `xs:decimal` / `xs:integer` (see *Fixed*), so the field holds the offending
+  lexical form, not only a QName. Its message is "[FOCA0002] Invalid lexical
+  value: '…'".
+- `XPathError` is no longer `UnwindSafe` / `RefUnwindSafe`: the payload of a
+  host error (`XPathError::host`, see *Added*) is an
+  `Arc<dyn Error + Send + Sync>`. Wrap an error in
+  `std::panic::AssertUnwindSafe` to carry it across `catch_unwind`.
+- `ItemType::Element` and `ItemType::Attribute` are struct variants,
+  `Element { name, type_test, nillable }` and `Attribute { name, type_test }`,
+  built with `ItemType::element` / `ItemType::attribute`. Their type is a
+  `TypeTest` (`#[non_exhaustive]`): a schema type key — simple or complex —, a
+  predefined `xs` type by its code, or `xs:untyped`; `TypeTest::canonical` gives
+  the spelling the binder produces. `ItemType::element` without a type ignores
+  `nillable`. The element and attribute tests of a host-built `ItemType` read
+  the node's type annotation (complex types included) and the untyped rules
+  (`xs:untyped`, `xs:untypedAtomic`).
+- `xpath::ast::TypeExprNode` has a crate-private field, so it cannot be built
+  with a struct literal outside the crate: use `TypeExprNode::new`. Bind a node
+  again after editing it.
+- `SequenceType`'s `Display` prints element, attribute, document and schema
+  tests in SequenceType syntax.
+
+**Typed values**
+
+- `XmlAtomicValue::QName` and `XmlAtomicValue::Notation` hold a `QNameValue`
+  instead of a `QualifiedName`: the expanded name (`QNameValue::name()`)
+  together with its string form, so such a value converts to a string without
+  a name table. Build one with `QNameValue::new(name, &name_table)`.
+- `XmlValueKind::List::items` is a `Vec<XmlValue>` (it was a
+  `Vec<XmlAtomicValue>`): each member carries its own type code and
+  `schema_type` — the item type's or, for a list whose item type is a union,
+  those of the member type that validated that member. `item_type` is the code
+  of the declared item type (`xs:anySimpleType` for a union); it was the type
+  of the last member. `XmlValue::to_xpath_value` takes no argument.
+- The `PartialOrd` and `PartialEq` of the date/time value structs
+  (`DateTimeValue`, `DateValue`, `TimeValue` and the five `g*` structs) and of
+  `DurationValue`, `YearMonthDurationValue` and `DayTimeDurationValue` are now
+  the XSD order and equality, computed exactly: date/time values on the time
+  line, a value without a time zone offset incomparable (`None`) with one that
+  has an offset unless 14 hours either way give the same order, and never
+  equal to it; durations by the four reference dateTimes (`P1M` and `P30D` are
+  incomparable, `P1D == PT24H`, `P400Y == P146097D`). Before, `PartialEq`
+  compared fields and `PartialOrd` read a missing offset as UTC and durations
+  in average months. The derived `PartialEq` of `XmlAtomicValue` and
+  `XmlValue` follows. Upgrading: code that used `==` to mean "the same fields"
+  compares the fields; `partial_cmp` may return `None`, so sort with your own
+  total order if you need one. The structs are no longer usable as constant
+  patterns in a `match` (they lost `StructuralPartialEq`).
+
+**Schema API**
 
 - `FacetSet::merge_with_base` takes the built-in datatype the facet values
   belong to (`merge_with_base(&base, XmlTypeCode::Decimal)`) and compares them
@@ -140,24 +169,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   written. The schema compiler uses the same method. Upgrading: pass the
   nearest built-in type code of the restricted type and the base's effective
   facets.
-- The `PartialOrd` and `PartialEq` of the date/time value structs
-  (`DateTimeValue`, `DateValue`, `TimeValue` and the five `g*` structs) and of
-  `DurationValue`, `YearMonthDurationValue` and `DayTimeDurationValue` are now
-  the XSD order and equality, computed exactly: date/time values on the time
-  line, a value without a time zone offset incomparable (`None`) with one that
-  has an offset unless 14 hours either way give the same order, and never
-  equal to it; durations by the four reference dateTimes (`P1M` and `P30D` are
-  incomparable, `P1D == PT24H`, `P400Y == P146097D`). Before, `PartialEq`
-  compared fields and `PartialOrd` read a missing offset as UTC and durations
-  in average months. The derived `PartialEq` of `XmlAtomicValue` and
-  `XmlValue` follows. Upgrading: code that used `==` to mean "the same fields"
-  compares the fields; `partial_cmp` may return `None`, so sort with your own
-  total order if you need one.
 - `types::complex::other_matches_namespace`,
   `types::complex::NamespaceConstraint::matches` and
   `schema::wildcard::NamespaceConstraint::allows` no longer take an
   `XsdVersion`: no namespace constraint depends on the version.
 
+**Behaviour**
+
+- `SchemaValidator::new` (and `with_substitution_groups`) honour
+  `ValidationFlags::PROCESS_ASSERTIONS`: with the flag set, XSD 1.1 `xs:assert`
+  is evaluated inline while streaming, as with `new_fragment_buffer`. The flag
+  used to be removed silently, so assertions never ran. `new_main_document`
+  still removes it; that mode evaluates no assertion at all (now documented).
 - Schemas are bounded in nesting, so that a deeply nested schema is refused
   with an error instead of overflowing a 2 MiB thread stack (for XPath
   expressions: in an optimized build). `ParserConfig::max_depth` (default
@@ -177,9 +200,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   schema limits off, and with them this protection. The deepest schema of the
   W3C XSD suite nests 16 elements deep; the deepest XPath expression of the
   W3C XSD and XQuery test suites 14 levels.
-- `SchemaError` and `xpath::parser::ParseError` are `#[non_exhaustive]`; a
-  `match` needs a wildcard arm. `SchemaError::location()` gives any variant's
-  location.
 - Every entry point checks a schema alike: `load_and_process_schema` and
   `load_and_process_schema_async` run the builder's directive rules and phases
   — the asynchronous pipeline used to skip UPA, the XSD 1.0 all-group rules,
@@ -206,8 +226,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   attributes and elements the schema for schemas does not allow, and invalid
   attribute values, as `s4s-att-not-allowed` / `s4s-elt-invalid-content` /
   `s4s-att-invalid-value` (was `ct-props-correct` / `sch-props-correct`).
-
-- a schema document of an XML Schema 1.1 set can no longer name
+- A schema document of an XML Schema 1.1 set can no longer name
   `xs:untypedAtomic` — a `type`, `base`, `itemType`, `memberTypes` or type
   alternative naming it is `src-resolve`, as in an XML Schema 1.0 set. The
   type is the XPath 2.0 data model's (XML Schema 1.1 Structures §1.3.1.1: "not
@@ -217,17 +236,95 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `xpath::RegexCache`: compiled regular expressions of `fn:matches`,
-  `fn:replace` and `fn:tokenize` that a host keeps across evaluation runs.
-  Lend it to a run with `XPathEvaluator::with_regex_cache`, or
-  `DynamicContext::with_regex_cache` / `set_regex_cache` (inside a `run_with`
-  callback). A host that evaluates the same expressions once per item — for
-  example a test evaluated for every item of a loop — then compiles each
-  pattern once instead of once per evaluation. Bounded (64 entries by
-  default, `RegexCache::with_capacity`, least recently used dropped), `Send`
-  but not `Sync`, no global state. Without one, each run keeps its own cache as
-  before.
-- `compose::Composer` keeps one such cache for all its evaluations.
+**Validation**
+
+- `ValidationRoot` and `ValidationRuntime::set_validation_root`: how a run
+  assesses its validation root (XSD 1.1 §5.2) — by the top-level declaration
+  of the root's name (the default, unchanged), against a stipulated element
+  declaration (`Element`) or type definition (`Type`: "validate as this type",
+  whatever the root's name), or laxly when the root is undeclared (`Lax`: no
+  `cvc-elt.1`, `[validity]` notKnown). Every driver that takes the caller's
+  runtime honours it, the typed build included.
+- `document::build_typed_document_with`: validate and type a document in one
+  pass with your own `SchemaValidator` (e.g. with assertions), your own
+  `ValidationSink` (errors reported, not dropped) and your own
+  `ValidationEventHandler` (also `&mut dyn`) alongside the builder; options in
+  `TypedBuildOptions`. `document::TypedBuilderHandler` (public) composes the
+  builder with a handler for hosts that drive `drive_quick_xml_with`
+  themselves; `TypedBuild`, `TypedBuildError`. `build_typed_document` is built
+  on it.
+- Errors and warnings name the item they are about: `subject()`
+  (`ValidationSubject::Element` / `Attribute` with an `ExpandedName`) and
+  `instance_path()` — a namespace-aware, positional path in XPath 3.0 form,
+  `/Q{urn:po}order[1]/Q{}item[3]/@Q{}qty` (`InstancePath`, `PathStep`),
+  including for errors reported later (unresolved IDREFs, nested assertions,
+  deferred keyrefs). Paths share their ancestor steps, so a diagnostic costs
+  the same at any depth; the positions cost no measurable validation time.
+  `with_subject` / `with_instance_path` for errors a host builds itself.
+- `TypedBuildOptions::defaults_as_nodes` and
+  `TypedBuilderHandler::with_defaults_as_nodes` (default `true`).
+- `ValidationRuntime::take_default_attributes` and
+  `EndOfAttributesView::default_attributes`: the defaulted attributes of the
+  element, found by the end-of-attributes step.
+- `DefaultAttribute::typed_value`: the value constraint's {value}, read with
+  the namespace bindings of the schema element it is written on. It is present
+  when the run keeps PSVI typed values, and always for a type whose values can
+  be or hold QNames or NOTATIONs.
+- `ValidationEventHandler::skip_attribute` (defaulted to `false`) lets a
+  handler have an attribute that the element's type does not declare recorded
+  but not validated, as if a `processContents="skip"` wildcard matched it (no
+  PSVI, no error, the element's `[validation attempted]` partial); a declared
+  attribute is always validated. Also
+  `ValidationRuntime::skip_attribute[_by_id]`. Honoured by the quick-xml
+  drivers and the typed build; the tree-walking drivers validate every
+  attribute.
+
+**Reading XML text**
+
+- Parse limits (`xml::ParseLimits`): depth, name and namespace-URI length,
+  attributes and namespace declarations per element, namespaces in scope
+  (bound prefixes; undeclarations are not counted), attribute-value and text
+  size, and nodes. Checked on the raw markup before anything of it is
+  interned; a violation is `xml::LimitExceeded` naming the limit.
+  `ValidationRuntime::set_parse_limits` for the drivers and the typed build,
+  `BufferDocumentBuilder::with_parse_limits`. No limits by default; they do
+  not bound the reader's memory.
+- `ValidationEventHandler::on_doctype` (`DoctypeView`) and
+  `ValidationEventHandler::on_xml_declaration` (`xml::XmlDeclaration`), both
+  defaulted to accept: return an error to refuse documents with a document
+  type declaration, or an encoding the host did not decode.
+  `BufferDocument::xml_declaration`.
+- `ParseLimit::description()` and `ParseLimit::unit()`: what a parse limit
+  counts and its unit, the words `LimitExceeded` uses.
+- `TrackedReader::error_position` and `TrackedReader::xml_version`; a schema
+  document that is not well-formed gets a source location.
+
+**Schema loading**
+
+- `SchemaSet::directive_failures` / `CompiledSchemaSet::directive_failures`
+  and `DirectiveFailure`: the directives whose schema document could not be
+  read (not schema errors, Structures §4.2.3 / §4.2.6.2), with the location as
+  written, the namespace, the location read and the directive's position. A
+  reference that then fails to resolve names those documents.
+- `LocationRewriter` / `LocationRequest`,
+  `SchemaSetBuilder::set_location_rewriter`,
+  `SchemaResolver::set_location_rewriter`: map the locations of directives
+  (with the import's namespace) and the locations given to the builder before
+  they are identified and loaded, in the style of an XML Catalog's
+  `rewriteSystem` / `uri` entries. The answer is final — an absolute URI or
+  file path is loaded as it is, whatever the base of the document that named
+  the location; a relative path is resolved against the working directory —
+  and the rewriter is asked once per location.
+- `SchemaSetBuilder::with_resolver`, `SchemaResolver::{catalog, config,
+  loader}`, `SchemaSet::{max_depth, set_max_depth}`,
+  `parser::DEFAULT_MAX_DEPTH`, `SchemaError::LimitExceeded`, `SchemaLimit`,
+  `XPathError::LimitExceeded`, `xpath::depth::{MAX_EXPRESSION_DEPTH,
+  expression_depth}`, `NameTable::heap_bytes`.
+- `schema::validate_assertion_xpath` (`xsd11`): the schema-time XPath Valid
+  check of assertions (see *Changed*), beside the existing
+  `validate_cta_xpath` of type alternatives.
+
+**XPath**
 
 - `fn:error` is a built-in function, with the four signatures of F&O §3; a
   host's own registration of it still takes precedence. The error object
@@ -238,34 +335,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `source()`. `RaisedErrorInfo` implements `std::error::Error`; cloning a
   raised error shares its data. Also `XPathError::treat_mismatch` and
   `root_not_a_document`.
-- `types::QNameValue` (`new`, `name`, `prefix`, `local_name`, `lexical`): its
-  `Display` is the lexical form, and its equality ignores the prefix.
-- `TypeTest`, `ItemType::element`, `ItemType::attribute`, and `Display` for
-  `ItemType`, `NameTest`, `TypeTest` and the AST sequence types.
-- Errors and warnings name the item they are about: `subject()`
-  (`ValidationSubject::Element` / `Attribute` with an `ExpandedName`) and
-  `instance_path()` — a namespace-aware, positional path in XPath 3.0 form,
-  `/Q{urn:po}order[1]/Q{}item[3]/@Q{}qty` (`InstancePath`, `PathStep`),
-  including for errors reported later (unresolved IDREFs, nested assertions,
-  deferred keyrefs). Paths share their ancestor steps, so a diagnostic costs
-  the same at any depth; the positions cost no measurable validation time.
-  `with_subject` / `with_instance_path` for errors a host builds itself.
-- `document::build_typed_document_with`: validate and type a document in one
-  pass with your own `SchemaValidator` (e.g. with assertions), your own
-  `ValidationSink` (errors reported, not dropped) and your own
-  `ValidationEventHandler` (also `&mut dyn`) alongside the builder; options in
-  `TypedBuildOptions`. `document::TypedBuilderHandler` (public) composes the
-  builder with a handler for hosts that drive `drive_quick_xml_with`
-  themselves; `TypedBuild`, `TypedBuildError`. `build_typed_document` is built
-  on it.
-- `ValidationEventHandler::skip_attribute` (defaulted to `false`) lets a
-  handler have an attribute that the element's type does not declare recorded
-  but not validated, as if a `processContents="skip"` wildcard matched it (no
-  PSVI, no error, the element's `[validation attempted]` partial); a declared
-  attribute is always validated. Also
-  `ValidationRuntime::skip_attribute[_by_id]`. Honoured by the quick-xml
-  drivers and the typed build; the tree-walking drivers validate every
-  attribute.
 - XPath: `cast as`, `castable as` and constructor functions for the atomic
   simple types of the schema set attached to the static context
   (`XPathContext::with_schema_set`), XPath 2.0 §3.10.2 – §3.10.4. The value is
@@ -284,71 +353,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   function namespace is none. Lists and unions have neither (`XPST0051`,
   `XPST0017`). XSD 1.1 assertions do not see these casts and constructors
   (Structures §3.13.6.2 clause 2.2.5): there they behave as before.
-- Parse limits (`xml::ParseLimits`): depth, name and namespace-URI length,
-  attributes and namespace declarations per element, namespaces in scope
-  (bound prefixes; undeclarations are not counted), attribute-value and text
-  size, and nodes. Checked on the raw markup before anything of it is
-  interned; a violation is `xml::LimitExceeded` naming the limit.
-  `ValidationRuntime::set_parse_limits` for the drivers and the typed build,
-  `BufferDocumentBuilder::with_parse_limits`. No limits by default; they do
-  not bound the reader's memory.
-- `ValidationEventHandler::on_doctype` (`DoctypeView`) and
-  `ValidationEventHandler::on_xml_declaration` (`xml::XmlDeclaration`), both
-  defaulted to accept: return an error to refuse documents with a document
-  type declaration, or an encoding the host did not decode.
-  `BufferDocument::xml_declaration`.
-- `TrackedReader::error_position` and `TrackedReader::xml_version`; a schema
-  document that is not well-formed gets a source location.
-- `ParseLimit::description()` and `ParseLimit::unit()`: what a parse limit
-  counts and its unit, the words `LimitExceeded` uses.
-- `ValidationRoot` and `ValidationRuntime::set_validation_root`: how a run
-  assesses its validation root (XSD 1.1 §5.2) — by the top-level declaration
-  of the root's name (the default, unchanged), against a stipulated element
-  declaration (`Element`) or type definition (`Type`: "validate as this type",
-  whatever the root's name), or laxly when the root is undeclared (`Lax`: no
-  `cvc-elt.1`, `[validity]` notKnown). Every driver that takes the caller's
-  runtime honours it, the typed build included.
-
 - `fn:idref` (F&O 1.0 §15.5.3), in its one- and two-argument forms: the
   elements and attributes with the is-idrefs property whose string value has
   one of the given IDs as a token, in document order. It is empty for a tree
-  without type annotations.
-- The is-idrefs property: `DomNavigator::is_idrefs` and
-  `DomNavigator::find_nodes_by_idref` (defaults: `false`, none). A typed
-  document sets it on an element or attribute whose typed value holds an
-  `xs:IDREF` value; `BufferDocumentBuilder::register_idrefs` sets it on a node
-  without an annotation.
-- `TypedBuildOptions::defaults_as_nodes` and
-  `TypedBuilderHandler::with_defaults_as_nodes` (default `true`).
-- `ValidationRuntime::take_default_attributes` and
-  `EndOfAttributesView::default_attributes`: the defaulted attributes of the
-  element, found by the end-of-attributes step.
-- `DefaultAttribute::typed_value`: the value constraint's {value}, read with
-  the namespace bindings of the schema element it is written on. It is present
-  when the run keeps PSVI typed values, and always for a type whose values can
-  be or hold QNames or NOTATIONs.
-
-- `SchemaSet::directive_failures` / `CompiledSchemaSet::directive_failures`
-  and `DirectiveFailure`: the directives whose schema document could not be
-  read (not schema errors, Structures §4.2.3 / §4.2.6.2), with the location as
-  written, the namespace, the location read and the directive's position. A
-  reference that then fails to resolve names those documents.
-- `LocationRewriter` / `LocationRequest`,
-  `SchemaSetBuilder::set_location_rewriter`,
-  `SchemaResolver::set_location_rewriter`: map the locations of directives
-  (with the import's namespace) and the locations given to the builder before
-  they are identified and loaded, in the style of an XML Catalog's
-  `rewriteSystem` / `uri` entries. The answer is final — an absolute URI or
-  file path is loaded as it is, whatever the base of the document that named
-  the location; a relative path is resolved against the working directory —
-  and the rewriter is asked once per location.
-- `SchemaSetBuilder::with_resolver`, `SchemaResolver::{catalog, config,
-  loader}`, `SchemaSet::{max_depth, set_max_depth}`,
-  `parser::DEFAULT_MAX_DEPTH`, `TrackedReader::from_bytes_with_limits`,
-  `SchemaError::LimitExceeded`, `SchemaLimit`, `XPathError::LimitExceeded`,
-  `xpath::depth::{MAX_EXPRESSION_DEPTH, expression_depth}`,
-  `NameTable::heap_bytes`.
-
+  without type annotations. The is-idrefs property:
+  `DomNavigator::is_idrefs` and `DomNavigator::find_nodes_by_idref` (defaults:
+  `false`, none). A typed document sets it on an element or attribute whose
+  typed value holds an `xs:IDREF` value (`document::Node::IS_IDREFS`);
+  `BufferDocumentBuilder::register_idrefs` sets it on a node without an
+  annotation.
+- `xpath::RegexCache`: compiled regular expressions of `fn:matches`,
+  `fn:replace` and `fn:tokenize` that a host keeps across evaluation runs.
+  Lend it to a run with `XPathEvaluator::with_regex_cache`, or
+  `DynamicContext::with_regex_cache` / `set_regex_cache` (inside a `run_with`
+  callback). A host that evaluates the same expressions once per item — for
+  example a test evaluated for every item of a loop — then compiles each
+  pattern once instead of once per evaluation. Bounded (64 entries by
+  default, `RegexCache::with_capacity`, least recently used dropped), `Send`
+  but not `Sync`, no global state. Without one, each run keeps its own cache as
+  before. `compose::Composer` keeps one such cache for all its evaluations.
 - `DynamicContext::implicit_timezone_or_host`,
   `xpath::operators::eval_binary_with_timezone`.
 - XPath warnings: `xpath::XPathWarning`, `XPathEvaluator::with_warnings`,
@@ -359,6 +382,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   function). During validation, such a warning from an XSD 1.1 assertion or
   type alternative is reported to the sink, as the same code is for a literal
   (with `ValidationFlags::REPORT_WARNINGS`).
+- `types::QNameValue` (`new`, `name`, `prefix`, `local_name`, `lexical`): its
+  `Display` is the lexical form, and its equality ignores the prefix.
+- `TypeTest`, `ItemType::element`, `ItemType::attribute`, and `Display` for
+  `ItemType`, `NameTest`, `TypeTest` and the AST sequence types, kind tests and
+  QNames.
+
+**Hosts of the XPath data model**
 
 - `SchemaSet::xpath_type` / `BuiltinTypes::xpath_type`: the types the XPath
   2.0 data model adds to the XML Schema namespace (`xs:anyAtomicType`,
@@ -366,9 +396,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that validates nodes against a type it names — in an XML Schema 1.0 set too,
   where they validate, annotate and take part in the type hierarchy as in a
   1.1 set. Schema documents of a 1.0 set still cannot name them.
-- `ValidationFlags::XPATH_TYPES`: an `xsi:type` may name those types where the
-  set's XSD version does not define them.
-
+  `ValidationFlags::XPATH_TYPES`: an `xsi:type` may name those types where the
+  set's XSD version does not define them. `types::validators::UntypedAtomicValidator`
+  validates `xs:untypedAtomic`.
 - `SchemaSet::element_value_constraint` and
   `SchemaSet::element_value_constraint_for_type`: an element declaration's
   {value constraint} — its variety (`default` / `fixed`), its {lexical form}
@@ -382,8 +412,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   host that builds and validates an element can now declare the prefixes such
   a value needs on the start tag. New types `schema::ElementValueConstraint`,
   `schema::ValueConstraintVariety`.
+- `schema::composition::CompositionEdgeKind` implements `Hash`.
 
 ### Changed
+
+**Regular expressions**
 
 - The regular-expression engine of the `xsd11` feature is now `regexml-fork`
   0.3, the maintained fork of `regexml` (the code keeps the name `regexml`; no
@@ -414,71 +447,102 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `FacetError::InvalidPattern` messages are the engine's `Display` text
   (`invalid regular expression: …`) instead of its `Debug` form.
 
+**XPath**
+
+- XPath: date/time comparisons, the subtraction of two date/time values,
+  `fn:adjust-*-to-timezone` (one argument), `fn:implicit-timezone` and
+  `fn:current-dateTime` read the implicit timezone of the dynamic context
+  (`DynamicContext::implicit_timezone`); without one, the host's local offset,
+  read once per evaluation. `fn:current-dateTime()` is the current instant
+  expressed in that timezone. `eq` on `xs:gYear`, `xs:gYearMonth`,
+  `xs:gMonthDay`, `xs:gMonth` and `xs:gDay` compares starting instants with
+  the implicit timezone (F&O §10.4.15 – §10.4.19).
+- XPath: date/time and duration comparisons are exact (no rounding beyond 28
+  digits) and durations compare by months and seconds; arithmetic is exact and
+  raises FODT0001 / FODT0002 / FOCA0005 / FOAR0001 / FOAR0002 at the limits of
+  the values instead of panicking or wrapping. An XSD 1.1 assertion or type
+  alternative comparing the largest durations no longer panics.
+- XPath casts: `xs:nonNegativeInteger`, `xs:positiveInteger`,
+  `xs:nonPositiveInteger` and `xs:negativeInteger` have no size limit;
+  `xs:float`/`xs:double` → `xs:decimal` raises FOCA0001 when too large and
+  gives ±10⁻²⁸ for magnitudes in (5 × 10⁻²⁹, 10⁻²⁸); a date/time or duration
+  literal beyond the value limits raises FODT0001 / FODT0002.
+- XPath: a cast or constructor to `xs:QName` (or a type derived from
+  `xs:QName` or `xs:NOTATION`) from anything but a string literal or a value
+  of the same base type raises XPTY0004, and `castable as` is false.
+- XPath: `fn:subsequence` with an empty `$startingLoc` or `$length` raises
+  XPTY0004; an unclosed `(:` comment is XPST0003; `fn:base-uri` resolves
+  `xml:base` per RFC 3986 (dot segments removed); the substring functions
+  answer a zero-length second argument before FOCH0004.
+- XPath 1.0 compatibility mode: general comparisons follow XPath 2.0 §3.5.2
+  after atomization. `XPathMode::XPath10`: `number()` reads strings as XPath
+  1.0 does (no exponent, `+` or `INF`).
+
+**Schema documents**
+
+- The XPath of assertions and type alternatives sees only the built-in
+  components (XSD 1.1). Structures 1.1 §3.13.6.2 (XPath Valid) gives the tests
+  of `xs:assert`, `xs:assertion` and `xs:alternative` a static context whose
+  "in-scope schema definitions are those components that are present in every
+  schema by definition", and a static error makes the schema invalid
+  (§3.13.6.1, §3.12.6). Each test is now checked when the schema is built: one
+  that names a user-defined type or declaration — `instance of`, `treat as`,
+  `cast as`, `castable as`, a constructor, `element(*, T)`, `attribute(*, T)`,
+  `schema-element`, `schema-attribute` — or has another static error (an
+  undeclared prefix, an undefined variable, an unknown `xs:` constructor, a
+  syntax error) is refused with `as-props-correct` (assertions) or
+  `src-ct-alternative` (type alternatives). The components present in every
+  schema stay in scope: the built-in types and the four `xsi:` attribute
+  declarations, so `schema-attribute(xsi:nil)` is fine; there is no built-in
+  element declaration. Such assertions used to fail or pass on each instance;
+  `instance of` / `treat as` a user type were evaluated. A function the engine
+  does not know, in a namespace other than the XML Schema one, is still left
+  to the evaluation (`cvc-assertion`). The schema-time check of a type
+  alternative now also applies the schema document's `xpathDefaultNamespace`.
+  Upgrading: an assertion such as `$value instance of my:t` or
+  `@a castable as my:t` must be written against built-in types —
+  `$value instance of xs:integer and $value le 10`,
+  `@a castable as xs:integer and xs:integer(@a) le 10` — or the condition
+  moved into facets of `my:t`; `element(*, my:T)` / `schema-element(my:e)`
+  become name tests (`self::my:e`) or checks of built-in types. Node type
+  annotations still count: a node of a user type derived from `xs:integer`
+  matches `element(*, xs:integer)`.
 - XSD 1.1 assertions: an assertion whose test is a static error now — a
   `schema-element(N)` / `schema-attribute(N)` with an undeclared `N`, or a
   union or list type in `instance of`, `treat as`, `cast` or `castable` —
   fails with `cvc-assertion`, as other static errors in assertions already
   did.
-
-- XSD 1.0 mode compares `fixed` values by value too (see *Fixed*). That
-  departs from the letter of two XSD 1.0 clauses that compare strings —
-  Attribute Locally Valid (Use), "its normalized value must match the
-  canonical lexical representation of the attribute use's {value constraint}
-  value", and derivation-ok-restriction 2.1.3.2, "fixed with the same string"
-  — so in 1.0 mode values that are equal but spelled differently are accepted
-  there (`13:00:00+01:00` against `fixed="12:00:00Z"`). See
-  [Overview](doc/OVERVIEW.md).
 - XSD 1.1: a type alternative whose test calls the constructor of a
   user-defined atomic type is rejected with `src-ct-alternative`, as one with
   `cast as` such a type already was (Type Alternative Properties Correct, XPath
   Valid). Before, the test was accepted and never matched.
-- An enumeration value is normalized with the base type's whiteSpace: its
-  values are values of the base type (Datatypes 1.1 §4.3.5), so
-  `<xs:enumeration value=" red "/>` restricting `xs:token` — or `xs:language`,
-  `xs:Name`, `xs:NCName`, `xs:NMTOKEN`, `xs:ID`, `xs:anyURI`, `xs:QName`,
-  `xs:NOTATION`, a `normalizedString` value with a tab, a list, a union member
-  with its own `whiteSpace`, a simple content restriction — now admits `red`
-  (it admitted no value before), and so do the restrictions inheriting it,
-  their defaults, fixed values, casts and further enumerations. An enumeration
-  value of an `xs:string` type keeps its white space, also under a restriction
-  that collapses.
-- `<xs:whiteSpace value=" preserve "/>` and
-  `<xs:explicitTimezone value=" required "/>` are read after whitespace
-  collapse, as their `xs:NMTOKEN` type prescribes (the first was taken as
-  `collapse`, the second was a schema error).
+- Assertions after the attribute wildcard (XSD 1.1). `<xs:assert>` is accepted
+  after `<xs:anyAttribute>` in `<complexType>` and in the `<restriction>` /
+  `<extension>` of simple and complex content, as Structures 1.1 §3.4.2
+  allows, and the children of these elements are checked in the order the
+  content models give: an `assert` before an attribute, an attribute group,
+  the attribute wildcard, a particle or an `openContent`, a second
+  `openContent`, an `openContent` after the particle, and a facet after an
+  `assert` are refused. An `assert` or `openContent` in a simple type's
+  `<restriction>`, and an inline `<simpleType>` in a complex-content
+  `<restriction>`, are refused; they were accepted and ignored.
+- Schema errors are deterministic. When several independent components are
+  invalid, the error reported no longer varies from run to run: types are
+  checked in the order they are defined, enumeration values in sorted order.
+- `cos-nonambig` (Unique Particle Attribution) names the same competing pair
+  on every run: the first in content-model order. A content model with several
+  competing pairs could name a different pair from run to run; the verdict and
+  the constraint were already stable.
 - Schema-document errors raised from an element's attributes (an undeclared
   prefix in a QName, say) carry the element's location; with error recovery,
   the first error inside an element is reported rather than a consequence of
   skipping the refused child.
-- The attribute wildcard of an extension that declares one of its own takes
-  that wildcard's {process contents} (Structures §3.4.2.5; it took the weaker
-  of the two), so some attributes the combined wildcard admitted laxly or
-  skipped before are validated strictly now.
-- A `default` or `fixed` value of type `xs:QName` or `xs:NOTATION` (also in a
-  list, or as a union's member) is read with the namespace bindings of the
-  schema element it is written on (Datatypes §3.3.18). An empty element that
-  takes such a value is validated and typed with it, also where the instance
-  binds the prefix elsewhere or not at all, and a defaulted attribute's value
-  joins identity constraints as that value.
-- A typed document (`build_typed_document`, `build_typed_document_with`,
-  `TypedBuilderHandler`) is the XDM instance of the PSVI in two more ways
-  (XDM 1.0 §6.2.4, §6.7.4):
-  - each defaulted attribute is an attribute node, and a valid empty element
-    that takes its `default` / `fixed` value has a text node with it. A QName
-    in such a value is written with a prefix the instance binds to its
-    namespace; a prefix is declared on the element when none is (a QName in
-    no namespace where a default namespace is in scope keeps its lexical
-    form). `with_defaults_as_nodes(false)` restores the old behaviour for
-    defaults;
-  - a text node that is all white space is not built in element-only
-    content.
-- In a typed document (`build_typed_document`, `build_typed_document_with`), a
-  valid attribute and a valid element of a simple type or with simple content
-  have their [schema normalized value] as their string value (XDM 1.0 §6.2.4,
-  §6.3.4): an `xs:token` value read as `"  a   b "` is `"a b"`. Such an
-  element keeps one text node, none for an empty value, beside its comments
-  and processing instructions; invalid nodes and mixed or element-only content
-  keep their text as read. XSD 1.1 assertions see the same string values.
+- `<xs:whiteSpace value=" preserve "/>` and
+  `<xs:explicitTimezone value=" required "/>` are read after whitespace
+  collapse, as their `xs:NMTOKEN` type prescribes (the first was taken as
+  `collapse`, the second was a schema error).
+
+**Restriction checks**
 
 - Complex-content restriction (`derivation-ok-restriction`) is checked against
   the base's content with its nested sequences flattened: the sequence an
@@ -488,7 +552,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   §3.4.6.4 compares languages; a restriction that lists the elements of an
   all-optional base one after another was rejected. For example Exchange Web
   Services' `WellKnownResponseObjectType` now loads.
-
 - The restriction check counts occurrences exactly, on both sides: a group
   that repeats a particle needing two or more occurrences admits counts with
   gaps (`sequence{1,2}(b{2,2})` admits two or four `b`s, never three), and the
@@ -524,11 +587,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   b)`; `sequence(a, sequence?(b))` restricts `sequence(a, sequence?(b, c?))`).
   All GAEB DA XML 3.3 schemas now load under XSD 1.0.
 
-- `cos-nonambig` (Unique Particle Attribution) names the same competing pair
-  on every run: the first in content-model order. A content model with several
-  competing pairs could name a different pair from run to run; the verdict and
-  the constraint were already stable.
+**Values, facets and value constraints**
 
+- XSD 1.0 mode compares `fixed` values by value too (see *Fixed*). That
+  departs from the letter of two XSD 1.0 clauses that compare strings —
+  Attribute Locally Valid (Use), "its normalized value must match the
+  canonical lexical representation of the attribute use's {value constraint}
+  value", and derivation-ok-restriction 2.1.3.2, "fixed with the same string"
+  — so in 1.0 mode values that are equal but spelled differently are accepted
+  there (`13:00:00+01:00` against `fixed="12:00:00Z"`). See
+  [Overview](doc/OVERVIEW.md).
+- An enumeration value is normalized with the base type's whiteSpace: its
+  values are values of the base type (Datatypes 1.1 §4.3.5), so
+  `<xs:enumeration value=" red "/>` restricting `xs:token` — or `xs:language`,
+  `xs:Name`, `xs:NCName`, `xs:NMTOKEN`, `xs:ID`, `xs:anyURI`, `xs:QName`,
+  `xs:NOTATION`, a `normalizedString` value with a tab, a list, a union member
+  with its own `whiteSpace`, a simple content restriction — now admits `red`
+  (it admitted no value before), and so do the restrictions inheriting it,
+  their defaults, fixed values, casts and further enumerations. An enumeration
+  value of an `xs:string` type keeps its white space, also under a restriction
+  that collapses.
+- A `default` or `fixed` value of type `xs:QName` or `xs:NOTATION` (also in a
+  list, or as a union's member) is read with the namespace bindings of the
+  schema element it is written on (Datatypes §3.3.18). An empty element that
+  takes such a value is validated and typed with it, also where the instance
+  binds the prefix elsewhere or not at all, and a defaulted attribute's value
+  joins identity constraints as that value.
+- The attribute wildcard of an extension that declares one of its own takes
+  that wildcard's {process contents} (Structures §3.4.2.5; it took the weaker
+  of the two), so some attributes the combined wildcard admitted laxly or
+  skipped before are validated strictly now.
 - Facet verdicts follow the specification text where Xerces-J 2.12.2 (XSD 1.0)
   differs: it reports a minimum and a maximum bound that are incomparable
   (date/time values with and without a time zone offset, durations such as
@@ -545,34 +633,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and identity constraints compare the literal as written, and the validator
   reports the warning `xs-seconds-capacity`.
 
-- XPath: date/time comparisons, the subtraction of two date/time values,
-  `fn:adjust-*-to-timezone` (one argument), `fn:implicit-timezone` and
-  `fn:current-dateTime` read the implicit timezone of the dynamic context
-  (`DynamicContext::implicit_timezone`); without one, the host's local offset,
-  read once per evaluation. `fn:current-dateTime()` is the current instant
-  expressed in that timezone. `eq` on `xs:gYear`, `xs:gYearMonth`,
-  `xs:gMonthDay`, `xs:gMonth` and `xs:gDay` compares starting instants with
-  the implicit timezone (F&O §10.4.15 – §10.4.19).
-- XPath: date/time and duration comparisons are exact (no rounding beyond 28
-  digits) and durations compare by months and seconds; arithmetic is exact and
-  raises FODT0001 / FODT0002 / FOCA0005 / FOAR0001 / FOAR0002 at the limits of
-  the values instead of panicking or wrapping. An XSD 1.1 assertion or type
-  alternative comparing the largest durations no longer panics.
-- XPath casts: `xs:nonNegativeInteger`, `xs:positiveInteger`,
-  `xs:nonPositiveInteger` and `xs:negativeInteger` have no size limit;
-  `xs:float`/`xs:double` → `xs:decimal` raises FOCA0001 when too large and
-  gives ±10⁻²⁸ for magnitudes in (5 × 10⁻²⁹, 10⁻²⁸); a date/time or duration
-  literal beyond the value limits raises FODT0001 / FODT0002.
-- XPath: a cast or constructor to `xs:QName` (or a type derived from
-  `xs:QName` or `xs:NOTATION`) from anything but a string literal or a value
-  of the same base type raises XPTY0004, and `castable as` is false.
-- XPath: `fn:subsequence` with an empty `$startingLoc` or `$length` raises
-  XPTY0004; an unclosed `(:` comment is XPST0003; `fn:base-uri` resolves
-  `xml:base` per RFC 3986 (dot segments removed); the substring functions
-  answer a zero-length second argument before FOCH0004.
-- XPath 1.0 compatibility mode: general comparisons follow XPath 2.0 §3.5.2
-  after atomization. `XPathMode::XPath10`: `number()` reads strings as XPath
-  1.0 does (no exponent, `+` or `INF`).
+**Identity constraints and the PSVI**
 
 - Keyrefs see only their own element's keys. A `keyref` is checked against the
   identity-constraint table of the element that declares it — its own keys and
@@ -585,56 +646,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   declared later in the document, on a local element, or in another schema
   document of the namespace is found. Such schemas were refused with
   `src-identity-constraint`.
-- Assertions after the attribute wildcard (XSD 1.1). `<xs:assert>` is accepted
-  after `<xs:anyAttribute>` in `<complexType>` and in the `<restriction>` /
-  `<extension>` of simple and complex content, as Structures 1.1 §3.4.2
-  allows, and the children of these elements are checked in the order the
-  content models give: an `assert` before an attribute, an attribute group,
-  the attribute wildcard, a particle or an `openContent`, a second
-  `openContent`, an `openContent` after the particle, and a facet after an
-  `assert` are refused. An `assert` or `openContent` in a simple type's
-  `<restriction>`, and an inline `<simpleType>` in a complex-content
-  `<restriction>`, are refused; they were accepted and ignored.
 - The end-of-element `SchemaInfo::is_nil` is the [nil] property (Structures
   §3.3.5.3): `false` for an element with `xsi:nil="true"` that has character
   or element children (`cvc-elt.3.2.1`, still reported). The start-of-element
   value still says whether the element is nilled.
-- Schema errors are deterministic. When several independent components are
-  invalid, the error reported no longer varies from run to run: types are
-  checked in the order they are defined, enumeration values in sorted order.
-- The XPath of assertions and type alternatives sees only the built-in
-  components (XSD 1.1). Structures 1.1 §3.13.6.2 (XPath Valid) gives the tests
-  of `xs:assert`, `xs:assertion` and `xs:alternative` a static context whose
-  "in-scope schema definitions are those components that are present in every
-  schema by definition", and a static error makes the schema invalid
-  (§3.13.6.1, §3.12.6). Each test is now checked when the schema is built: one
-  that names a user-defined type or declaration — `instance of`, `treat as`,
-  `cast as`, `castable as`, a constructor, `element(*, T)`, `attribute(*, T)`,
-  `schema-element`, `schema-attribute` — or has another static error (an
-  undeclared prefix, an undefined variable, an unknown `xs:` constructor, a
-  syntax error) is refused with `as-props-correct` (assertions) or
-  `src-ct-alternative` (type alternatives). The components present in every
-  schema stay in scope: the built-in types and the four `xsi:` attribute
-  declarations, so `schema-attribute(xsi:nil)` is fine; there is no built-in
-  element declaration. Such assertions used to fail or pass on each instance;
-  `instance of` / `treat as` a user type were evaluated. A function the engine
-  does not know, in a namespace other than the XML Schema one, is still left
-  to the evaluation (`cvc-assertion`). The schema-time check of a type
-  alternative now also applies the schema document's `xpathDefaultNamespace`.
-  Upgrading: an assertion such as `$value instance of my:t` or
-  `@a castable as my:t` must be written against built-in types —
-  `$value instance of xs:integer and $value le 10`,
-  `@a castable as xs:integer and xs:integer(@a) le 10` — or the condition
-  moved into facets of `my:t`; `element(*, my:T)` / `schema-element(my:e)`
-  become name tests (`self::my:e`) or checks of built-in types. Node type
-  annotations still count: a node of a user type derived from `xs:integer`
-  matches `element(*, xs:integer)`.
+
+**Typed documents**
+
+- A typed document (`build_typed_document`, `build_typed_document_with`,
+  `TypedBuilderHandler`) is the XDM instance of the PSVI in two more ways
+  (XDM 1.0 §6.2.4, §6.7.4):
+  - each defaulted attribute is an attribute node, and a valid empty element
+    that takes its `default` / `fixed` value has a text node with it. A QName
+    in such a value is written with a prefix the instance binds to its
+    namespace; a prefix is declared on the element when none is (a QName in
+    no namespace where a default namespace is in scope keeps its lexical
+    form). `with_defaults_as_nodes(false)` restores the old behaviour for
+    defaults;
+  - a text node that is all white space is not built in element-only
+    content.
+- In a typed document (`build_typed_document`, `build_typed_document_with`), a
+  valid attribute and a valid element of a simple type or with simple content
+  have their [schema normalized value] as their string value (XDM 1.0 §6.2.4,
+  §6.3.4): an `xs:token` value read as `"  a   b "` is `"a b"`. Such an
+  element keeps one text node, none for an empty value, beside its comments
+  and processing instructions; invalid nodes and mixed or element-only content
+  keep their text as read. XSD 1.1 assertions see the same string values.
+
+**Documentation**
 
 - Documented: `SchemaInfo::typed_value` is kept whatever
   `ValidationFlags::BUILD_PSVI_TYPED_VALUES` says for an element that took its
   declaration's `default` / `fixed` value and for elements and attributes
   whose type is or can hold `xs:ID`, `xs:IDREF`, `xs:QName` or `xs:NOTATION`
   values.
+- The guides in `doc/` are compiled and run with the crate's doctests, and
+  two are new: [What's New in 0.3](doc/WHATS_NEW.md) and
+  [Upgrading to 0.3](doc/UPGRADING_0_3.md).
 
 ### Deprecated
 
@@ -644,51 +692,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+**XPath**
+
 - Casting an `xs:QName` or `xs:NOTATION` to `xs:string` or `xs:untypedAtomic`
   (`xs:string($q)`, `$q cast as xs:string`) raised `XPTY0004`; it gives
   `prefix:local`, or the local name (F&O §17.1.2). Every other string
   conversion of such a value — `fn:string`, `concat`, `string-join`,
   `XmlValue::to_string_value`, `Display` — gave an internal debug form
   (`QName(Some(NameId(…)):…)`) and now gives the same lexical form.
-- The typed value of an `xs:NOTATION`-typed node was an `xs:QName` value, and a
-  member of a list of `xs:QName` was a string under the QName type code, so
-  `eq` and `namespace-uri-from-QName` failed on it.
-- The members of a list whose item type is a union are typed with the member
-  type that validated each of them (XPath 2.0 §2.5.2) — in `fn:data` and in
-  `$value` of an assertion on a simple type and on a complex type with simple
-  content: `data(@a)[2] + 1` on `x 1` (a union of `xs:integer` and
-  `xs:string`) is `2` (it raised `XPTY0004`), and `$value` of a complex type
-  with simple content no longer types every member with the last member's type
-  (`abc` was an `xs:decimal`). A member that the union's `xs:decimal` member
-  type validated beyond `rust_decimal`'s capacity is an `xs:decimal` with the
-  capacity warning, as any other such value.
-- `xs:ENTITY` values inside a union value — a union with an `xs:ENTITIES` or
-  `xs:ENTITY` member, also as the item type of a list — are checked against the
-  document's unparsed entities (Structures §3.16.4); an undeclared entity was
-  accepted. The `xs:ENTITY`, `xs:ID` and `xs:IDREF` members of a list of a
-  union are recognized by their own member type: an integer member was checked
-  as an entity name when the list's last member was an ENTITY, and an ENTITY
-  member was not checked otherwise.
-- An `xs:QName` or `xs:NOTATION` member of a list whose prefix is not declared
-  is invalid (`cvc-datatype-valid.1.2.1`), as an atomic value already was — in
-  a list of `xs:QName` with more than one member, in a list of a union with a
-  QName member, and in any such list as element content, none of which was
-  checked.
-- A list type's `enumeration` compares the instance with each enumerated list
-  member for member in value space (Datatypes §4.3.5.4, §2.4.1.2): `01 2`
-  matches `enumeration="1 2"` on a list of `xs:integer`, and `1 x` matches
-  `1.0 x` on a list of a union of `xs:decimal` and `xs:string`. `pattern` still
-  constrains the lexical form. A union whose chosen member type is a list
-  compares its enumeration the same way (an enumerated list never matched).
-- Identity constraints compare list values member for member, each member in
-  its own value space (Structures §3.11.4, Datatypes §2.2.1): a list of
-  `xs:integer` `1 2` and a list of `xs:decimal` `1.0 2` are equal keys, and an
-  integer member of a list of a union no longer equals the string `1` of a
-  list of `xs:string`.
-- XSD 1.1 type alternatives: a test that calls an XML Schema constructor
-  function that does not exist (`xs:anyAtomicType('a')`, `xs:NOTATION('a')`)
-  or casts to `xs:NOTATION` / `xs:anyAtomicType` makes the schema invalid
-  (`src-ct-alternative`, Structures §3.12.6); the alternative was skipped.
 - `schema-element(N)` / `schema-attribute(N)` with an `N` that is not declared
   is the static error XPST0008 (XPath 2.0 §2.5.4.4, §2.5.4.6), also when no
   schema set is attached.
@@ -707,25 +718,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   2.0 §3.10.4); they were XPST0051 and a dynamic `XPTY0004`.
 - A failed `treat as` says which sequence type was expected and what the
   operand was.
-
-- `fixed` values compare "equal or identical" (Structures 1.1 cvc-elt
-  5.2.2.2.2, Attribute Locally Valid (Use)) instead of structurally: `NaN`
-  matches `NaN`, `0` matches `-0`, an `xs:dateTime` or `xs:time` on the same
-  instant in another time zone matches, `PT60S` matches `PT1M`, and a union
-  value matches whichever member type each spelling chose. A value with a time
-  zone never matches one without, and values of different primitive types
-  (`xs:float` against `xs:double`) never match. The restriction checks of a
-  `fixed` element particle or attribute use compare the same way.
-- The schema check of an attribute use against its declaration
-  (`au-props-correct`) compares values instead of whitespace-collapsed
-  strings: `1.0` against `1` is accepted, and `a  b` against `a b` for
-  `xs:string` (which keeps whitespace) is an error. With XSD 1.1, whose
-  clause 3 requires identity, `-0` against `0` and one instant in two time
-  zones are errors.
-- Identity constraints compare durations exactly, by months and seconds:
-  `P1M` and `P30DT10H29M6S` are different keys (they compared equal through
-  30.436875-day months), and a value of a type derived from `xs:duration`
-  matches an `xs:duration` key with the same value.
+- XPath SequenceType matching (`instance of`, `treat as`, `element(N, T)`,
+  `attribute(N, T)`, `schema-element`, `schema-attribute`,
+  `ItemType::matches_item`) no longer treats a member type of a union as
+  derived from the union; XPath 2.0's derives-from is restriction and
+  extension only. Validation is unchanged.
 - XPath: a cast to a built-in type no longer keeps the user-defined
   `schema_type` of a value whose type code already matches (F&O §17.3: the
   result has a new type annotation).
@@ -739,6 +736,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   them) raise `XPTY0004`, as the casting table of F&O §17.1 requires.
 - XPath: `fn:ceiling`, `fn:floor`, `fn:round` and `fn:round-half-to-even` of a
   value of a type derived from `xs:integer` return an `xs:integer` (F&O §6.4).
+- `fn:resolve-uri` resolves a reference that contains characters `xs:anyURI`
+  allows but a URI holds only escaped (a space, for example) instead of
+  raising FORG0002, and returns it unescaped.
+- `fn:local-name-from-QName` and `fn:prefix-from-QName` return `xs:NCName`,
+  and `fn:in-scope-prefixes` returns its prefixes as `xs:NCName`, as F&O
+  specifies.
+- The typed value of a union-typed element or attribute is, for XPath, the
+  value of the member type that validated it (XDM 1.0 §3.3.1.2):
+  `data($n) instance of my:member` is true for a user-defined member type.
+- A year `-2147483648` is written as itself (was `--2147483648`).
+- `fn:adjust-dateTime-to-timezone` and `fn:adjust-date-to-timezone` raise
+  FODT0001 when the adjusted year is out of range (a debug build panicked, a
+  release build wrapped the year).
+- XSD 1.1 type alternatives: a test that calls an XML Schema constructor
+  function that does not exist (`xs:anyAtomicType('a')`, `xs:NOTATION('a')`)
+  or casts to `xs:NOTATION` / `xs:anyAtomicType` makes the schema invalid
+  (`src-ct-alternative`, Structures §3.12.6); the alternative was skipped.
+
+**Facets and the value space**
+
 - A restriction of an enumerated simple type that adds no `enumeration` of its
   own (`<xs:restriction base="t:color"/>`, or one adding only `maxLength`,
   `pattern`, a bound, …) keeps its base type's enumeration (Structures 1.1
@@ -780,17 +797,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   too), and the `[schema normalized value]` and the typed value are the
   normalized string. An element's `default` or `fixed` value must satisfy
   these facets as well.
-- A restriction of a complex type that got its attribute wildcard by extension
-  is no longer rejected as adding a wildcard (derivation-ok-restriction): the
-  base's {attribute wildcard} is the one it has through extension (Structures
-  §3.4.2.5), the one its instances are validated with.
-- An explicit restriction of `xs:anyType`
-  (`<xs:restriction base="xs:anyType">`) may declare an attribute wildcard
-  with any `processContents`, as the shorthand `<xs:complexType>` can; it was
-  rejected as adding a wildcard. An extension of `xs:anyType` has anyType's
-  attribute wildcard (any namespace, `lax`, Structures §3.4.7): attributes it
-  does not declare are validated laxly instead of rejected, and a restriction
-  of it may keep a wildcard.
 - `xs:QName` and `xs:NOTATION` values are validated in their value space
   (Datatypes §3.3.18): `enumeration` compares expanded names — each enumerated
   value read with the namespace bindings in scope where it is written, an
@@ -810,97 +816,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   §2.4.1.3). A QName no longer matches a literal that an earlier string member
   reads as a string, nor an integer a literal that an earlier token member
   reads as a token.
-- `ValidationRuntime::get_default_attributes` reports every defaulted
-  attribute (Structures §3.4.4.2): uses of local declarations, `fixed` as well
-  as `default` value constraints, attribute-group uses, and uses inherited
-  from base types — a restriction's redeclared or prohibited attributes
-  excepted. It used to report only `default` values of global declarations
-  used directly or through a group.
-- XPath SequenceType matching (`instance of`, `treat as`, `element(N, T)`,
-  `attribute(N, T)`, `schema-element`, `schema-attribute`,
-  `ItemType::matches_item`) no longer treats a member type of a union as
-  derived from the union; XPath 2.0's derives-from is restriction and
-  extension only. Validation is unchanged.
-- `fn:resolve-uri` resolves a reference that contains characters `xs:anyURI`
-  allows but a URI holds only escaped (a space, for example) instead of
-  raising FORG0002, and returns it unescaped.
-- `fn:local-name-from-QName` and `fn:prefix-from-QName` return `xs:NCName`,
-  and `fn:in-scope-prefixes` returns its prefixes as `xs:NCName`, as F&O
-  specifies.
-- The embedded schema for the XML namespace is the current W3C edition: it
-  declares `xml:id` and allows an empty `xml:lang`. `assets/NOTICE.md` records
-  its source and the W3C licence that applies to it.
-- An attribute that `xs:schema` does not allow (or an invalid value of one it
-  does) is reported with its name and location instead of the internal error
-  "Root frame did not produce a schema result".
-- A required attribute inherited from a base type is reported missing when an
-  extension or an attribute group marks it `use="prohibited"` — a prohibition
-  only stops a restriction's inheritance (Structures §3.4.2.4); such an
-  attribute is also accepted on the element instead of being refused as
-  prohibited. A `use="prohibited"` attribute beside an attribute group no
-  longer hides the group's attribute of the same name.
-- Default and fixed attribute values from attribute groups and base types take
-  part in identity constraints and in ID/IDREF checks (Structures §3.11.4);
-  under XSD 1.1 an inheritable defaulted attribute from a base type is
-  inherited by descendant elements. A defaulted value is compared in its
-  type's value space, as an attribute the instance carries (an integer default
-  `1` and a string default `"1"` are different key values).
-- An attribute reference's own `default` or `fixed` value in an attribute
-  group wins over its declaration's (`get_default_attributes`, identity
-  constraints, ID/IDREF, inherited attributes), as it already did for a
-  reference in a complex type.
-
-- The typed value of a union-typed element or attribute is, for XPath, the
-  value of the member type that validated it (XDM 1.0 §3.3.1.2):
-  `data($n) instance of my:member` is true for a user-defined member type.
-- `fn:id` and the id index find an element whose typed value is a single
-  `xs:ID` (a simple type or simple content), in typed documents, annotated
-  copies and trees a host binds itself (XDM 1.0 §6.2.4, F&O 1.0 §15.5.2).
-- In a typed document, whether a union-typed element or attribute is an ID or
-  has the is-idrefs property is decided by the member type its value has with
-  the node's in-scope namespaces, as `fn:data` gives it: a value of a QName
-  member is no longer filed as an `xs:ID` or `xs:IDREF`.
-- `SchemaInfo::is_default` is set when an empty element takes its `fixed`
-  value, as for a `default`.
-
-- Restrictions of complex types read the {attribute uses} as Structures
-  §3.4.2.4 builds them, on both sides of the comparison. Newly accepted: a
-  restriction whose attribute group marks a required base attribute
-  `use="prohibited"` (the group's prohibition is no attribute use, so the
-  attribute is inherited, still required); a restriction with its own
-  `use="prohibited"` attribute beside an attribute group's required use of the
-  same attribute. Newly refused: a restriction that weakens, retypes or
-  changes the `fixed` value of an attribute its base still has — the base side
-  is the base's complete {attribute uses}, so an extension's or an attribute
-  group's "prohibition" further up the base chain no longer hides the base's
-  use of it.
-- XSD 1.1: an attribute reference without `inheritable` inherits its
-  declaration's `{inheritable}`; an explicit `inheritable="false"` on such a
-  reference is honoured, also by the restriction check (a restriction that
-  turns an inherited `true` into `false` this way is refused; it was
-  accepted).
-- An element assessed laxly (matched by a lax wildcard, or the undeclared root
-  of a `ValidationRoot::Lax` run, with no usable `xsi:type`) has `[validity]`
-  notKnown, also when one of its attributes or descendants is invalid (which
-  is still reported).
-- An element is nilled only when its declaration is nillable: with no
-  governing element declaration, or with a non-nillable one (where `xsi:nil`
-  is still reported, `cvc-elt.3.1`), `xsi:nil="true"` neither suppresses the
-  check of the content against the element's type nor makes content an error.
-  In a typed document only a valid element is nilled.
-- XSD 1.1: an `xsi:type` attribute that resolves to no type definition is
-  invalid (Structures 1.1 §3.2.4.1 clause 5, `cvc-attribute.5`); the problem
-  is still reported once, as `cvc-elt.4.1`, when the element event carries the
-  `xsi:type`.
-- `get_expected_attributes` lists the attribute uses inherited from base
-  types.
-- In a typed document, an element no declaration or type governs is typed
-  `xs:anyType` when one of its attributes or descendants was assessed (XDM 1.0
-  §3.3.1.1), and stays untyped otherwise.
-- Defaulted attributes whose types are derived from `xs:ID`, `xs:IDREF` or
-  `xs:ENTITY` — by restriction, list or union — take part in the ID/IDREF and
-  ENTITY checks.
-
 - `-0` (and `-00`, …) is a valid `xs:unsignedLong`, `unsignedInt`,
   `unsignedShort` and `unsignedByte` value with every driver, as a default,
   enumeration value or bound, and in casts to derived types; it is also
@@ -936,29 +851,76 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   union type with a QName member — unless a later member of the union accepts
   the literal (`xs:QName xs:string`), which is then the value; declared
   attributes, list items and identity-constraint fields follow the same rule.
-
-- `SchemaSetBuilder::compile_async` overflowed the stack on a cycle of
-  includes.
-- The content model of an extension chain was compiled in time exponential in
-  the chain's length (25 levels took seconds); the base content model is
-  compiled once.
-- Recursion bounds of the derivation and compilation passes no longer cut
-  legal schemas short (attribute inheritance stopped after 50 derivation
-  levels, attribute groups after 20 levels, group references after about 50).
-- "Unexpected element" errors in schema documents carry their location.
-
-- A year `-2147483648` is written as itself (was `--2147483648`).
-- `fn:adjust-dateTime-to-timezone` and `fn:adjust-date-to-timezone` raise
-  FODT0001 when the adjusted year is out of range (a debug build panicked, a
-  release build wrapped the year).
-
 - `xs:untypedAtomic` had no validator ("No validator for type code
   UntypedAtomic"): every string is now a valid, unnormalized value. Without
   `ValidationFlags::XPATH_TYPES` an `xsi:type` naming it is `cvc-elt.4.1`.
 - `xs:dayTimeDuration` and `xs:yearMonthDuration` accepted literals that are
   not durations (`PT`, `P1DT`, `P+1D`, `P+1Y`) and, for the constructor
   functions, the same.
+- `xs:duration` refuses fields out of order (`P1M1Y`, `PT1M1H`), in schema
+  validation and in XPath casts and constructor functions (Datatypes
+  §3.3.6.2).
 
+**Lists and unions**
+
+- The typed value of an `xs:NOTATION`-typed node was an `xs:QName` value, and a
+  member of a list of `xs:QName` was a string under the QName type code, so
+  `eq` and `namespace-uri-from-QName` failed on it.
+- The members of a list whose item type is a union are typed with the member
+  type that validated each of them (XPath 2.0 §2.5.2) — in `fn:data` and in
+  `$value` of an assertion on a simple type and on a complex type with simple
+  content: `data(@a)[2] + 1` on `x 1` (a union of `xs:integer` and
+  `xs:string`) is `2` (it raised `XPTY0004`), and `$value` of a complex type
+  with simple content no longer types every member with the last member's type
+  (`abc` was an `xs:decimal`). A member that the union's `xs:decimal` member
+  type validated beyond `rust_decimal`'s capacity is an `xs:decimal` with the
+  capacity warning, as any other such value.
+- `xs:ENTITY` values inside a union value — a union with an `xs:ENTITIES` or
+  `xs:ENTITY` member, also as the item type of a list — are checked against the
+  document's unparsed entities (Structures §3.16.4); an undeclared entity was
+  accepted. The `xs:ENTITY`, `xs:ID` and `xs:IDREF` members of a list of a
+  union are recognized by their own member type: an integer member was checked
+  as an entity name when the list's last member was an ENTITY, and an ENTITY
+  member was not checked otherwise.
+- An `xs:QName` or `xs:NOTATION` member of a list whose prefix is not declared
+  is invalid (`cvc-datatype-valid.1.2.1`), as an atomic value already was — in
+  a list of `xs:QName` with more than one member, in a list of a union with a
+  QName member, and in any such list as element content, none of which was
+  checked.
+- A list type's `enumeration` compares the instance with each enumerated list
+  member for member in value space (Datatypes §4.3.5.4, §2.4.1.2): `01 2`
+  matches `enumeration="1 2"` on a list of `xs:integer`, and `1 x` matches
+  `1.0 x` on a list of a union of `xs:decimal` and `xs:string`. `pattern` still
+  constrains the lexical form. A union whose chosen member type is a list
+  compares its enumeration the same way (an enumerated list never matched).
+- Identity constraints compare list values member for member, each member in
+  its own value space (Structures §3.11.4, Datatypes §2.2.1): a list of
+  `xs:integer` `1 2` and a list of `xs:decimal` `1.0 2` are equal keys, and an
+  integer member of a list of a union no longer equals the string `1` of a
+  list of `xs:string`.
+
+**Value constraints**
+
+- `fixed` values compare "equal or identical" (Structures 1.1 cvc-elt
+  5.2.2.2.2, Attribute Locally Valid (Use)) instead of structurally: `NaN`
+  matches `NaN`, `0` matches `-0`, an `xs:dateTime` or `xs:time` on the same
+  instant in another time zone matches, `PT60S` matches `PT1M`, and a union
+  value matches whichever member type each spelling chose. A value with a time
+  zone never matches one without, and values of different primitive types
+  (`xs:float` against `xs:double`) never match. The restriction checks of a
+  `fixed` element particle or attribute use compare the same way.
+- The schema check of an attribute use against its declaration
+  (`au-props-correct`) compares values instead of whitespace-collapsed
+  strings: `1.0` against `1` is accepted, and `a  b` against `a b` for
+  `xs:string` (which keeps whitespace) is an error. With XSD 1.1, whose
+  clause 3 requires identity, `-0` against `0` and one instant in two time
+  zones are errors.
+- Identity constraints compare durations exactly, by months and seconds:
+  `P1M` and `P30DT10H29M6S` are different keys (they compared equal through
+  30.436875-day months), and a value of a type derived from `xs:duration`
+  matches an `xs:duration` key with the same value.
+- `SchemaInfo::is_default` is set when an empty element takes its `fixed`
+  value, as for a `default`.
 - An empty element that takes its declaration's `default` / `fixed` value
   under an `xsi:type` or a type alternative is validated with the value
   constraint's {lexical form} (Structures §3.3.4.3 clause 5.1.2), as under the
@@ -969,7 +931,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Clause 5.1.1 is checked: an empty element whose `xsi:type` has empty or
   element-only content, or reads the default as another value than the
   declaration's, is invalid (`cvc-elt.5.1.1`).
-
 - An element with `xsi:nil="true"` whose declaration has a `fixed` value is
   invalid (`cvc-elt.3.2.2`, Structures §3.3.4.3 clause 3.2.3.2), and its [nil]
   property is false.
@@ -982,15 +943,98 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   5.2.2.2.2; Datatypes 1.0 §2.5.1 and §3.2.x.2, a dateTime in `Z`, the seconds
   as written) read with the element type's white space; no facet of the
   element's type is applied to that form.
-- XSD 1.1 type alternatives see all of the element's attributes, `xsi:type`,
-  `xsi:nil` and the schema location hints included (Structures §3.12.4 clause
-  1.1.2), and `xml:` attributes accepted under `ALLOW_XML_ATTRIBUTES`.
-- `xs:duration` refuses fields out of order (`P1M1Y`, `PT1M1H`), in schema
-  validation and in XPath casts and constructor functions (Datatypes
-  §3.3.6.2).
 - A QName or NOTATION `default` / `fixed` value whose prefix the declaration
   does not bind is a schema error (`e-props-correct.2`, `a-props-correct`), as
   it already was at validation.
+
+**Attribute uses and wildcards**
+
+- A restriction of a complex type that got its attribute wildcard by extension
+  is no longer rejected as adding a wildcard (derivation-ok-restriction): the
+  base's {attribute wildcard} is the one it has through extension (Structures
+  §3.4.2.5), the one its instances are validated with.
+- An explicit restriction of `xs:anyType`
+  (`<xs:restriction base="xs:anyType">`) may declare an attribute wildcard
+  with any `processContents`, as the shorthand `<xs:complexType>` can; it was
+  rejected as adding a wildcard. An extension of `xs:anyType` has anyType's
+  attribute wildcard (any namespace, `lax`, Structures §3.4.7): attributes it
+  does not declare are validated laxly instead of rejected, and a restriction
+  of it may keep a wildcard.
+- `ValidationRuntime::get_default_attributes` reports every defaulted
+  attribute (Structures §3.4.4.2): uses of local declarations, `fixed` as well
+  as `default` value constraints, attribute-group uses, and uses inherited
+  from base types — a restriction's redeclared or prohibited attributes
+  excepted. It used to report only `default` values of global declarations
+  used directly or through a group.
+- A required attribute inherited from a base type is reported missing when an
+  extension or an attribute group marks it `use="prohibited"` — a prohibition
+  only stops a restriction's inheritance (Structures §3.4.2.4); such an
+  attribute is also accepted on the element instead of being refused as
+  prohibited. A `use="prohibited"` attribute beside an attribute group no
+  longer hides the group's attribute of the same name.
+- Default and fixed attribute values from attribute groups and base types take
+  part in identity constraints and in ID/IDREF checks (Structures §3.11.4);
+  under XSD 1.1 an inheritable defaulted attribute from a base type is
+  inherited by descendant elements. A defaulted value is compared in its
+  type's value space, as an attribute the instance carries (an integer default
+  `1` and a string default `"1"` are different key values).
+- An attribute reference's own `default` or `fixed` value in an attribute
+  group wins over its declaration's (`get_default_attributes`, identity
+  constraints, ID/IDREF, inherited attributes), as it already did for a
+  reference in a complex type.
+- Restrictions of complex types read the {attribute uses} as Structures
+  §3.4.2.4 builds them, on both sides of the comparison. Newly accepted: a
+  restriction whose attribute group marks a required base attribute
+  `use="prohibited"` (the group's prohibition is no attribute use, so the
+  attribute is inherited, still required); a restriction with its own
+  `use="prohibited"` attribute beside an attribute group's required use of the
+  same attribute. Newly refused: a restriction that weakens, retypes or
+  changes the `fixed` value of an attribute its base still has — the base side
+  is the base's complete {attribute uses}, so an extension's or an attribute
+  group's "prohibition" further up the base chain no longer hides the base's
+  use of it.
+- XSD 1.1: an attribute reference without `inheritable` inherits its
+  declaration's `{inheritable}`; an explicit `inheritable="false"` on such a
+  reference is honoured, also by the restriction check (a restriction that
+  turns an inherited `true` into `false` this way is refused; it was
+  accepted).
+- `get_expected_attributes` lists the attribute uses inherited from base
+  types.
+- Defaulted attributes whose types are derived from `xs:ID`, `xs:IDREF` or
+  `xs:ENTITY` — by restriction, list or union — take part in the ID/IDREF and
+  ENTITY checks.
+
+**PSVI, nil and ID/IDREF**
+
+- `fn:id` and the id index find an element whose typed value is a single
+  `xs:ID` (a simple type or simple content), in typed documents, annotated
+  copies and trees a host binds itself (XDM 1.0 §6.2.4, F&O 1.0 §15.5.2).
+- In a typed document, whether a union-typed element or attribute is an ID or
+  has the is-idrefs property is decided by the member type its value has with
+  the node's in-scope namespaces, as `fn:data` gives it: a value of a QName
+  member is no longer filed as an `xs:ID` or `xs:IDREF`.
+- An element assessed laxly (matched by a lax wildcard, or the undeclared root
+  of a `ValidationRoot::Lax` run, with no usable `xsi:type`) has `[validity]`
+  notKnown, also when one of its attributes or descendants is invalid (which
+  is still reported).
+- An element is nilled only when its declaration is nillable: with no
+  governing element declaration, or with a non-nillable one (where `xsi:nil`
+  is still reported, `cvc-elt.3.1`), `xsi:nil="true"` neither suppresses the
+  check of the content against the element's type nor makes content an error.
+  In a typed document only a valid element is nilled.
+- XSD 1.1: an `xsi:type` attribute that resolves to no type definition is
+  invalid (Structures 1.1 §3.2.4.1 clause 5, `cvc-attribute.5`); the problem
+  is still reported once, as `cvc-elt.4.1`, when the element event carries the
+  `xsi:type`.
+- In a typed document, an element no declaration or type governs is typed
+  `xs:anyType` when one of its attributes or descendants was assessed (XDM 1.0
+  §3.3.1.1), and stays untyped otherwise.
+- XSD 1.1 type alternatives see all of the element's attributes, `xsi:type`,
+  `xsi:nil` and the schema location hints included (Structures §3.12.4 clause
+  1.1.2), and `xml:` attributes accepted under `ALLOW_XML_ATTRIBUTES`.
+
+**Content models and schema documents**
+
 - XSD 1.1: All Group Limited is enforced — an `xs:all` group (or a reference
   to one) as the content type's particle must have `maxOccurs` 0 or 1, and a
   reference to an all group may not appear in a sequence or choice
@@ -1000,8 +1044,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   content type); in XSD 1.0 a type whose only particle has
   `minOccurs="0" maxOccurs="0"` has empty content, so white space is refused
   there too.
-- XSD 1.1: `<xs:import>` of the enclosing schema document's own target
-  namespace is an error (`src-import`, §4.2.6.2 clause 1.1).
 - An extension of a type without content by an `xs:all` group (inline or
   referenced) is validated as that all group: required members are required
   and each member occurs at most its `maxOccurs` (both versions). XSD 1.1: an
@@ -1010,11 +1052,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a mixed one keeps its empty sequence, and an `<xs:group ref>` to an all
   group extends an all-group base by merging (§3.4.2.3.3 clauses 4.2.1,
   4.2.3.2).
+- XSD 1.1: `<xs:import>` of the enclosing schema document's own target
+  namespace is an error (`src-import`, §4.2.6.2 clause 1.1).
 - A simple-content restriction may restrict a built-in member type of the
   base's union content (Type Derivation OK (Simple) clause 2.2.4).
+- `SchemaSetBuilder::compile_async` overflowed the stack on a cycle of
+  includes.
+- The content model of an extension chain was compiled in time exponential in
+  the chain's length (25 levels took seconds); the base content model is
+  compiled once.
+- Recursion bounds of the derivation and compilation passes no longer cut
+  legal schemas short (attribute inheritance stopped after 50 derivation
+  levels, attribute groups after 20 levels, group references after about 50).
+- "Unexpected element" errors in schema documents carry their location.
+- The embedded schema for the XML namespace is the current W3C edition: it
+  declares `xml:id` and allows an empty `xml:lang`. `assets/NOTICE.md` records
+  its source and the W3C licence that applies to it.
+- An attribute that `xs:schema` does not allow (or an invalid value of one it
+  does) is reported with its name and location instead of the internal error
+  "Root frame did not produce a schema result".
 
 ### Performance
 
+- Unique Particle Attribution: the epsilon closure of each content-model state
+  reuses its working storage instead of building a hash set per state. Large
+  WSDL schema sets compile up to 2.7 times faster (NetSuite 0.47 s → 0.24 s,
+  0.36 s → 0.13 s under XSD 1.1; vSphere 66 → 53 ms; Workday Human Resources
+  25 → 20 ms).
+- Key, unique and keyref tables are indexed: validating a document with
+  100,000 keys and 100,000 keyrefs takes under half a second instead of over
+  five minutes.
 - Each `xs:pattern` is compiled once: XSD 1.1 patterns were compiled two to
   eighteen times (a retry per unknown block name, then a second, anchored
   program), XSD 1.0 patterns twice. A first compile of a pattern-heavy XSD 1.1
@@ -1024,20 +1091,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   163 ms and takes 4.4 ms.
 - `fn:translate` with a long `$mapString` is linear instead of
   `|$arg| × |$mapString|` (a map of a whole Unicode category took minutes).
-
 - Validating list values is about 5–10 % faster: the members of a list of a
   union are no longer converted to strings and validated again.
 - A path step with a named kind test (`element(c)`) compares names without
   allocating, about twice as fast; `instance of` / `treat as` resolve their
   type once per expression.
-- Unique Particle Attribution: the epsilon closure of each content-model state
-  reuses its working storage instead of building a hash set per state. Large
-  WSDL schema sets compile up to 2.7 times faster (NetSuite 0.47 s → 0.24 s,
-  0.36 s → 0.13 s under XSD 1.1; vSphere 66 → 53 ms; Workday Human Resources
-  25 → 20 ms).
-- Key, unique and keyref tables are indexed: validating a document with
-  100,000 keys and 100,000 keyrefs takes under half a second instead of over
-  five minutes.
 
 ## [0.2.3] - 2026-10-15
 

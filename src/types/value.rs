@@ -1,7 +1,7 @@
 //! XSD value types for typed atomic values
 //!
 //! This module provides the `XmlValue` type for representing typed XSD values,
-//! integrating with the `xsd-types` crate for atomic value parsing and formatting.
+//! parsed and formatted by the datatype layer of [`crate::types`].
 //!
 //! ## Design
 //!
@@ -10,6 +10,11 @@
 //! - QName and NOTATION values are a [`QNameValue`]: the namespace-resolved
 //!   [`QualifiedName`] together with its lexical form
 //! - List values hold one `XmlValue` per member, each with its own type
+//! - The `PartialEq` / `PartialOrd` of the date/time and duration structs are
+//!   the XSD equality and order, computed exactly: a date/time value without a
+//!   time zone offset is incomparable with one that has an offset unless 14
+//!   hours either way give the same order, and durations are ordered by the
+//!   four reference dateTimes (`P1M` and `P30D` are incomparable)
 //!
 //! ## Implementation limits (Datatypes 1.1 §5.4)
 //!

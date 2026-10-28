@@ -24,3 +24,21 @@ cargo +nightly miri test --lib namespace::table   # NameTable unsafe verificatio
 cargo +nightly miri test --lib                     # Full lib under Miri
 cargo +nightly miri test --lib --features xsd11    # Full lib + XSD 1.1 under Miri
 ```
+
+### Doctests (the guides in `doc/` are doctested):
+```bash
+cargo test --doc                              # default features
+cargo test --doc --features xsd11
+cargo test --doc --all-features               # also COMPOSE.md and the async examples
+```
+`cargo test --all-targets` does not run doctests. A guide example that needs a
+feature is guarded with `#[cfg(feature = "...")]` (see `doc_guides` in `src/lib.rs`).
+
+### W3C conformance (always `--release`, always `--features xsd11`):
+```bash
+cargo test --test conformance --features xsd11 --release -- --test-suite ../../xsdtests --version 1.0
+cargo test --test conformance --features xsd11 --release -- --test-suite ../../xsdtests --version 1.1
+# The tests whose manifest names no XSD version (run as 1.0 above), under SchemaSet::xsd11():
+cargo test --test conformance --features xsd11 --release -- --test-suite ../../xsdtests --versionless-1.1
+```
+Compare runs by the FAIL and ERROR lines and the passed count.

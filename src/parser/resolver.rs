@@ -45,6 +45,14 @@
 //! - [`FileSystemLoader`] - Loads from local file system
 //! - [`EmbeddedLoader`] - Loads from embedded static assets
 //! - [`LoaderChain`] - Combines multiple loaders with priority
+//!
+//! # Failures and limits
+//!
+//! A directive whose document cannot be read is not a schema error
+//! (Structures §4.2.3, §4.2.6.2): it is recorded as a [`DirectiveFailure`]
+//! (`SchemaSet::directive_failures`). Directives are resolved in one walk
+//! that does not recurse, the same for the synchronous and the asynchronous
+//! loaders; [`ResolverConfig::max_depth`] bounds the chain of directives.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;

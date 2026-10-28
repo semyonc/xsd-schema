@@ -6,12 +6,14 @@
 
 | Document | Description |
 | --- | --- |
+| [What's New in 0.3](doc/WHATS_NEW.md) | A short overview of what 0.3.0 brings: new capabilities, correctness and conformance, safety and limits, performance, and the breaking changes. |
 | [Introduction](doc/INTRODUCTION.md) | Public API overview, feature sets, schema loading, validation flow, XPath entry points, and async loading notes. |
 | [Architecture Overview](doc/OVERVIEW.md) | Crate structure, pipeline diagram, module map, key abstractions, milestone history, and build reference. |
 | [Extensibility Guide](doc/EXTENSIBILITY.md) | Extension points for annotations/appinfo, schema loaders, DOM navigation, and custom XPath functions. |
 | [Unsafe Code](doc/UNSAFE.md) | Inventory of unsafe blocks, safety invariants, and Miri verification commands. |
 | [Composing XML from Rust](doc/COMPOSE.md) | XPath 2.0 with Rust values bound as `$variables`, the Lisp-style `form!` constructor, iterator pipelines for the FLWOR clauses, and serialization. |
 | [Implementation Limits](doc/IMPLEMENTATION_LIMITS.md) | Where values are bounded and what happens at the bound: `xs:decimal` beyond `rust_decimal` — exact validation, the typed value, the `xs-decimal-capacity` warning, XPath behaviour; regular expressions nested more than 64 levels deep. |
+| [Upgrading to 0.3](doc/UPGRADING_0_3.md) | Every breaking change with the 0.2.x and the 0.3 code, then the verdict changes users will see. |
 | [Changelog](CHANGELOG.md) | Release notes for every version, with upgrade notes for breaking releases. |
 
 To see exactly what the validator compiled for a complex type — the authored

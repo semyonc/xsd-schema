@@ -2,6 +2,25 @@
 //!
 //! This module provides validation error types, a push-based `SchemaValidator`,
 //! and supporting types for XML instance validation with spec-aligned error codes.
+//!
+//! - A [`SchemaValidator`] holds the configuration ([`ValidationFlags`]) and
+//!   starts a [`ValidationRuntime`] per instance, with a [`ValidationSink`]
+//!   that receives every [`ValidationError`] and [`ValidationWarning`]. Each
+//!   names the item it is about: [`ValidationError::subject`] and
+//!   [`ValidationError::instance_path`].
+//! - The runtime's push API (`validate_element`, `validate_attribute`, …,
+//!   `end_validation`) is source-agnostic. [`drive_quick_xml`] and its
+//!   variants drive it from XML text, through the [`xml`](crate::xml)
+//!   well-formedness layer and its [`ParseLimits`](crate::xml::ParseLimits);
+//!   [`drive_navigator`] re-validates any [`DomNavigator`](crate::DomNavigator)
+//!   tree. A [`ValidationEventHandler`] interleaves its own work with the
+//!   events.
+//! - [`ValidationRoot`] says how a run assesses its validation root: by the
+//!   declaration of its name (the default), against a stipulated element
+//!   declaration or type definition, or laxly (Structures 1.1 §5.2).
+//! - Every event returns a [`SchemaInfo`]: the declaration, the governing
+//!   type and its source ([`TypeSource`]), `[validity]`,
+//!   `[validation attempted]`, the normalized and typed values, nil.
 
 pub mod active_axis;
 #[cfg(feature = "xsd11")]

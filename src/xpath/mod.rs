@@ -2,6 +2,26 @@
 //!
 //! This module provides the full XPath 2.0 parser, binder, and evaluator.
 //!
+//! An expression is compiled once against a static context ([`XPathContext`]:
+//! names, namespaces, the schema set, the function catalog, the language
+//! [`XPathMode`]) and evaluated by an [`XPathEvaluator`], which builds the
+//! dynamic context ([`DynamicContext`]) of each run. The dynamic context holds
+//! the focus, the variables, the current dateTime and the **implicit
+//! timezone** — [`XPathContext::with_implicit_timezone`] or
+//! [`DynamicContext::with_implicit_timezone`]; without one, the host's local
+//! offset, read once per evaluation
+//! ([`DynamicContext::implicit_timezone_or_host`]). Date/time and duration
+//! comparison and arithmetic are exact and raise the F&O errors at the limits
+//! of the value types.
+//!
+//! A host can lend a run a [`RegexCache`] it keeps across runs
+//! ([`XPathEvaluator::with_regex_cache`]) and collect the run's
+//! [`XPathWarning`]s ([`XPathEvaluator::with_warnings`]). Every expression the
+//! parser reads nests at most [`MAX_EXPRESSION_DEPTH`] levels
+//! ([`XPathError::LimitExceeded`] beyond). [`XPathError`] is
+//! `#[non_exhaustive]`; errors identified by an error QName are
+//! [`XPathError::Raised`].
+//!
 //! ## Core Types (re-exported from `navigator`)
 //!
 //! - [`DomNavigator`] - Trait for cursor-based XML navigation

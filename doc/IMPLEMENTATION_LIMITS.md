@@ -175,8 +175,12 @@ A year is held in `i32` (`xs:dateTime`, `xs:date`, `xs:gYearMonth`,
 `u32`, and seconds in a `rust_decimal::Decimal` (whole seconds below `2^96`, at
 most 28 fraction digits). A literal beyond the integer limits is not a value
 here; one with more fraction digits than a `Decimal` holds is valid and its
-typed value keeps the fraction truncated toward zero (the `types::value`
-module documentation has the details for validation).
+typed value keeps the fraction truncated toward zero — not rounded, which could
+make `…59.999…` an invalid second 60 — while the facets, value constraints and
+identity constraints compare the literal as written. The validator reports the
+warning `xs-seconds-capacity` for such a value (Datatypes 1.1 §5.4), while
+`ValidationFlags::REPORT_WARNINGS` is set; the `types::value` module
+documentation has the details.
 
 ### In XPath
 
@@ -190,7 +194,11 @@ module documentation has the details for validation).
   difference of two date/time values beyond `2^32 − 1` days, `FODT0002` for a
   duration result beyond `2^32 − 1` days or years. A result's seconds field
   holds at most the digits a `Decimal` holds next to its whole seconds; more
-  fraction digits are truncated toward zero.
+  fraction digits are truncated toward zero, and the evaluation raises the
+  warning `xs-seconds-capacity` (an `xpath::XPathWarning`, once per evaluation
+  and operator or function: `XPathEvaluator::with_warnings` collects it). During
+  validation such a warning from an XSD 1.1 assertion or type alternative is
+  reported to the sink, as the same code is for a literal.
 - **Casts** of a literal beyond the integer limits raise `FODT0001` (date/time
   types) or `FODT0002` (durations), F&O §17.1.1.
 - **Year numbering**: as XSD 1.0, `-0001` is the year before `0001`; a year
@@ -204,3 +212,43 @@ module documentation has the details for validation).
   functions that take no dynamic context (`operators::value_eq`, `eval_binary`,
   …) read the host's offset when they compare a date/time value;
   `operators::eval_binary_with_timezone` takes the timezone explicitly.
+
+## 6. Nesting
+
+The schema-time passes, the XPath binder and evaluator, and the parsers of
+the crate recurse along the structures they read. So that a deeply nested
+input is refused with an error rather than overflowing the thread's stack —
+an abort, not a recoverable error — every such structure is bounded:
+
+| Limit | Default | Bounds | Refusal |
+| --- | --- | --- | --- |
+| `ParserConfig::max_depth` | 128 (`parser::DEFAULT_MAX_DEPTH`) | the element nesting of each schema document (`xs:schema` is 1), checked on the raw markup | `SchemaError::LimitExceeded`, `SchemaLimit::ElementDepth`, at the element |
+| `SchemaSet::max_depth` | the same value, set by `SchemaSetBuilder::compile` and `load_and_process_schema` | the longest chain of components nested through references — model groups in model groups (inline or by `<xs:group ref>`), a type in its base, item or member types, an attribute group in the groups it references, an element in its substitution group's head — measured once, without recursion, before any pass recurses along it | `SchemaError::LimitExceeded`, `SchemaLimit::ComponentDepth`, at the component |
+| `ResolverConfig::max_depth` | 100 | the chain of `xs:include` / `xs:import` / `xs:redefine` / `xs:override` directives, counted along the shortest chain that reaches a document | `SchemaError::LimitExceeded`, `SchemaLimit::DirectiveDepth`, at the directive |
+| `xpath::MAX_EXPRESSION_DEPTH` | 256 (fixed) | the nesting of every XPath expression the engine parses — a host's, and the tests of a schema's `xs:assert`, `xs:assertion` and `xs:alternative` (checked when the schema document is read) | `XPathError::LimitExceeded` (`ParseError::LimitExceeded` from the parser); in a schema `SchemaLimit::XPathDepth` |
+
+`0` turns a schema limit off, and with it the protection: the passes' own
+recursion bounds then refuse only some shapes, and a deep enough schema
+overflows the stack. Identity-constraint selectors and fields need no limit:
+their grammar is a union of paths, parsed by a loop.
+
+**Headroom.** The deepest schema of the W3C XSD test suite nests 16 elements
+(its deepest component chain 9 levels); the deepest real schema of a corpus of
+1,691 WSDL and XSD files 25. 128 is five times that, and every shape at the
+limit compiles on a 2 MiB thread in an unoptimized build too (the worst, a
+chain of group references, uses about 830 KiB). XPath expressions of the XQuery
+1.0 test suite and of the W3C XSD 1.1 suite nest at most 14 levels. 256 counts
+tree levels — a parenthesized expression is two, a predicate three, so 126
+nested parentheses or 84 nested predicates fit, and a chain of `or`, `+` or
+`if … else` nests one level per operator. At the limit an optimized build
+evaluates within about half a MiB of stack (344–479 KiB measured, for every
+shape and entry point); an unoptimized build needs about 40 KiB a level, so a
+larger thread near the limit. A tree a host builds into an `AstArena` itself is
+not checked; `xpath::expression_depth` measures one.
+
+Instance documents are not bounded by default. The streaming drivers keep
+their element stack on the heap; the tree-walk driver (`drive_navigator`,
+`drive_buffer_document`) recurses once per element level. A host that reads
+documents of untrusted depth sets `ParseLimits::max_depth` on the runtime or
+the document builder (§4), which bounds the trees it builds as well.
+
