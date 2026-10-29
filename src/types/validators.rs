@@ -23,6 +23,7 @@ use super::value::{
     GMonthValue, GYearMonthValue, GYearValue, TimeValue, TimezoneOffset, XmlAtomicValue, XmlValue,
     XmlValueKind, YearMonthDurationValue,
 };
+use super::value_order::FacetOrder;
 use super::{PrimitiveTypeCode, XmlTypeCode};
 use crate::error::FacetError;
 
@@ -95,6 +96,22 @@ macro_rules! enum_matches_value_space {
                 .ok()
                 .map(|e| $eq_fn($typed, e))
                 .unwrap_or(false)
+        }
+    };
+}
+
+/// [`enum_matches_value_space!`] for the datatypes with seconds: equality in
+/// the facet order on the two literals
+/// ([`FacetOrder::facet_cmp_literal`]), exact also for seconds with more
+/// fraction digits than the typed value holds.
+macro_rules! enum_matches_literal {
+    ($typed:expr, $lexical:expr, $parse_fn:expr) => {
+        |s: &str| {
+            $parse_fn(&normalize_whitespace(s, WhitespaceMode::Collapse))
+                .ok()
+                .is_some_and(|e| {
+                    $typed.facet_cmp_literal($lexical, &e, s) == Some(std::cmp::Ordering::Equal)
+                })
         }
     };
 }
@@ -212,6 +229,9 @@ impl ValidatorRegistry {
         registry.register(Arc::new(YearMonthDurationValidator));
         registry.register(Arc::new(DayTimeDurationValidator));
         registry.register(Arc::new(DateTimeStampValidator));
+
+        // The XPath 2.0 data model's xs:untypedAtomic
+        registry.register(Arc::new(UntypedAtomicValidator));
 
         registry
     }
@@ -1160,57 +1180,35 @@ pub(crate) fn parse_double(s: &str) -> Result<f64, String> {
 
 use crate::types::equality::{double_eq, float_eq};
 
-/// Value-space equality for xs:duration per §3.3.6.
-/// Two durations are equal iff their signed total-months components are equal
-/// AND their signed total day-time seconds components are equal.
-fn datetime_value_eq(a: &DateTimeValue, b: &DateTimeValue) -> bool {
-    a.partial_cmp(b) == Some(std::cmp::Ordering::Equal)
-}
-
+/// Value-space equality of two `xs:date` values for `enumeration`: equal in
+/// the order the facets use ([`FacetOrder`]), so one instant written with two
+/// time zone offsets is one value, and a value without a time zone offset
+/// equals no value with one. The datatypes with seconds compare their
+/// literals ([`enum_matches_literal!`]): `xs:duration` values are equal when
+/// the four reference sums agree — the same signed months and seconds, and
+/// also pairs such as `P400Y` / `P146097D` (decision 11).
 fn date_value_eq(a: &DateValue, b: &DateValue) -> bool {
-    a.partial_cmp(b) == Some(std::cmp::Ordering::Equal)
+    a.facet_cmp(b) == Some(std::cmp::Ordering::Equal)
 }
 
-fn time_value_eq(a: &TimeValue, b: &TimeValue) -> bool {
-    a.partial_cmp(b) == Some(std::cmp::Ordering::Equal)
-}
-
-fn duration_eq(a: &DurationValue, b: &DurationValue) -> bool {
-    let sign = |d: &DurationValue| if d.negative { -1i64 } else { 1 };
-    let total_months = |d: &DurationValue| d.years as i64 * 12 + d.months as i64;
-    if sign(a) * total_months(a) != sign(b) * total_months(b) {
-        return false;
-    }
-    let day_secs = |d: &DurationValue| {
-        let s = rust_decimal::Decimal::from(d.days as i64) * rust_decimal::Decimal::from(86400)
-            + rust_decimal::Decimal::from(d.hours as i64) * rust_decimal::Decimal::from(3600)
-            + rust_decimal::Decimal::from(d.minutes as i64) * rust_decimal::Decimal::from(60)
-            + d.seconds;
-        if d.negative {
-            -s
-        } else {
-            s
-        }
-    };
-    day_secs(a) == day_secs(b)
+/// Value-space equality of two values of a g* datatype for `enumeration`, in
+/// the same order (Datatypes 1.1 §3.3.13.1: "---15−11:00 = ---16+13:00").
+fn g_value_eq<T: FacetOrder>(a: &T, b: &T) -> bool {
+    a.facet_cmp(b) == Some(std::cmp::Ordering::Equal)
 }
 
 fn year_month_duration_value_eq(a: &YearMonthDurationValue, b: &YearMonthDurationValue) -> bool {
     a.partial_cmp(b) == Some(std::cmp::Ordering::Equal)
 }
 
-fn day_time_duration_value_eq(a: &DayTimeDurationValue, b: &DayTimeDurationValue) -> bool {
-    a.partial_cmp(b) == Some(std::cmp::Ordering::Equal)
-}
-
-// ============================================================================
 // ---------------------------------------------------------------------------
 // Date/time bound checking helper
 // ---------------------------------------------------------------------------
 
-/// Validate min/max inclusive/exclusive bounds for types that implement PartialOrd.
+/// Validate the min/max inclusive/exclusive bounds in the datatype's
+/// [`FacetOrder`]; a value ·incomparable· with a bound violates it.
 /// The `parse_fn` parses the bound value string using the same parser as the main value.
-fn validate_bounds<T: PartialOrd, F: Fn(&str) -> Option<T>>(
+fn validate_bounds<T: FacetOrder, F: Fn(&str) -> Option<T>>(
     value: &T,
     facets: &FacetSet,
     _type_name: &str,
@@ -1219,9 +1217,10 @@ fn validate_bounds<T: PartialOrd, F: Fn(&str) -> Option<T>>(
 ) -> ValidationResult<()> {
     if let Some(ref min) = facets.min_inclusive {
         if let Some(bound) = parse_fn(&min.value) {
-            if value.partial_cmp(&bound) != Some(std::cmp::Ordering::Greater)
-                && value.partial_cmp(&bound) != Some(std::cmp::Ordering::Equal)
-            {
+            if !matches!(
+                value.facet_cmp_literal(value_str, &bound, &min.value),
+                Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
+            ) {
                 return Err(ValidationError::FacetViolation(
                     FacetError::MinInclusiveViolation {
                         value: value_str.to_string(),
@@ -1233,9 +1232,10 @@ fn validate_bounds<T: PartialOrd, F: Fn(&str) -> Option<T>>(
     }
     if let Some(ref max) = facets.max_inclusive {
         if let Some(bound) = parse_fn(&max.value) {
-            if value.partial_cmp(&bound) != Some(std::cmp::Ordering::Less)
-                && value.partial_cmp(&bound) != Some(std::cmp::Ordering::Equal)
-            {
+            if !matches!(
+                value.facet_cmp_literal(value_str, &bound, &max.value),
+                Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+            ) {
                 return Err(ValidationError::FacetViolation(
                     FacetError::MaxInclusiveViolation {
                         value: value_str.to_string(),
@@ -1247,7 +1247,9 @@ fn validate_bounds<T: PartialOrd, F: Fn(&str) -> Option<T>>(
     }
     if let Some(ref min) = facets.min_exclusive {
         if let Some(bound) = parse_fn(&min.value) {
-            if value.partial_cmp(&bound) != Some(std::cmp::Ordering::Greater) {
+            if value.facet_cmp_literal(value_str, &bound, &min.value)
+                != Some(std::cmp::Ordering::Greater)
+            {
                 return Err(ValidationError::FacetViolation(
                     FacetError::MinExclusiveViolation {
                         value: value_str.to_string(),
@@ -1259,7 +1261,9 @@ fn validate_bounds<T: PartialOrd, F: Fn(&str) -> Option<T>>(
     }
     if let Some(ref max) = facets.max_exclusive {
         if let Some(bound) = parse_fn(&max.value) {
-            if value.partial_cmp(&bound) != Some(std::cmp::Ordering::Less) {
+            if value.facet_cmp_literal(value_str, &bound, &max.value)
+                != Some(std::cmp::Ordering::Less)
+            {
                 return Err(ValidationError::FacetViolation(
                     FacetError::MaxExclusiveViolation {
                         value: value_str.to_string(),
@@ -1310,7 +1314,7 @@ impl TypeValidator for DurationValidator {
             })?;
             // §cvc-enumeration-valid: compare in value space, not lexically
             facets.validate_enum_value_space(
-                enum_matches_value_space!(dur, parse_duration, |a, b| duration_eq(a, &b)),
+                enum_matches_literal!(dur, value, parse_duration),
                 value,
             )?;
         }
@@ -1366,7 +1370,7 @@ impl TypeValidator for DateTimeValidator {
                 parse_datetime(&normalize_whitespace(s, WhitespaceMode::Collapse)).ok()
             })?;
             facets.validate_enum_value_space(
-                enum_matches_value_space!(dt, parse_datetime, |a, b| datetime_value_eq(a, &b)),
+                enum_matches_literal!(dt, value, parse_datetime),
                 value,
             )?;
         }
@@ -1479,10 +1483,7 @@ impl TypeValidator for TimeValidator {
             validate_bounds(t, facets, "time", value, |s| {
                 parse_time(&normalize_whitespace(s, WhitespaceMode::Collapse)).ok()
             })?;
-            facets.validate_enum_value_space(
-                enum_matches_value_space!(t, parse_time, |a, b| time_value_eq(a, &b)),
-                value,
-            )?;
+            facets.validate_enum_value_space(enum_matches_literal!(t, value, parse_time), value)?;
         }
         facets.validate_patterns_only(value)?;
         Ok(result)
@@ -1531,13 +1532,21 @@ impl TypeValidator for GYearMonthValidator {
 
     fn validate_with_facets(&self, value: &str, facets: &FacetSet) -> ValidationResult<XmlValue> {
         let result = self.validate(value)?;
+        let canonical = result.to_string_value();
         if let XmlValueKind::Atomic(XmlAtomicValue::GYearMonth(ref v)) = result.value {
             facets.validate_explicit_timezone(v.timezone.is_some())?;
             validate_bounds(v, facets, "gYearMonth", value, |s| {
                 parse_gyearmonth(&normalize_whitespace(s, WhitespaceMode::Collapse)).ok()
             })?;
+            // Datatypes §4.3.4: a pattern constrains the lexical space —
+            // the normalized value, not the canonical representation.
+            facets
+                .validate_patterns_only(&normalize_whitespace(value, WhitespaceMode::Collapse))?;
+            facets.validate_enum_value_space(
+                enum_matches_value_space!(v, parse_gyearmonth, |a, b| g_value_eq(a, &b)),
+                &canonical,
+            )?;
         }
-        facets.validate_string(&result.to_string_value())?;
         Ok(result)
     }
 
@@ -1584,13 +1593,21 @@ impl TypeValidator for GYearValidator {
 
     fn validate_with_facets(&self, value: &str, facets: &FacetSet) -> ValidationResult<XmlValue> {
         let result = self.validate(value)?;
+        let canonical = result.to_string_value();
         if let XmlValueKind::Atomic(XmlAtomicValue::GYear(ref v)) = result.value {
             facets.validate_explicit_timezone(v.timezone.is_some())?;
             validate_bounds(v, facets, "gYear", value, |s| {
                 parse_gyear(&normalize_whitespace(s, WhitespaceMode::Collapse)).ok()
             })?;
+            // Datatypes §4.3.4: a pattern constrains the lexical space —
+            // the normalized value, not the canonical representation.
+            facets
+                .validate_patterns_only(&normalize_whitespace(value, WhitespaceMode::Collapse))?;
+            facets.validate_enum_value_space(
+                enum_matches_value_space!(v, parse_gyear, |a, b| g_value_eq(a, &b)),
+                &canonical,
+            )?;
         }
-        facets.validate_string(&result.to_string_value())?;
         Ok(result)
     }
 
@@ -1637,13 +1654,21 @@ impl TypeValidator for GMonthDayValidator {
 
     fn validate_with_facets(&self, value: &str, facets: &FacetSet) -> ValidationResult<XmlValue> {
         let result = self.validate(value)?;
+        let canonical = result.to_string_value();
         if let XmlValueKind::Atomic(XmlAtomicValue::GMonthDay(ref v)) = result.value {
             facets.validate_explicit_timezone(v.timezone.is_some())?;
             validate_bounds(v, facets, "gMonthDay", value, |s| {
                 parse_gmonthday(&normalize_whitespace(s, WhitespaceMode::Collapse)).ok()
             })?;
+            // Datatypes §4.3.4: a pattern constrains the lexical space —
+            // the normalized value, not the canonical representation.
+            facets
+                .validate_patterns_only(&normalize_whitespace(value, WhitespaceMode::Collapse))?;
+            facets.validate_enum_value_space(
+                enum_matches_value_space!(v, parse_gmonthday, |a, b| g_value_eq(a, &b)),
+                &canonical,
+            )?;
         }
-        facets.validate_string(&result.to_string_value())?;
         Ok(result)
     }
 
@@ -1690,13 +1715,21 @@ impl TypeValidator for GDayValidator {
 
     fn validate_with_facets(&self, value: &str, facets: &FacetSet) -> ValidationResult<XmlValue> {
         let result = self.validate(value)?;
+        let canonical = result.to_string_value();
         if let XmlValueKind::Atomic(XmlAtomicValue::GDay(ref v)) = result.value {
             facets.validate_explicit_timezone(v.timezone.is_some())?;
             validate_bounds(v, facets, "gDay", value, |s| {
                 parse_gday(&normalize_whitespace(s, WhitespaceMode::Collapse)).ok()
             })?;
+            // Datatypes §4.3.4: a pattern constrains the lexical space —
+            // the normalized value, not the canonical representation.
+            facets
+                .validate_patterns_only(&normalize_whitespace(value, WhitespaceMode::Collapse))?;
+            facets.validate_enum_value_space(
+                enum_matches_value_space!(v, parse_gday, |a, b| g_value_eq(a, &b)),
+                &canonical,
+            )?;
         }
-        facets.validate_string(&result.to_string_value())?;
         Ok(result)
     }
 
@@ -1743,13 +1776,21 @@ impl TypeValidator for GMonthValidator {
 
     fn validate_with_facets(&self, value: &str, facets: &FacetSet) -> ValidationResult<XmlValue> {
         let result = self.validate(value)?;
+        let canonical = result.to_string_value();
         if let XmlValueKind::Atomic(XmlAtomicValue::GMonth(ref v)) = result.value {
             facets.validate_explicit_timezone(v.timezone.is_some())?;
             validate_bounds(v, facets, "gMonth", value, |s| {
                 parse_gmonth(&normalize_whitespace(s, WhitespaceMode::Collapse)).ok()
             })?;
+            // Datatypes §4.3.4: a pattern constrains the lexical space —
+            // the normalized value, not the canonical representation.
+            facets
+                .validate_patterns_only(&normalize_whitespace(value, WhitespaceMode::Collapse))?;
+            facets.validate_enum_value_space(
+                enum_matches_value_space!(v, parse_gmonth, |a, b| g_value_eq(a, &b)),
+                &canonical,
+            )?;
         }
-        facets.validate_string(&result.to_string_value())?;
         Ok(result)
     }
 
@@ -1806,11 +1847,20 @@ impl TypeValidator for HexBinaryValidator {
 
     fn validate_with_facets(&self, value: &str, facets: &FacetSet) -> ValidationResult<XmlValue> {
         let result = self.validate(value)?;
+        let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
         if let XmlValueKind::Atomic(XmlAtomicValue::HexBinary(bytes)) = &result.value {
             facets.validate_binary_length(bytes.len() as u64)?;
+            facets.validate_patterns_only(&normalized)?;
+            // §cvc-enumeration-valid: a value is a sequence of octets
+            // (Datatypes §3.3.15.1), so `0A` is the value of `0a`.
+            facets.validate_enum_value_space(
+                |s| {
+                    hex::decode(normalize_whitespace(s, WhitespaceMode::Collapse).as_bytes())
+                        .is_ok_and(|octets| &octets == bytes)
+                },
+                &normalized,
+            )?;
         }
-        let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
-        facets.validate_string_patterns_enums(&normalized)?;
         Ok(result)
     }
 
@@ -1859,11 +1909,22 @@ impl TypeValidator for Base64BinaryValidator {
 
     fn validate_with_facets(&self, value: &str, facets: &FacetSet) -> ValidationResult<XmlValue> {
         let result = self.validate(value)?;
+        let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
         if let XmlValueKind::Atomic(XmlAtomicValue::Base64Binary(bytes)) = &result.value {
             facets.validate_binary_length(bytes.len() as u64)?;
+            facets.validate_patterns_only(&normalized)?;
+            // §cvc-enumeration-valid: a value is a sequence of octets
+            // (Datatypes §3.3.16.1), compared as such.
+            facets.validate_enum_value_space(
+                |s| {
+                    self.validate(s).is_ok_and(|literal| {
+                        matches!(&literal.value,
+                            XmlValueKind::Atomic(XmlAtomicValue::Base64Binary(octets)) if octets == bytes)
+                    })
+                },
+                &normalized,
+            )?;
         }
-        let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
-        facets.validate_string_patterns_enums(&normalized)?;
         Ok(result)
     }
 
@@ -2125,9 +2186,8 @@ fn parse_duration(s: &str) -> ValidationResult<DurationValue> {
 
         match field {
             Field::Seconds => {
-                out.seconds = num_str
-                    .parse()
-                    .map_err(|_| bad(format!("Invalid seconds value '{}'", num_str)))?;
+                out.seconds = parse_seconds(num_str)
+                    .ok_or_else(|| bad(format!("Invalid seconds value '{}'", num_str)))?;
             }
             _ => {
                 let v: u32 = num_str
@@ -2158,6 +2218,14 @@ fn parse_duration(s: &str) -> ValidationResult<DurationValue> {
             "Time designator 'T' requires at least one time component".to_string(),
         ));
     }
+    // Datatypes 1.1 §3.3.6.2: "a durationLexicalRep consists of one or more
+    // of a duYearFrag, duMonthFrag, duDayFrag, duHourFrag, duMinuteFrag,
+    // and/or duSecondFrag, in order".
+    if !duration_fields_in_order(s) {
+        return Err(bad(
+            "the fields of a duration are in the order Y, M, D, T, H, M, S".to_string(),
+        ));
+    }
 
     Ok(out)
 }
@@ -2171,6 +2239,85 @@ enum Field {
     Hours = 3,
     Minutes = 4,
     Seconds = 5,
+}
+
+/// The warning code the validator reports, through
+/// [`ValidationSink::on_warning`](crate::validation::ValidationSink::on_warning),
+/// for a date/time or duration literal whose seconds have more digits than
+/// this implementation holds ([`parse_seconds`]).
+pub(crate) const SECONDS_CAPACITY_WARNING: &str = "xs-seconds-capacity";
+
+/// A seconds number of a time of day or a duration (`ss`, `ss.s+`, a
+/// duration's `n.nS`) as a `Decimal`: exactly when it fits — at most 28
+/// fraction digits and a 96-bit mantissa; otherwise its fraction truncated,
+/// toward zero, to the digits that fit, never rounded up past a whole second
+/// (`59.99…9` stays below 60). Datatypes 1.1 §5.4: a value beyond the capacity
+/// of a partial implementation "must not be treated as invalid, and the
+/// unsupported value must not be quietly changed to a supported value": the
+/// comparisons that see the literal — the bounds, `enumeration`, value
+/// constraints, identity constraints, the schema-time facet checks — use its
+/// fraction as written
+/// (`value_order::literal_cmp_in`), and the runtime reports
+/// [`SECONDS_CAPACITY_WARNING`] for an instance literal
+/// ([`seconds_beyond_capacity`]), whose typed value holds the truncated
+/// seconds. `None` for a malformed number, or one whose integral part alone
+/// exceeds the mantissa.
+fn parse_seconds(text: &str) -> Option<Decimal> {
+    let (whole, fraction) = text.split_once('.').unwrap_or((text, ""));
+    if whole.is_empty() || !whole.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if !fraction.bytes().all(|b| b.is_ascii_digit()) || text.ends_with('.') {
+        return None;
+    }
+    // Leading zeros carry nothing; at most 28 fraction digits can be kept.
+    let whole = match whole.trim_start_matches('0') {
+        "" => "0",
+        digits => digits,
+    };
+    (0..=fraction.len().min(28)).rev().find_map(|keep| {
+        let candidate = if keep == 0 {
+            whole.to_string()
+        } else {
+            format!("{whole}.{}", &fraction[..keep])
+        };
+        Decimal::from_str_exact(&candidate).ok()
+    })
+}
+
+/// Whether a literal holds a number with a fraction that [`parse_seconds`]
+/// could not keep exactly — the case for [`SECONDS_CAPACITY_WARNING`], and
+/// for comparing the literal's fraction as written.
+pub(crate) fn seconds_beyond_capacity(lexical: &str) -> bool {
+    let bytes = lexical.as_bytes();
+    bytes.iter().enumerate().any(|(dot, &b)| {
+        if b != b'.' {
+            return false;
+        }
+        let start = (0..dot)
+            .rev()
+            .take_while(|&i| bytes[i].is_ascii_digit())
+            .last()
+            .unwrap_or(dot);
+        let end = (dot + 1..bytes.len())
+            .take_while(|&i| bytes[i].is_ascii_digit())
+            .last()
+            .map_or(dot + 1, |i| i + 1);
+        // Leading zeros of the whole part and trailing zeros of the fraction
+        // carry nothing: `001.5000…0` is exact.
+        let whole = lexical[start..dot].trim_start_matches('0');
+        let fraction = lexical[dot + 1..end].trim_end_matches('0');
+        if whole.len() + fraction.len() <= 28 {
+            // Fewer than 29 digits always fit a 96-bit mantissa.
+            return false;
+        }
+        fraction.len() > 28
+            || Decimal::from_str_exact(&format!(
+                "{}.{fraction}",
+                if whole.is_empty() { "0" } else { whole }
+            ))
+            .is_err()
+    })
 }
 
 /// Parse XSD dateTime
@@ -2469,9 +2616,8 @@ fn parse_time_part(s: &str, type_name: &'static str) -> ValidationResult<(u8, u8
             type_name,
             message: "Invalid minute".to_string(),
         })?;
-    let second: Decimal = parts[2]
-        .parse()
-        .map_err(|_| ValidationError::InvalidLexical {
+    let second: Decimal =
+        parse_seconds(parts[2]).ok_or_else(|| ValidationError::InvalidLexical {
             value: s.to_string(),
             type_name,
             message: "Invalid second".to_string(),
@@ -2746,199 +2892,90 @@ fn parse_gmonth(s: &str) -> ValidationResult<GMonthValue> {
     })
 }
 
-/// Parse xs:yearMonthDuration (XSD 1.1)
-/// Format: -?P(nY)?(nM)?
+/// Whether the designators of a duration literal come in the order of
+/// Datatypes 1.1 §3.3.6.2's grammar — `Y`, `M`, `D`, then after `T` `H`, `M`,
+/// `S` — checked by [`parse_duration`] for `xs:duration` and its two
+/// subtypes alike.
+fn duration_fields_in_order(s: &str) -> bool {
+    let mut last = 0u8;
+    let mut in_time = false;
+    for c in s.chars() {
+        let rank = match (c, in_time) {
+            ('T', _) => {
+                in_time = true;
+                continue;
+            }
+            ('Y', false) => 1,
+            ('M', false) => 2,
+            ('D', false) => 3,
+            ('H', true) => 4,
+            ('M', true) => 5,
+            ('S', true) => 6,
+            _ => continue,
+        };
+        if rank <= last {
+            return false;
+        }
+        last = rank;
+    }
+    true
+}
+
+/// Parse xs:yearMonthDuration: a lexical form of `xs:duration` that matches
+/// the pattern `[^DT]*` (Datatypes 1.1 §3.4.26.1; XDM 1.0 §2.6.2 restricts
+/// `xs:duration` with the same pattern) — no day field, no time part.
 fn parse_year_month_duration(s: &str) -> ValidationResult<YearMonthDurationValue> {
-    let (negative, rest) = if let Some(stripped) = s.strip_prefix('-') {
-        (true, stripped)
-    } else {
-        (false, s)
+    let bad = |message: &str| ValidationError::InvalidLexical {
+        value: s.to_string(),
+        type_name: "yearMonthDuration",
+        message: message.to_string(),
     };
-
-    if !rest.starts_with('P') {
-        return Err(ValidationError::InvalidLexical {
-            value: s.to_string(),
-            type_name: "yearMonthDuration",
-            message: "Must start with 'P' (or '-P')".to_string(),
-        });
+    let duration = parse_duration(s).map_err(|e| match e {
+        ValidationError::InvalidLexical { message, .. } => bad(&message),
+        other => other,
+    })?;
+    if s.contains(['D', 'T']) {
+        return Err(bad(
+            "yearMonthDuration cannot contain day or time components",
+        ));
     }
-
-    let content = &rest[1..];
-    if content.is_empty() {
-        return Err(ValidationError::InvalidLexical {
-            value: s.to_string(),
-            type_name: "yearMonthDuration",
-            message: "Duration cannot be empty".to_string(),
-        });
-    }
-
-    // Must not contain day/time components
-    if content.contains('D') || content.contains('T') {
-        return Err(ValidationError::InvalidLexical {
-            value: s.to_string(),
-            type_name: "yearMonthDuration",
-            message: "yearMonthDuration cannot contain day or time components".to_string(),
-        });
-    }
-
-    let mut years = 0u32;
-    let mut months = 0u32;
-    let mut current = content;
-
-    // Parse years
-    if let Some(y_pos) = current.find('Y') {
-        years = current[..y_pos]
-            .parse()
-            .map_err(|_| ValidationError::InvalidLexical {
-                value: s.to_string(),
-                type_name: "yearMonthDuration",
-                message: "Invalid years value".to_string(),
-            })?;
-        current = &current[y_pos + 1..];
-    }
-
-    // Parse months
-    if let Some(m_pos) = current.find('M') {
-        months = current[..m_pos]
-            .parse()
-            .map_err(|_| ValidationError::InvalidLexical {
-                value: s.to_string(),
-                type_name: "yearMonthDuration",
-                message: "Invalid months value".to_string(),
-            })?;
-        current = &current[m_pos + 1..];
-    }
-
-    // Check nothing remains
-    if !current.is_empty() {
-        return Err(ValidationError::InvalidLexical {
-            value: s.to_string(),
-            type_name: "yearMonthDuration",
-            message: "Invalid duration format".to_string(),
-        });
-    }
-
     Ok(YearMonthDurationValue {
-        negative,
-        years,
-        months,
+        negative: duration.negative,
+        years: duration.years,
+        months: duration.months,
     })
 }
 
-/// Parse xs:dayTimeDuration (XSD 1.1)
-/// Format: -?P(nD)?(T(nH)?(nM)?(n(.n)?S)?)?
+/// Parse xs:dayTimeDuration: a lexical form of `xs:duration` that matches
+/// the pattern `[^YM]*[DT].*` (Datatypes 1.1 §3.4.27.1; XDM 1.0 §2.6.2) — a
+/// day field or a time part, and no year or month field.
 fn parse_day_time_duration(s: &str) -> ValidationResult<DayTimeDurationValue> {
-    let (negative, rest) = if let Some(stripped) = s.strip_prefix('-') {
-        (true, stripped)
-    } else {
-        (false, s)
+    let bad = |message: &str| ValidationError::InvalidLexical {
+        value: s.to_string(),
+        type_name: "dayTimeDuration",
+        message: message.to_string(),
     };
-
-    if !rest.starts_with('P') {
-        return Err(ValidationError::InvalidLexical {
-            value: s.to_string(),
-            type_name: "dayTimeDuration",
-            message: "Must start with 'P' (or '-P')".to_string(),
-        });
+    let duration = parse_duration(s).map_err(|e| match e {
+        ValidationError::InvalidLexical { message, .. } => bad(&message),
+        other => other,
+    })?;
+    // Year and month fields precede the day field and the time part, whose
+    // `M` is minutes.
+    let date_part = s.split('T').next().unwrap_or(s);
+    if date_part.contains(['Y', 'M']) {
+        return Err(bad(
+            "dayTimeDuration cannot contain year or month components",
+        ));
     }
-
-    let content = &rest[1..];
-    if content.is_empty() {
-        return Err(ValidationError::InvalidLexical {
-            value: s.to_string(),
-            type_name: "dayTimeDuration",
-            message: "Duration cannot be empty".to_string(),
-        });
+    if !s.contains(['D', 'T']) {
+        return Err(bad("dayTimeDuration needs a day or a time component"));
     }
-
-    // Must not contain year/month components (before T)
-    let date_part = if let Some(t_pos) = content.find('T') {
-        &content[..t_pos]
-    } else {
-        content
-    };
-    if date_part.contains('Y') || date_part.contains('M') {
-        return Err(ValidationError::InvalidLexical {
-            value: s.to_string(),
-            type_name: "dayTimeDuration",
-            message: "dayTimeDuration cannot contain year or month components".to_string(),
-        });
-    }
-
-    let mut days = 0u32;
-    let mut hours = 0u32;
-    let mut minutes = 0u32;
-    let mut seconds = Decimal::ZERO;
-    let mut current = content;
-
-    // Parse days
-    if let Some(d_pos) = current.find('D') {
-        days = current[..d_pos]
-            .parse()
-            .map_err(|_| ValidationError::InvalidLexical {
-                value: s.to_string(),
-                type_name: "dayTimeDuration",
-                message: "Invalid days value".to_string(),
-            })?;
-        current = &current[d_pos + 1..];
-    }
-
-    // Parse time part
-    if let Some(stripped) = current.strip_prefix('T') {
-        current = stripped;
-
-        // Parse hours
-        if let Some(h_pos) = current.find('H') {
-            hours = current[..h_pos]
-                .parse()
-                .map_err(|_| ValidationError::InvalidLexical {
-                    value: s.to_string(),
-                    type_name: "dayTimeDuration",
-                    message: "Invalid hours value".to_string(),
-                })?;
-            current = &current[h_pos + 1..];
-        }
-
-        // Parse minutes
-        if let Some(m_pos) = current.find('M') {
-            minutes = current[..m_pos]
-                .parse()
-                .map_err(|_| ValidationError::InvalidLexical {
-                    value: s.to_string(),
-                    type_name: "dayTimeDuration",
-                    message: "Invalid minutes value".to_string(),
-                })?;
-            current = &current[m_pos + 1..];
-        }
-
-        // Parse seconds
-        if let Some(s_pos) = current.find('S') {
-            seconds = current[..s_pos]
-                .parse()
-                .map_err(|_| ValidationError::InvalidLexical {
-                    value: s.to_string(),
-                    type_name: "dayTimeDuration",
-                    message: "Invalid seconds value".to_string(),
-                })?;
-            current = &current[s_pos + 1..];
-        }
-    }
-
-    // Check nothing remains
-    if !current.is_empty() {
-        return Err(ValidationError::InvalidLexical {
-            value: s.to_string(),
-            type_name: "dayTimeDuration",
-            message: "Invalid duration format".to_string(),
-        });
-    }
-
     Ok(DayTimeDurationValue {
-        negative,
-        days,
-        hours,
-        minutes,
-        seconds,
+        negative: duration.negative,
+        days: duration.days,
+        hours: duration.hours,
+        minutes: duration.minutes,
+        seconds: duration.seconds,
     })
 }
 
@@ -3485,6 +3522,23 @@ impl TypeValidator for NegativeIntegerValidator {
     }
 }
 
+/// The lexical form `parse::<u64>()` (and the narrower unsigned parses)
+/// should read for a collapsed unsigned-integer literal: Datatypes 1.1
+/// §3.4.21.1 (unsignedLong; §3.4.22.1 – §3.4.24.1 alike) — "If the sign is
+/// present, it must be '+' except for lexical forms denoting zero, which may
+/// be preceded by a positive ('+') or a negative ('-') sign". XSD 1.0 has the
+/// same lexical space: these types restrict `nonNegativeInteger`, whose zero
+/// "may be preceded by a positive ("+") or a negative ("-") sign" (§3.3.20.1),
+/// by `maxInclusive` only (§2.4.2: "Constraining the ·value space·
+/// consequently constrains the ·lexical space·"). So `-0`, `-00`, … read as
+/// `0`; every other form is left to the parse, which takes an optional `+`.
+pub(crate) fn unsigned_lexical(normalized: &str) -> &str {
+    match normalized.strip_prefix('-') {
+        Some(digits) if !digits.is_empty() && digits.bytes().all(|b| b == b'0') => "0",
+        _ => normalized,
+    }
+}
+
 /// Validator for xs:unsignedLong
 pub struct UnsignedLongValidator;
 
@@ -3504,7 +3558,7 @@ impl TypeValidator for UnsignedLongValidator {
 
     fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
-        normalized
+        unsigned_lexical(&normalized)
             .parse::<u64>()
             .map(|v| {
                 XmlValue::new(
@@ -3560,7 +3614,7 @@ impl TypeValidator for UnsignedIntValidator {
 
     fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
-        normalized
+        unsigned_lexical(&normalized)
             .parse::<u32>()
             .map(|v| {
                 XmlValue::new(
@@ -3616,7 +3670,7 @@ impl TypeValidator for UnsignedShortValidator {
 
     fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
-        normalized
+        unsigned_lexical(&normalized)
             .parse::<u16>()
             .map(|v| {
                 XmlValue::new(
@@ -3672,7 +3726,7 @@ impl TypeValidator for UnsignedByteValidator {
 
     fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
-        normalized
+        unsigned_lexical(&normalized)
             .parse::<u8>()
             .map(|v| {
                 XmlValue::new(
@@ -3902,7 +3956,10 @@ impl TypeValidator for NmTokensValidator {
                     message: format!("Invalid NMTOKEN: '{}'", token),
                 });
             }
-            items.push(XmlAtomicValue::String(token.to_string()));
+            items.push(XmlValue::new(
+                XmlTypeCode::NmToken,
+                XmlValueKind::Atomic(XmlAtomicValue::String(token.to_string())),
+            ));
         }
 
         Ok(XmlValue::new(
@@ -3966,7 +4023,10 @@ impl TypeValidator for IdRefsValidator {
                     message: format!("Invalid IDREF: '{}' (must be NCName)", token),
                 });
             }
-            items.push(XmlAtomicValue::String(token.to_string()));
+            items.push(XmlValue::new(
+                XmlTypeCode::IdRef,
+                XmlValueKind::Atomic(XmlAtomicValue::String(token.to_string())),
+            ));
         }
 
         Ok(XmlValue::new(
@@ -4030,7 +4090,10 @@ impl TypeValidator for EntitiesValidator {
                     message: format!("Invalid ENTITY: '{}' (must be NCName)", token),
                 });
             }
-            items.push(XmlAtomicValue::String(token.to_string()));
+            items.push(XmlValue::new(
+                XmlTypeCode::Entity,
+                XmlValueKind::Atomic(XmlAtomicValue::String(token.to_string())),
+            ));
         }
 
         Ok(XmlValue::new(
@@ -4153,9 +4216,7 @@ impl TypeValidator for DayTimeDurationValidator {
                 parse_day_time_duration(&normalize_whitespace(s, WhitespaceMode::Collapse)).ok()
             })?;
             facets.validate_enum_value_space(
-                enum_matches_value_space!(dur, parse_day_time_duration, |a, b| {
-                    day_time_duration_value_eq(a, &b)
-                }),
+                enum_matches_literal!(dur, value, parse_day_time_duration),
                 value,
             )?;
         }
@@ -4173,6 +4234,49 @@ impl TypeValidator for DayTimeDurationValidator {
                 | "pattern"
                 | "enumeration"
         )
+    }
+}
+
+/// Validator for `xs:untypedAtomic`, the XPath 2.0 data model's type of
+/// "untyped atomic data, such as text that has not been assigned a more
+/// specific type" (XDM 1.0 §2.6.2): every string is a value of it, unchanged —
+/// §2.6.4: "When xs:untypedAtomic is specified as the type, no validation takes
+/// place". Its typed value is the string as an `xs:untypedAtomic`. The type
+/// has no facets of its own, so no white space is normalized; a facet a
+/// restriction of it adds applies to the string.
+pub struct UntypedAtomicValidator;
+
+impl TypeValidator for UntypedAtomicValidator {
+    fn type_name(&self) -> &'static str {
+        "untypedAtomic"
+    }
+    fn type_code(&self) -> XmlTypeCode {
+        XmlTypeCode::UntypedAtomic
+    }
+    fn primitive_type(&self) -> PrimitiveTypeCode {
+        PrimitiveTypeCode::String
+    }
+    fn whitespace(&self) -> WhitespaceMode {
+        WhitespaceMode::Preserve
+    }
+
+    fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
+        Ok(XmlValue::untyped(value))
+    }
+
+    fn validate_with_facets(&self, value: &str, facets: &FacetSet) -> ValidationResult<XmlValue> {
+        let ws = facets
+            .whitespace
+            .as_ref()
+            .map(|w| w.value)
+            .unwrap_or(WhitespaceMode::Preserve);
+        let normalized = normalize_whitespace(value, ws);
+        facets.validate_string(&normalized)?;
+        Ok(XmlValue::untyped(normalized.into_owned()))
+    }
+
+    fn facet_applicable(&self, facet: &str) -> bool {
+        matches!(facet, "pattern" | "enumeration" | "whitespace")
     }
 }
 
@@ -4221,7 +4325,7 @@ impl TypeValidator for DateTimeStampValidator {
                 parse_datetime(&normalize_whitespace(s, WhitespaceMode::Collapse)).ok()
             })?;
             facets.validate_enum_value_space(
-                enum_matches_value_space!(dt, parse_datetime, |a, b| datetime_value_eq(a, &b)),
+                enum_matches_literal!(dt, value, parse_datetime),
                 value,
             )?;
         }
@@ -4514,5 +4618,78 @@ mod tests {
         let v = TokenValidator;
         let result = v.validate("  hello   world  ").unwrap();
         assert_eq!(result.to_string_value(), "hello world");
+    }
+
+    /// Seconds with more fraction digits than a `Decimal` holds are
+    /// truncated toward zero, never rounded up to the next second, and
+    /// flagged for the capacity warning; trailing zeros are not excess.
+    #[test]
+    fn seconds_beyond_capacity_truncate_toward_zero() {
+        let d = |s: &str| Decimal::from_str_exact(s).unwrap();
+        assert_eq!(parse_seconds("59.5"), Some(d("59.5")));
+        assert_eq!(
+            // 59 and 27 nines: 29 digits are the most a 96-bit mantissa holds here.
+            parse_seconds("59.99999999999999999999999999999"),
+            Some(d("59.999999999999999999999999999"))
+        );
+        assert_eq!(
+            parse_seconds("0.000000000000000000000000000001"),
+            Some(d("0"))
+        );
+        assert_eq!(
+            parse_seconds("1.50000000000000000000000000000000"),
+            Some(d("1.5"))
+        );
+        assert_eq!(
+            parse_seconds("79228162514264337593543950335.5"),
+            Some(d("79228162514264337593543950335"))
+        );
+        assert_eq!(parse_seconds("79228162514264337593543950336"), None);
+        assert_eq!(parse_seconds("1.5e3"), None);
+        assert_eq!(
+            parse_seconds("00000000000000000000000000000000001.5"),
+            Some(d("1.5"))
+        );
+        assert_eq!(parse_seconds("7"), Some(d("7")));
+        assert_eq!(parse_seconds("7."), None);
+        assert!(DurationValidator.validate("PT.5S").is_err());
+        assert!(DurationValidator.validate("PT1.S").is_err());
+        assert!(TimeValidator.validate("10:00:.5").is_err());
+        assert!(TimeValidator.validate("10:00:1.5").is_err());
+
+        assert!(!seconds_beyond_capacity("PT59.5S"));
+        assert!(!seconds_beyond_capacity(
+            "PT1.50000000000000000000000000000000S"
+        ));
+        assert!(!seconds_beyond_capacity(
+            "2000-01-01T00:00:00.0000000000000000000000000001Z"
+        ));
+        assert!(seconds_beyond_capacity(
+            "2000-01-01T00:00:00.00000000000000000000000000001Z"
+        ));
+        assert!(seconds_beyond_capacity(
+            "-PT0.000000000000000000000000000001S"
+        ));
+        assert!(seconds_beyond_capacity(
+            "PT79228162514264337593543950335.5S"
+        ));
+        assert!(!seconds_beyond_capacity(
+            "PT00000000000000000000000000000000001.5S"
+        ));
+        assert!(!seconds_beyond_capacity(
+            "PT7.9228162514264337593543950335S"
+        ));
+        assert!(seconds_beyond_capacity("PT7.9228162514264337593543950336S"));
+
+        let dt = DateTimeValidator
+            .validate("2000-01-01T23:59:59.99999999999999999999999999999Z")
+            .unwrap();
+        assert_eq!(
+            dt.to_string_value(),
+            "2000-01-01T23:59:59.999999999999999999999999999Z"
+        );
+        assert!(DurationValidator.validate("PT1_0S").is_err());
+        assert!(TimeValidator.validate("10:00:0_1").is_err());
+        assert!(TimeValidator.validate("10:00:01._1").is_err());
     }
 }

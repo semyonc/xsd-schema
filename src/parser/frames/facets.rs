@@ -39,6 +39,11 @@ impl FacetFrame {
                 .unwrap_or_default()
         };
 
+        #[cfg(feature = "xsd11")]
+        if kind == FacetKind::Assertion {
+            crate::xpath::depth::check_schema_test(&value, xsd_names::ASSERTION)?;
+        }
+
         let fixed = parse_bool_attr_default(attrs, name_table, "fixed", false)?;
 
         let id = attrs

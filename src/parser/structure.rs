@@ -641,7 +641,7 @@ pub fn validate_extension_structure(
 
     if !has_base {
         return Err(SchemaError::structural(
-            "src-ct",
+            "s4s-att-must-appear",
             "Extension must have 'base' attribute",
             None,
         ));

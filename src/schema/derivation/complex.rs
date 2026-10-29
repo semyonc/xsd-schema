@@ -493,6 +493,14 @@ fn validate_complex_restriction(
                 // Validate simpleContent inline type restriction
                 // (derivation-ok-restriction clause 2.2.2.1)
                 validate_simple_content_restriction(schema_set, type_def, base_type)?;
+
+                // The simpleContent restriction's own facets restrict the
+                // base content type (Datatypes constraints on facets).
+                super::simple::validate_simple_content_restriction_facets(
+                    schema_set,
+                    type_def,
+                    base_complex_key,
+                )?;
             }
         }
     }
@@ -679,7 +687,10 @@ fn validate_simple_content_restriction(
     if derived_variety != base_variety {
         // Different varieties — check if the inline type's base chain leads to
         // the base simple type (which would mean it's a valid restriction despite
-        // variety difference, e.g. restriction of a union member).
+        // variety difference, e.g. restriction of a union member: Type
+        // Derivation OK (Simple) clause 2.2.4, "B.{variety} = union … D is
+        // validly ·derived· from a type definition M in B's transitive
+        // membership", which `is_type_derived_from` applies).
         // For the common case (list restricting atomic, union restricting atomic),
         // this chain walk will NOT find the base type.
         if let Some(inline_resolved_base) = resolve_inline_simple_type_base(schema_set, inline_st) {
@@ -721,9 +732,11 @@ fn resolve_inline_simple_type_base(
     // assembly, it would be in the arena. We can try to find it by matching
     // the QName if present.
     match &inline_st.base_type {
-        Some(crate::parser::frames::TypeRefResult::QName(qname)) => {
-            schema_set.lookup_type(qname.namespace, qname.local_name)
-        }
+        // A built-in base (`xs:string`, a member of a union of built-ins) is
+        // not among the schema's own types.
+        Some(crate::parser::frames::TypeRefResult::QName(qname)) => schema_set
+            .lookup_type(qname.namespace, qname.local_name)
+            .or_else(|| schema_set.get_built_in_type_by_qname(qname.namespace, qname.local_name)),
         _ => None,
     }
 }

@@ -155,7 +155,9 @@ pub fn validate_attribute_value_constraints(schema_set: &SchemaSet) -> SchemaRes
         let Some(type_key @ TypeKey::Simple(_)) = attr.resolved_type else {
             continue;
         };
-        if crate::validation::simple::validate_simple_type(value, type_key, schema_set).is_err() {
+        // Simple Default Valid (§3.2.6.2): a QName / NOTATION in the value is
+        // read with the bindings of the declaration it is written on.
+        if !schema_set.value_constraint_literal_has_value(value, type_key, attr.source.as_ref()) {
             let attr_name = attr
                 .name
                 .map(|n| schema_set.name_table.resolve(n).to_string())
@@ -187,7 +189,9 @@ pub fn validate_attribute_value_constraints(schema_set: &SchemaSet) -> SchemaRes
             // otherwise the global declaration's. au-props-correct.2 says
             // a use's fixed must equal the declaration's, but here we only
             // need to check that *some* effective value-constraint parses.
-            let value_constraint: Option<(&str, bool)> = attr_use
+            // The schema element the value is written on goes with it: its
+            // bindings read a QName / NOTATION value.
+            let value_constraint: Option<(&str, bool, Option<&SourceRef>)> = attr_use
                 .attribute
                 .fixed_value
                 .as_deref()
@@ -199,30 +203,52 @@ pub fn validate_attribute_value_constraints(schema_set: &SchemaSet) -> SchemaRes
                         .as_deref()
                         .map(|v| (v, false))
                 })
+                .map(|(v, fixed)| (v, fixed, attr_use.attribute.source.as_ref()))
                 .or_else(|| {
                     ref_decl.and_then(|d| {
                         d.fixed_value
                             .as_deref()
                             .map(|v| (v, true))
                             .or_else(|| d.default_value.as_deref().map(|v| (v, false)))
+                            .map(|(v, fixed)| (v, fixed, d.source.as_ref()))
                     })
                 });
 
-            // au-props-correct.2 (§3.5.6): if the referenced attribute
+            // au-props-correct (§3.5.6 clause 3): if the referenced attribute
             // declaration has `fixed`, then a `fixed` on the attribute use
-            // must denote the same value (the use's `default` is forbidden
-            // when the declaration is fixed). Literal comparison after
-            // whitespace collapse — sufficient for the `xs:string`-flavoured
-            // fixed-value cases the test suite exercises (addB108, attO025).
+            // "is identical to" the declaration's value (the use's `default`
+            // is forbidden when the declaration is fixed) — values, compared
+            // in the declaration's type; a form the type rejects (another
+            // constraint reports it), or an unresolved type, falls back to
+            // the literals after whitespace collapse.
             if let (Some(use_fixed), Some(decl_fixed)) = (
                 attr_use.attribute.fixed_value.as_deref(),
                 ref_decl.and_then(|d| d.fixed_value.as_deref()),
             ) {
                 use crate::types::facets::normalize_whitespace;
                 use crate::types::WhitespaceMode;
-                let use_norm = normalize_whitespace(use_fixed, WhitespaceMode::Collapse);
-                let decl_norm = normalize_whitespace(decl_fixed, WhitespaceMode::Collapse);
-                if use_norm != decl_norm {
+                let identical = ref_decl
+                    .and_then(|d| d.resolved_type)
+                    .and_then(|tk| {
+                        // Each literal is read with the namespace bindings
+                        // of the element it is written on (QName values).
+                        crate::validation::simple::fixed_values_identical_in(
+                            use_fixed,
+                            schema_set
+                                .value_constraint_namespaces(attr_use.attribute.source.as_ref()),
+                            decl_fixed,
+                            schema_set.value_constraint_namespaces(
+                                ref_decl.and_then(|d| d.source.as_ref()),
+                            ),
+                            tk,
+                            schema_set,
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        normalize_whitespace(use_fixed, WhitespaceMode::Collapse)
+                            == normalize_whitespace(decl_fixed, WhitespaceMode::Collapse)
+                    });
+                if !identical {
                     let attr_name = ref_decl
                         .and_then(|d| d.name)
                         .map(|n| schema_set.name_table.resolve(n).to_string())
@@ -271,7 +297,7 @@ pub fn validate_attribute_value_constraints(schema_set: &SchemaSet) -> SchemaRes
                 ));
             }
 
-            let Some((value, is_fixed)) = value_constraint else {
+            let Some((value, is_fixed, value_source)) = value_constraint else {
                 continue;
             };
 
@@ -281,8 +307,7 @@ pub fn validate_attribute_value_constraints(schema_set: &SchemaSet) -> SchemaRes
             let Some(type_key @ TypeKey::Simple(_)) = attr_type else {
                 continue;
             };
-            if crate::validation::simple::validate_simple_type(value, type_key, schema_set).is_err()
-            {
+            if !schema_set.value_constraint_literal_has_value(value, type_key, value_source) {
                 let attr_name = attr_use
                     .attribute
                     .name
@@ -394,18 +419,26 @@ pub fn validate_element_value_constraints(schema_set: &SchemaSet) -> SchemaResul
             }
         }
 
-        // e-props-correct.2: value must be valid for the declared type
+        // e-props-correct.2: value must be valid for the declared type — for
+        // a complex type with simple content, its {content type}'s simple type
+        // with the facets of its restrictions (Structures §3.4.2.2), which
+        // `validate_simple_type` applies to a complex type key.
         let effective_type = match type_key {
             TypeKey::Simple(_) => Some(type_key),
-            TypeKey::Complex(ck) => schema_set
-                .arenas
-                .complex_types
-                .get(ck)
-                .and_then(|ct| effective_simple_content_type_key(schema_set, ct)),
+            TypeKey::Complex(ck) => schema_set.arenas.complex_types.get(ck).and_then(|ct| {
+                if matches!(ct.content, ComplexContentResult::Simple(_)) {
+                    Some(type_key)
+                } else {
+                    effective_simple_content_type_key(schema_set, ct)
+                }
+            }),
         };
 
+        // A QName / NOTATION in the value is read with the bindings of the
+        // declaration it is written on (Datatypes §3.3.18), as the {value}
+        // is (`SchemaSet::element_value_constraint`).
         if let Some(st_key) = effective_type {
-            if crate::validation::simple::validate_simple_type(value, st_key, schema_set).is_err() {
+            if !schema_set.value_constraint_literal_has_value(value, st_key, elem.source.as_ref()) {
                 return Err(SchemaError::structural(
                     "e-props-correct.2",
                     format!(
@@ -503,7 +536,7 @@ pub fn validate_complex_type_attribute_uniqueness(schema_set: &SchemaSet) -> Sch
         seen: &mut HashSet<AttrDeclId>,
         out: &mut Vec<EffectiveAttributeUse>,
     ) {
-        if depth > 50 {
+        if depth > schema_set.recursion_bound(50) {
             return;
         }
         for (i, attr_use) in type_def.attributes.iter().enumerate() {
@@ -902,7 +935,7 @@ pub fn validate_local_decl_target_namespace(schema_set: &SchemaSet) -> SchemaRes
         schema_tns: Option<NameId>,
         depth: usize,
     ) -> Option<(Option<SourceRef>, String)> {
-        if depth > 100 {
+        if depth > schema_set.recursion_bound(100) {
             return None;
         }
         match &particle.term {
@@ -1049,7 +1082,7 @@ pub fn validate_substitution_group_element_consistency(schema_set: &SchemaSet) -
         out: &mut HashMap<(Option<NameId>, NameId), Vec<Entry>>,
         depth: usize,
     ) {
-        if depth > 100 {
+        if depth > schema_set.recursion_bound(100) {
             return;
         }
         match &particle.term {

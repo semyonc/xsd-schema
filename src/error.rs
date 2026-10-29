@@ -140,8 +140,54 @@ impl FacetError {
     }
 }
 
+/// A limit of the crate that a schema can break (see
+/// [`SchemaError::LimitExceeded`]).
+///
+/// `Display` (and [`setting`](Self::setting)) is the setting that holds it,
+/// e.g. `ParserConfig::max_depth`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum SchemaLimit {
+    /// The element nesting of a schema document
+    /// ([`ParserConfig::max_depth`](crate::parser::parse::ParserConfig::max_depth)).
+    ElementDepth,
+    /// The nesting of components through references
+    /// ([`SchemaSet::max_depth`](crate::SchemaSet::max_depth), set from
+    /// `ParserConfig::max_depth`).
+    ComponentDepth,
+    /// The nesting of `xs:include` / `xs:import` / `xs:redefine` /
+    /// `xs:override` directives
+    /// ([`ResolverConfig::max_depth`](crate::ResolverConfig::max_depth)).
+    DirectiveDepth,
+    /// The nesting of an XPath expression of the schema (an assertion, a
+    /// type alternative): `xpath::depth::MAX_EXPRESSION_DEPTH`.
+    XPathDepth,
+}
+
+impl SchemaLimit {
+    /// The setting that holds the limit, e.g. `"ParserConfig::max_depth"`.
+    pub fn setting(self) -> &'static str {
+        match self {
+            SchemaLimit::ElementDepth => "ParserConfig::max_depth",
+            SchemaLimit::ComponentDepth => "SchemaSet::max_depth",
+            SchemaLimit::DirectiveDepth => "ResolverConfig::max_depth",
+            SchemaLimit::XPathDepth => "xpath::depth::MAX_EXPRESSION_DEPTH",
+        }
+    }
+}
+
+impl std::fmt::Display for SchemaLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.setting())
+    }
+}
+
 /// XSD schema error with source location
+///
+/// `#[non_exhaustive]`: a `match` needs a wildcard arm; later variants are
+/// additive.
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum SchemaError {
     /// XML parsing error from quick-xml
     #[error("XML parse error{}: {message}", location_str(.location))]
@@ -183,6 +229,27 @@ pub enum SchemaError {
     /// Internal error (should not happen, indicates a bug)
     #[error("Internal error: {0}")]
     Internal(String),
+
+    /// A schema broke one of the crate's limits — the bounds that keep the
+    /// schema-time passes inside a thread's stack (see [`SchemaLimit`]). The
+    /// schema is refused; it is not invalid by the specification, but too
+    /// deep (or too large) for this processor as configured.
+    ///
+    /// `Display`: `Schema limit ParserConfig::max_depth exceeded at
+    /// main.xsd:1:2177: element depth 129, the limit is 128`.
+    #[error("Schema limit {limit} exceeded{}: {message}, the limit is {max}", location_str(.location))]
+    LimitExceeded {
+        /// The limit.
+        limit: SchemaLimit,
+        /// Its configured maximum.
+        max: usize,
+        /// What was found (greater than `max`).
+        found: usize,
+        /// What broke it, e.g. "element depth 129".
+        message: String,
+        /// Where.
+        location: Option<SourceLocation>,
+    },
 }
 
 impl SchemaError {
@@ -194,6 +261,23 @@ impl SchemaError {
     ) -> Self {
         SchemaError::StructuralError {
             constraint,
+            message: message.into(),
+            location,
+        }
+    }
+
+    /// Create a limit error.
+    pub(crate) fn limit(
+        limit: SchemaLimit,
+        max: usize,
+        found: usize,
+        message: impl Into<String>,
+        location: Option<SourceLocation>,
+    ) -> Self {
+        SchemaError::LimitExceeded {
+            limit,
+            max,
+            found,
             message: message.into(),
             location,
         }
@@ -268,8 +352,85 @@ impl SchemaError {
                 message,
                 location: Some(location),
             },
+            SchemaError::LimitExceeded {
+                limit,
+                max,
+                found,
+                message,
+                location: None,
+            } => SchemaError::LimitExceeded {
+                limit,
+                max,
+                found,
+                message,
+                location: Some(location),
+            },
             // Already has location or doesn't support location - return unchanged
             other => other,
+        }
+    }
+
+    /// The source location the error carries, if any — whatever its variant,
+    /// so that a caller need not match the variants (the enum is
+    /// `#[non_exhaustive]`).
+    pub fn location(&self) -> Option<&SourceLocation> {
+        match self {
+            SchemaError::XmlError { location, .. }
+            | SchemaError::StructuralError { location, .. }
+            | SchemaError::NamespaceError { location, .. }
+            | SchemaError::FeatureError { location, .. }
+            | SchemaError::LimitExceeded { location, .. } => location.as_ref(),
+            SchemaError::ResolutionError { .. }
+            | SchemaError::IoError(_)
+            | SchemaError::Internal(_) => None,
+        }
+    }
+
+    /// A copy of this error (`std::io::Error` is not `Clone`: an I/O error
+    /// is copied as its kind and message).
+    pub(crate) fn duplicate(&self) -> SchemaError {
+        match self {
+            SchemaError::XmlError { message, location } => SchemaError::XmlError {
+                message: message.clone(),
+                location: location.clone(),
+            },
+            SchemaError::StructuralError {
+                constraint,
+                message,
+                location,
+            } => SchemaError::StructuralError {
+                constraint,
+                message: message.clone(),
+                location: location.clone(),
+            },
+            SchemaError::NamespaceError { message, location } => SchemaError::NamespaceError {
+                message: message.clone(),
+                location: location.clone(),
+            },
+            SchemaError::FeatureError { message, location } => SchemaError::FeatureError {
+                message: message.clone(),
+                location: location.clone(),
+            },
+            SchemaError::ResolutionError { message } => SchemaError::ResolutionError {
+                message: message.clone(),
+            },
+            SchemaError::IoError(e) => {
+                SchemaError::IoError(std::io::Error::new(e.kind(), e.to_string()))
+            }
+            SchemaError::Internal(message) => SchemaError::Internal(message.clone()),
+            SchemaError::LimitExceeded {
+                limit,
+                max,
+                found,
+                message,
+                location,
+            } => SchemaError::LimitExceeded {
+                limit: *limit,
+                max: *max,
+                found: *found,
+                message: message.clone(),
+                location: location.clone(),
+            },
         }
     }
 
@@ -286,6 +447,7 @@ impl SchemaError {
                 | SchemaError::NamespaceError { .. }
                 | SchemaError::XmlError { .. }
                 | SchemaError::FeatureError { .. }
+                | SchemaError::LimitExceeded { .. }
         )
     }
 }

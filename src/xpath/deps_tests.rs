@@ -150,12 +150,11 @@ fn implicit_context_functions_use_the_focus() {
 }
 
 #[test]
-fn idref_is_not_a_registered_function() {
-    // Documents why fn:idref has no entry in the implicit-context table:
-    // it is not in FUNCTION_REGISTRY at all, so it cannot be called.
-    let names = NameTable::new();
-    let ctx = XPathContext::new(&names);
-    assert!(XPathExpr::compile("idref('x')", &ctx).is_err());
+fn idref_reads_the_focus_only_in_its_one_argument_form() {
+    // F&O 1.0 §15.5.3: without `$node` the target document is the context
+    // item's, as for fn:id.
+    assert!(compile("idref('x')", &[]).uses_focus());
+    assert!(!compile("idref('x', $x)", &["x"]).uses_focus());
 }
 
 #[test]

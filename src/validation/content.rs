@@ -636,8 +636,7 @@ fn open_content_allows(
     namespace: Option<NameId>,
     target_ns: Option<NameId>,
 ) -> bool {
-    ns_constraint.matches(namespace, target_ns, XsdVersion::V1_1)
-        && !not_qnames_exclude(not_qnames, namespace, name)
+    ns_constraint.matches(namespace, target_ns) && !not_qnames_exclude(not_qnames, namespace, name)
 }
 
 #[cfg(test)]

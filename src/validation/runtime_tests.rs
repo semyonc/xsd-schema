@@ -734,6 +734,51 @@ fn test_xsi_type_on_local_element() {
     assert!(v.sink.errors.is_empty(), "errors: {:?}", v.sink.errors);
 }
 
+/// Structures §3.3.5.5: an element for which clause 5.1 of Element Locally
+/// Valid (Element) applied — no element or character [children], a `default`
+/// *or* `fixed` value constraint — has [schema specified] "schema"; the
+/// end-element `SchemaInfo` reports it as `is_default`, for a fixed value as
+/// for a default (a typed build gives both a text node with the value). An
+/// element with character children takes no value constraint.
+#[test]
+fn an_empty_element_that_takes_its_fixed_value_is_defaulted() {
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root"><xs:complexType><xs:sequence>
+                <xs:element name="f" type="xs:string" fixed="LOCKED" maxOccurs="2"/>
+                <xs:element name="d" type="xs:string" default="fallback"/>
+            </xs:sequence></xs:complexType></xs:element>
+        </xs:schema>"#,
+    );
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+    v.validate_element("root", "", None, None, &ns);
+    v.validate_end_of_attributes();
+    v.validate_element("f", "", None, None, &ns);
+    v.validate_end_of_attributes();
+    let empty_fixed = v.validate_end_element();
+    v.validate_element("f", "", None, None, &ns);
+    v.validate_end_of_attributes();
+    v.validate_text("LOCKED");
+    let written_fixed = v.validate_end_element();
+    v.validate_element("d", "", None, None, &ns);
+    v.validate_end_of_attributes();
+    let empty_default = v.validate_end_element();
+    v.validate_end_element();
+    assert!(v.end_validation().is_ok());
+    assert!(v.sink.errors.is_empty(), "errors: {:?}", v.sink.errors);
+    assert!(
+        empty_fixed.is_default,
+        "an empty element takes its fixed value"
+    );
+    assert!(
+        !written_fixed.is_default,
+        "character children: no value constraint"
+    );
+    assert!(empty_default.is_default);
+}
+
 #[test]
 fn test_group_ref_with_nillable_fixed_default() {
     let schema_set = load_schema(
@@ -1368,6 +1413,386 @@ fn test_default_from_global_declaration_in_group() {
     v.validate_end_element();
     assert!(v.end_validation().is_ok());
     assert!(v.sink.errors.is_empty(), "errors: {:?}", v.sink.errors);
+}
+
+/// C74. Structures §3.4.4.2: "A defaulted attribute belonging to an element
+/// information item E ·governed by· a complex type T is any Attribute Use U for
+/// which all of the following are true: 1 U is a member of T.{attribute uses}.
+/// 2 U.{required} = false. 3 U's ·effective value constraint· is not ·absent·.
+/// … 5 U.{attribute declaration} does not match any of the attribute
+/// information items in E.[attributes]"; §3.4.5.1 adds one attribute per
+/// defaulted attribute, with "The ·effective value constraint·'s {lexical
+/// form}" — a `default` or a `fixed` one, of a local or a global declaration.
+/// T.{attribute uses} (§3.4.2.2) holds the uses of T's own `<attribute>`
+/// children and attribute groups and those "inherited" from its base type —
+/// minus, in a restriction, the ones T redeclares or prohibits.
+const DEFAULTED_ATTRIBUTES_SCHEMA: &str = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+        xmlns:t="urn:t" targetNamespace="urn:t">
+    <xs:attribute name="g" type="xs:string" default="G"/>
+    <xs:attribute name="gf" type="xs:int" fixed="7"/>
+    <xs:attributeGroup name="grp">
+        <xs:attribute name="inGroup" type="xs:string" default="IG"/>
+        <xs:attribute ref="t:g"/>
+    </xs:attributeGroup>
+    <xs:complexType name="base">
+        <xs:attribute name="fromBase" type="xs:string" default="B"/>
+        <xs:attribute name="baseFixed" type="xs:decimal" fixed="1.5"/>
+        <xs:attribute name="overridden" type="xs:string" default="base"/>
+        <xs:attribute name="dropped" type="xs:string" default="D"/>
+        <xs:attributeGroup ref="t:grp"/>
+    </xs:complexType>
+    <xs:complexType name="restricted">
+        <xs:complexContent>
+            <xs:restriction base="t:base">
+                <xs:attribute name="overridden" type="xs:string" default="restricted"/>
+                <xs:attribute name="dropped" use="prohibited"/>
+            </xs:restriction>
+        </xs:complexContent>
+    </xs:complexType>
+    <xs:complexType name="extended">
+        <xs:complexContent>
+            <xs:extension base="t:restricted">
+                <xs:attribute name="local" type="xs:string" default="L"/>
+                <xs:attribute name="localFixed" fixed="F"/>
+                <xs:attribute name="requiredFixed" type="xs:string" use="required" fixed="R"/>
+                <xs:attribute name="noDefault" type="xs:string"/>
+                <xs:attribute ref="t:gf"/>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>
+    <xs:element name="root" type="t:extended"/>
+</xs:schema>"#;
+
+/// Run `root` with `attributes` (local name, namespace, value) and return the
+/// defaulted attributes as sorted `(local name, namespace, value)` triples.
+fn defaulted_attributes_of(
+    schema_set: &SchemaSet,
+    attributes: &[(&str, &str, &str)],
+) -> Vec<(String, String, String)> {
+    let validator = SchemaValidator::new(schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+    v.validate_element("root", "urn:t", None, None, &ns);
+    for (local, namespace, value) in attributes {
+        v.validate_attribute(local, namespace, value);
+    }
+    v.validate_end_of_attributes();
+    let mut defaults: Vec<(String, String, String)> = v
+        .get_default_attributes()
+        .iter()
+        .map(|d| {
+            (
+                schema_set.name_table.resolve(d.local_name).to_string(),
+                d.namespace
+                    .map(|n| schema_set.name_table.resolve(n).to_string())
+                    .unwrap_or_default(),
+                d.value.clone(),
+            )
+        })
+        .collect();
+    defaults.sort();
+    v.validate_end_element();
+    assert!(v.end_validation().is_ok());
+    assert!(v.sink.errors.is_empty(), "errors: {:?}", v.sink.errors);
+    defaults
+}
+
+#[test]
+fn defaulted_attributes_include_local_group_inherited_and_fixed_uses() {
+    let owned = |rows: &[(&str, &str, &str)]| {
+        rows.iter()
+            .map(|(a, b, c)| (a.to_string(), b.to_string(), c.to_string()))
+            .collect::<Vec<_>>()
+    };
+    #[allow(unused_mut)]
+    let mut sets = vec![("1.0", load_schema(DEFAULTED_ATTRIBUTES_SCHEMA))];
+    #[cfg(feature = "xsd11")]
+    sets.push(("1.1", load_schema_xsd11(DEFAULTED_ATTRIBUTES_SCHEMA)));
+    for (version, schema_set) in sets {
+        assert_eq!(
+            defaulted_attributes_of(
+                &schema_set,
+                &[("requiredFixed", "", "R"), ("g", "urn:t", "supplied")]
+            ),
+            owned(&[
+                ("baseFixed", "", "1.5"),
+                ("fromBase", "", "B"),
+                ("gf", "urn:t", "7"),
+                ("inGroup", "", "IG"),
+                ("local", "", "L"),
+                ("localFixed", "", "F"),
+                ("overridden", "", "restricted"),
+            ]),
+            "XSD {version}"
+        );
+        // Supplied attributes are not defaulted.
+        assert_eq!(
+            defaulted_attributes_of(
+                &schema_set,
+                &[
+                    ("requiredFixed", "", "R"),
+                    ("local", "", "x"),
+                    ("gf", "urn:t", "7"),
+                    ("inGroup", "", "y"),
+                    ("fromBase", "", "z"),
+                ]
+            ),
+            owned(&[
+                ("baseFixed", "", "1.5"),
+                ("g", "urn:t", "G"),
+                ("localFixed", "", "F"),
+                ("overridden", "", "restricted"),
+            ]),
+            "XSD {version}"
+        );
+    }
+}
+
+/// C74 fix round. Structures §3.4.2.4: the {attribute uses} of a type are
+/// "1 The set of attribute uses corresponding to the <attribute> [children]",
+/// "2 The {attribute uses} of the attribute groups", and "3 The attribute uses
+/// "inherited" from the {base type definition}" — for a restriction minus the
+/// names of clause 3.2.1 (uses already included by clause 1 or 2) and 3.2.2
+/// (an `<attribute>` child with `use="prohibited"`). Its note: `prohibited`
+/// "serves to prevent inheritance of an identically named attribute use from
+/// the {base type definition}", and is "simply ignored" elsewhere (an
+/// extension, an attribute group). So a prohibited `<attribute>` beside an
+/// attribute group never hides the group's use of the same name.
+fn defaulted_attributes_in_both_versions(
+    xsd: &str,
+    attributes: &[(&str, &str, &str)],
+    expected: &[(&str, &str, &str)],
+) {
+    let expected: Vec<(String, String, String)> = expected
+        .iter()
+        .map(|(a, b, c)| (a.to_string(), b.to_string(), c.to_string()))
+        .collect();
+    #[allow(unused_mut)]
+    let mut sets = vec![("1.0", load_schema(xsd))];
+    #[cfg(feature = "xsd11")]
+    sets.push(("1.1", load_schema_xsd11(xsd)));
+    for (version, schema_set) in sets {
+        assert_eq!(
+            defaulted_attributes_of(&schema_set, attributes),
+            expected,
+            "XSD {version}"
+        );
+    }
+}
+
+/// The declarations the fix-round schemas share: a global `a` with a default,
+/// and a group that references it.
+const PROHIBITION_PROLOGUE: &str = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+        xmlns:t="urn:t" targetNamespace="urn:t">
+    <xs:attribute name="a" type="xs:string" default="A"/>
+    <xs:attributeGroup name="g">
+        <xs:attribute ref="t:a"/>
+    </xs:attributeGroup>"#;
+
+#[test]
+fn a_prohibited_attribute_beside_a_group_keeps_the_group_default() {
+    let xsd = format!(
+        r#"{PROHIBITION_PROLOGUE}
+    <xs:complexType name="T">
+        <xs:attribute ref="t:a" use="prohibited"/>
+        <xs:attributeGroup ref="t:g"/>
+    </xs:complexType>
+    <xs:element name="root" type="t:T"/>
+</xs:schema>"#
+    );
+    defaulted_attributes_in_both_versions(&xsd, &[], &[("a", "urn:t", "A")]);
+}
+
+#[test]
+fn a_restriction_prohibition_drops_only_the_inherited_default() {
+    let xsd = format!(
+        r#"{PROHIBITION_PROLOGUE}
+    <xs:complexType name="B">
+        <xs:attribute name="x" type="xs:string" default="X"/>
+        <xs:attribute name="y" type="xs:string" default="Y"/>
+        <xs:attribute ref="t:a"/>
+    </xs:complexType>
+    <xs:complexType name="R">
+        <xs:complexContent>
+            <xs:restriction base="t:B">
+                <xs:attribute name="x" use="prohibited"/>
+                <xs:attribute ref="t:a" use="prohibited"/>
+                <xs:attributeGroup ref="t:g"/>
+            </xs:restriction>
+        </xs:complexContent>
+    </xs:complexType>
+    <xs:element name="root" type="t:R"/>
+</xs:schema>"#
+    );
+    // `x` is not inherited; `a` is R's own use (through the group); `y` is
+    // inherited.
+    defaulted_attributes_in_both_versions(&xsd, &[], &[("a", "urn:t", "A"), ("y", "", "Y")]);
+}
+
+#[test]
+fn a_prohibition_in_an_extension_is_ignored() {
+    let xsd = format!(
+        r#"{PROHIBITION_PROLOGUE}
+    <xs:complexType name="B">
+        <xs:attribute name="b" type="xs:string" default="B"/>
+    </xs:complexType>
+    <xs:complexType name="E">
+        <xs:complexContent>
+            <xs:extension base="t:B">
+                <xs:attribute ref="t:a" use="prohibited"/>
+                <xs:attributeGroup ref="t:g"/>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>
+    <xs:element name="root" type="t:E"/>
+</xs:schema>"#
+    );
+    defaulted_attributes_in_both_versions(&xsd, &[], &[("a", "urn:t", "A"), ("b", "", "B")]);
+}
+
+/// The name set of the attribute-use walk: inline up to `AttrNames::INLINE`
+/// names, spilled to a hash set past that, the same answers either way.
+#[test]
+fn attribute_name_sets_spill_past_the_inline_capacity() {
+    let name = |i: u32| (if i < 25 { None } else { Some(NameId(1000)) }, NameId(i));
+    let mut set = AttrNames::new();
+    for i in 0..40 {
+        assert!(set.insert(name(i)), "{i}");
+        assert!(!set.insert(name(i)), "{i} twice");
+    }
+    assert!((0..40).all(|i| set.contains(&name(i))));
+    assert!(!set.contains(&name(40)));
+    let mut other = AttrNames::new();
+    for i in 30..60 {
+        other.insert(name(i));
+    }
+    set.absorb(&mut other);
+    assert!((0..60).all(|i| set.contains(&name(i))));
+    assert!(!other.contains(&name(30)) && !other.contains(&name(59)));
+    set.clear();
+    assert!(!(0..60).any(|i| set.contains(&name(i))));
+    assert!(set.insert(name(5)));
+}
+
+/// A type with more attribute uses than the walk's inline name capacity, in
+/// a base chain: every inherited default is reported once, and a
+/// restriction's prohibitions still apply past the inline capacity.
+#[test]
+fn defaulted_attributes_of_a_wide_base_chain() {
+    let attrs = |prefix: &str, n: usize| {
+        (0..n)
+            .map(|i| {
+                format!(r#"<xs:attribute name="{prefix}{i}" type="xs:string" default="v{i}"/>"#)
+            })
+            .collect::<String>()
+    };
+    let prohibitions = (0..20)
+        .map(|i| format!(r#"<xs:attribute name="b{i}" use="prohibited"/>"#))
+        .collect::<String>();
+    let xsd = format!(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+        xmlns:t="urn:t" targetNamespace="urn:t">
+    <xs:complexType name="B">{base}</xs:complexType>
+    <xs:complexType name="R"><xs:complexContent><xs:restriction base="t:B">
+        {prohibitions}
+    </xs:restriction></xs:complexContent></xs:complexType>
+    <xs:complexType name="E"><xs:complexContent><xs:extension base="t:R">
+        {own}
+    </xs:extension></xs:complexContent></xs:complexType>
+    <xs:element name="root" type="t:E"/>
+</xs:schema>"#,
+        base = attrs("b", 30),
+        own = attrs("e", 20),
+    );
+    let mut expected: Vec<(String, String, String)> = (20..30)
+        .map(|i| (format!("b{i}"), String::new(), format!("v{i}")))
+        .chain((0..20).map(|i| (format!("e{i}"), String::new(), format!("v{i}"))))
+        .collect();
+    expected.sort();
+    let expected: Vec<(&str, &str, &str)> = expected
+        .iter()
+        .map(|(a, b, c)| (a.as_str(), b.as_str(), c.as_str()))
+        .collect();
+    defaulted_attributes_in_both_versions(&xsd, &[], &expected);
+}
+
+/// Fix round: the ·effective value constraint· of an attribute use "is
+/// U.{value constraint}, if present, otherwise U.{attribute
+/// declaration}.{value constraint}" (Structures §3.4.4.2) — for a reference
+/// in an attribute group as for a direct one: the group's `fixed="new"` (or
+/// `default="mid"`) wins over the declaration's `default="old"`; a reference
+/// without one takes `old`.
+#[test]
+fn a_group_reference_s_own_value_constraint_is_the_default() {
+    for (group_use, expected) in [
+        (r#"<xs:attribute ref="t:a" fixed="new"/>"#, "new"),
+        (r#"<xs:attribute ref="t:a" default="mid"/>"#, "mid"),
+        (r#"<xs:attribute ref="t:a"/>"#, "old"),
+    ] {
+        let xsd = format!(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+        xmlns:t="urn:t" targetNamespace="urn:t">
+    <xs:attribute name="a" type="xs:string" default="old"/>
+    <xs:attributeGroup name="g">{group_use}</xs:attributeGroup>
+    <xs:complexType name="B"><xs:attributeGroup ref="t:g"/></xs:complexType>
+    <xs:complexType name="E"><xs:complexContent><xs:extension base="t:B"/></xs:complexContent></xs:complexType>
+    <xs:element name="root" type="t:E"/>
+</xs:schema>"#
+        );
+        defaulted_attributes_in_both_versions(&xsd, &[], &[("a", "urn:t", expected)]);
+    }
+}
+
+/// C74: a defaulted attribute names its global declaration when it has one
+/// (`None` for a local declaration) and carries the declaration's type.
+#[test]
+fn defaulted_attributes_carry_the_declaration_and_its_type() {
+    let schema_set = load_schema(DEFAULTED_ATTRIBUTES_SCHEMA);
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+    v.validate_element("root", "urn:t", None, None, &ns);
+    v.validate_attribute("requiredFixed", "", "R");
+    v.validate_end_of_attributes();
+    let defaults = v.get_default_attributes();
+    let find = |name: &str| {
+        defaults
+            .iter()
+            .find(|d| schema_set.name_table.resolve(d.local_name) == name)
+            .unwrap_or_else(|| panic!("{name} defaulted"))
+    };
+    let builtin = schema_set.builtin_types();
+    let gf = find("gf");
+    let gf_key = gf.attribute_key.expect("global declaration");
+    assert_eq!(
+        schema_set.name_table.resolve(
+            schema_set.arenas.attributes[gf_key]
+                .name
+                .expect("named declaration")
+        ),
+        "gf"
+    );
+    assert_eq!(gf.type_key, Some(TypeKey::Simple(builtin.int)));
+    let g = find("g");
+    assert!(g.attribute_key.is_some());
+    assert_eq!(g.type_key, Some(TypeKey::Simple(builtin.string)));
+    for (name, type_key) in [
+        ("local", Some(TypeKey::Simple(builtin.string))),
+        ("inGroup", Some(TypeKey::Simple(builtin.string))),
+        ("baseFixed", Some(TypeKey::Simple(builtin.decimal))),
+    ] {
+        let d = find(name);
+        assert_eq!(d.attribute_key, None, "{name}");
+        assert_eq!(d.type_key, type_key, "{name}");
+    }
+    // A local declaration without a type: no type key, or xs:anySimpleType.
+    let local_fixed = find("localFixed");
+    assert_eq!(local_fixed.attribute_key, None);
+    assert!(local_fixed
+        .type_key
+        .is_none_or(|t| t == TypeKey::Simple(builtin.any_simple_type)));
+    v.validate_end_element();
+    assert!(v.end_validation().is_ok());
 }
 
 // ── Mixed content tests ─────────────────────────────────────────────
@@ -2490,24 +2915,62 @@ mod assertion_runtime_tests {
     }
 
     #[test]
-    fn test_new_strips_process_assertions_flag() {
-        // SchemaValidator::new() silently strips PROCESS_ASSERTIONS,
-        // preventing the flag/source mismatch that would panic at runtime.
-        let schema_set = load_schema(
+    fn test_new_honours_process_assertions_flag() {
+        // SchemaValidator::new() keeps PROCESS_ASSERTIONS and switches to the
+        // inline (fragment-buffer) assertion mode, so a `false()` assertion
+        // fails instead of being silently skipped.
+        let schema_set = load_schema_xsd11(
             r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
-                <xs:element name="root" type="xs:string"/>
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:simpleContent>
+                            <xs:extension base="xs:string">
+                                <xs:assert test="false()"/>
+                            </xs:extension>
+                        </xs:simpleContent>
+                    </xs:complexType>
+                </xs:element>
             </xs:schema>"#,
         );
         let flags = ValidationFlags::default() | ValidationFlags::PROCESS_ASSERTIONS;
         let validator = SchemaValidator::new(&schema_set, flags);
-        assert!(!validator
+        assert!(validator
             .flags
             .contains(ValidationFlags::PROCESS_ASSERTIONS));
-        // Validation proceeds without panic
         let mut v = validator.start_run(TestSink::new());
+        assert_eq!(v.assertion_source, AssertionSource::FragmentBuffer);
         let ns = empty_ns_context();
-        let info = v.validate_element("root", "", None, None, &ns);
-        assert_eq!(info.validity, SchemaValidity::Valid);
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_end_of_attributes();
+        v.validate_text("hello");
+        let end_info = v.validate_end_element();
+        assert_eq!(end_info.validity, SchemaValidity::Invalid);
+        assert_eq!(end_info.assertion_outcome, Some(AssertionOutcome::Failed));
+        v.end_validation().ok();
+        assert!(
+            v.sink
+                .errors
+                .iter()
+                .any(|e| e.constraint == "cvc-assertion"),
+            "expected a cvc-assertion error, got: {:?}",
+            v.sink.errors
+        );
+
+        // Without the flag the same assertion is not evaluated.
+        let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+        let mut v = validator.start_run(TestSink::new());
+        assert_eq!(v.assertion_source, AssertionSource::Disabled);
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_end_of_attributes();
+        v.validate_text("hello");
+        let end_info = v.validate_end_element();
+        assert_eq!(end_info.validity, SchemaValidity::Valid);
+        assert_eq!(
+            end_info.assertion_outcome,
+            Some(AssertionOutcome::NotEvaluated)
+        );
+        v.end_validation().ok();
+        assert!(v.sink.errors.is_empty(), "{:?}", v.sink.errors);
     }
 
     #[test]
@@ -4622,15 +5085,27 @@ fn test_attribute_group_form_qualified() {
 #[cfg(feature = "xsd11")]
 #[test]
 fn test_attribute_explicit_target_namespace() {
+    // XSD 1.1 §3.2.3 clause 6.3: an explicit `targetNamespace` on a local
+    // attribute declaration is allowed only inside a `<restriction>` of a
+    // base other than xs:anyType (here one whose attribute wildcard allows
+    // the attribute). The one-document pipeline checks it since C87, as the
+    // builder always did.
     let schema_set = load_schema_xsd11(
         r###"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
                      targetNamespace="http://example.com/ns"
                      xmlns:tns="http://example.com/ns"
                      xmlns:other="http://other.com/ns">
+            <xs:complexType name="Base">
+                <xs:anyAttribute namespace="##any" processContents="lax"/>
+            </xs:complexType>
             <xs:element name="root">
                 <xs:complexType>
-                    <xs:attribute name="id" type="xs:string"
-                                  targetNamespace="http://other.com/ns"/>
+                    <xs:complexContent>
+                        <xs:restriction base="tns:Base">
+                            <xs:attribute name="id" type="xs:string"
+                                          targetNamespace="http://other.com/ns"/>
+                        </xs:restriction>
+                    </xs:complexContent>
                 </xs:complexType>
             </xs:element>
         </xs:schema>"###,
@@ -6881,6 +7356,94 @@ fn test_inheritable_default_shadows_ancestor() {
     assert!(v.sink.errors.is_empty(), "errors: {:?}", v.sink.errors);
 }
 
+/// C75: the defaulted inheritable attribute of `mid` comes from a base type
+/// of mid's type — an extension inherits the base's attribute uses
+/// (Structures §3.4.2.4 clause 3.1), so the default joins mid's \[attributes\]
+/// (§3.4.5.1) and is potentially inherited by `leaf` (§3.3.5.6), shadowing
+/// the ancestor's value; a restriction that prohibits the use (clause 3.2.2)
+/// has no such default, so `leaf` sees the ancestor's value.
+#[test]
+#[cfg(feature = "xsd11")]
+fn an_inheritable_default_from_a_base_type_shadows_the_ancestor() {
+    for (mid_type, expected) in [("E", "fr"), ("R", "en")] {
+        let schema_set = load_schema_xsd11(&format!(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:complexType name="B">
+                <xs:sequence><xs:element name="leaf" type="xs:string"/></xs:sequence>
+                <xs:attribute name="lang" type="xs:string" inheritable="true" default="fr"/>
+            </xs:complexType>
+            <xs:complexType name="E"><xs:complexContent><xs:extension base="B"/></xs:complexContent></xs:complexType>
+            <xs:complexType name="R"><xs:complexContent><xs:restriction base="B">
+                <xs:sequence><xs:element name="leaf" type="xs:string"/></xs:sequence>
+                <xs:attribute name="lang" use="prohibited"/>
+            </xs:restriction></xs:complexContent></xs:complexType>
+            <xs:element name="root">
+                <xs:complexType>
+                    <xs:sequence><xs:element name="mid" type="{mid_type}"/></xs:sequence>
+                    <xs:attribute name="lang" type="xs:string" inheritable="true"/>
+                </xs:complexType>
+            </xs:element>
+        </xs:schema>"#
+        ));
+        let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+        let mut v = validator.start_run(TestSink::new());
+        let ns = empty_ns_context();
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_attribute("lang", "", "en");
+        v.validate_end_of_attributes();
+        v.validate_element("mid", "", None, None, &ns);
+        v.validate_end_of_attributes();
+        v.validate_element("leaf", "", None, None, &ns);
+        v.validate_end_of_attributes();
+        let inherited = v.get_inherited_attributes();
+        assert_eq!(inherited.len(), 1, "{mid_type}");
+        assert_eq!(inherited[0].value, expected, "{mid_type}");
+        v.validate_text("text");
+        v.validate_end_element();
+        v.validate_end_element();
+        v.validate_end_element();
+        v.end_validation().ok();
+        assert!(v.sink.errors.is_empty(), "{mid_type}: {:?}", v.sink.errors);
+    }
+}
+
+/// Fix round: an inheritable reference in an attribute group passes its own
+/// `fixed` value down, not its declaration's `default` (Structures §3.4.4.2,
+/// ·effective value constraint·).
+#[test]
+#[cfg(feature = "xsd11")]
+fn an_inheritable_group_reference_passes_its_own_value_constraint() {
+    let schema_set = load_schema_xsd11(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+        <xs:attribute name="lang" type="xs:string" inheritable="true" default="old"/>
+        <xs:attributeGroup name="g">
+            <xs:attribute ref="lang" fixed="new" inheritable="true"/>
+        </xs:attributeGroup>
+        <xs:element name="root">
+            <xs:complexType>
+                <xs:sequence><xs:element name="leaf" type="xs:string"/></xs:sequence>
+                <xs:attributeGroup ref="g"/>
+            </xs:complexType>
+        </xs:element>
+    </xs:schema>"#,
+    );
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+    v.validate_element("root", "", None, None, &ns);
+    v.validate_end_of_attributes();
+    v.validate_element("leaf", "", None, None, &ns);
+    v.validate_end_of_attributes();
+    let inherited = v.get_inherited_attributes();
+    assert_eq!(inherited.len(), 1);
+    assert_eq!(inherited[0].value, "new");
+    v.validate_text("text");
+    v.validate_end_element();
+    v.validate_end_element();
+    v.end_validation().ok();
+    assert!(v.sink.errors.is_empty(), "errors: {:?}", v.sink.errors);
+}
+
 // =========================================================================
 // PSVI Exposure Tests (Phase 4)
 // =========================================================================
@@ -7151,7 +7714,7 @@ fn test_psvi_identity_constraint_tables() {
             </xs:element>
         </xs:schema>"#,
     );
-    let flags = ValidationFlags::default() | ValidationFlags::PROCESS_IDENTITY_CONSTRAINTS;
+    let flags = ValidationFlags::default();
     let validator = SchemaValidator::new(&schema_set, flags);
     let mut v = validator.start_run(TestSink::new());
     let ns = empty_ns_context();
@@ -8559,7 +9122,10 @@ fn test_ic_singleton_list_equals_atomic() {
             XmlTypeCode::Name,
             XmlValueKind::List {
                 item_type: XmlTypeCode::Name,
-                items: vec![XmlAtomicValue::String("alpha".to_string())],
+                items: vec![XmlValue::new(
+                    XmlTypeCode::Name,
+                    XmlValueKind::Atomic(XmlAtomicValue::String("alpha".to_string())),
+                )],
             },
         )),
     };
@@ -8569,6 +9135,186 @@ fn test_ic_singleton_list_equals_atomic() {
         "atomic xs:Name must equal singleton list-of-xs:Name for IC"
     );
     assert_eq!(singleton_list, atomic, "equality must be symmetric");
+}
+
+/// Run `<root>` with one `<item k="…"/>` per key and one `<ref r="…"/>` per
+/// reference, and return the constraint codes of the errors.
+fn ic_list_key_errors(xsd: &str, keys: &[&str], refs: &[&str]) -> Vec<String> {
+    let schema_set = load_schema(xsd);
+    let flags = ValidationFlags::default();
+    let validator = SchemaValidator::new(&schema_set, flags);
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+    v.validate_element("root", "", None, None, &ns);
+    v.validate_end_of_attributes();
+    for (element, attribute, values) in [("item", "k", keys), ("ref", "r", refs)] {
+        for value in values {
+            v.validate_element(element, "", None, None, &ns);
+            v.validate_attribute(attribute, "", value);
+            v.validate_end_of_attributes();
+            v.validate_end_element();
+        }
+    }
+    v.validate_end_element();
+    v.end_validation().ok();
+    v.sink
+        .errors
+        .iter()
+        .map(|e| e.constraint.to_string())
+        .collect()
+}
+
+/// A key on `item/@k`, a list of `key_item`, and a keyref on `ref/@r`, a list
+/// of `ref_item`.
+fn list_key_schema(key_item: &str, ref_item: &str) -> String {
+    format!(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:simpleType name="intOrString"><xs:union memberTypes="xs:integer xs:string"/></xs:simpleType>
+            <xs:element name="root">
+                <xs:complexType>
+                    <xs:sequence>
+                        <xs:element name="item" minOccurs="0" maxOccurs="unbounded">
+                            <xs:complexType>
+                                <xs:attribute name="k" use="required">
+                                    <xs:simpleType><xs:list itemType="{key_item}"/></xs:simpleType>
+                                </xs:attribute>
+                            </xs:complexType>
+                        </xs:element>
+                        <xs:element name="ref" minOccurs="0" maxOccurs="unbounded">
+                            <xs:complexType>
+                                <xs:attribute name="r" use="required">
+                                    <xs:simpleType><xs:list itemType="{ref_item}"/></xs:simpleType>
+                                </xs:attribute>
+                            </xs:complexType>
+                        </xs:element>
+                    </xs:sequence>
+                </xs:complexType>
+                <xs:key name="itemKey">
+                    <xs:selector xpath="item"/>
+                    <xs:field xpath="@k"/>
+                </xs:key>
+                <xs:keyref name="itemRef" refer="itemKey">
+                    <xs:selector xpath="ref"/>
+                    <xs:field xpath="@r"/>
+                </xs:keyref>
+            </xs:element>
+        </xs:schema>"#
+    )
+}
+
+/// §3.11.4 clauses 4.2.2 and 4.3: key-sequences are compared member for
+/// member, "pairwise equal or identical, as defined by Equality and Identity
+/// in [XML Schema: Datatypes]". Datatypes §2.2.1: two lists are identical when
+/// "they have the same length and … the items of A are pairwise identical to
+/// the items of B"; "'+2', treated as a decimal, '+2', treated as an integer,
+/// and '+2', treated as a byte, all denote the same value", while "values from
+/// different primitive datatypes' value spaces are made artificially
+/// distinct". So the members of a list of a union of xs:integer and xs:string
+/// are compared in the value space of the member type that validated each:
+/// `1 x` and `01 x` are one key; the integer member `1` is not the string `1`
+/// that a list of xs:string holds; and a list of xs:integer `1 2` and a list
+/// of xs:decimal `1.0 2` hold the same values.
+#[test]
+fn test_ic_list_keys_compare_members_by_value() {
+    const DUP: &str = "cvc-identity-constraint.4.2.2";
+    const NO_MATCH: &str = "cvc-identity-constraint.4.3";
+    let union_keys = list_key_schema("intOrString", "intOrString");
+    let errors = ic_list_key_errors(&union_keys, &["1 x", "01 x"], &[]);
+    assert!(errors.iter().any(|e| e == DUP), "errors={errors:?}");
+    let errors = ic_list_key_errors(&union_keys, &["x 1", "x +1"], &[]);
+    assert!(errors.iter().any(|e| e == DUP), "errors={errors:?}");
+    for distinct in [["1 x", "1 y"], ["1 x", "1.0 x"], ["1 x", "1 x 2"]] {
+        let errors = ic_list_key_errors(&union_keys, &distinct, &[]);
+        assert!(
+            errors.is_empty(),
+            "{distinct:?} are different keys, errors={errors:?}"
+        );
+    }
+    let errors = ic_list_key_errors(&union_keys, &["1 x"], &["01 x"]);
+    assert!(
+        errors.is_empty(),
+        "`01 x` refers to `1 x`, errors={errors:?}"
+    );
+
+    // The integer 1 is not the string "1".
+    let errors = ic_list_key_errors(
+        &list_key_schema("intOrString", "xs:string"),
+        &["1 x"],
+        &["1 x"],
+    );
+    assert!(
+        errors.iter().any(|e| e.starts_with(NO_MATCH)),
+        "an xs:string list does not refer to an integer member, errors={errors:?}"
+    );
+    let errors = ic_list_key_errors(
+        &list_key_schema("intOrString", "xs:string"),
+        &["a x"],
+        &["a x"],
+    );
+    assert!(errors.is_empty(), "string members match, errors={errors:?}");
+}
+
+/// §3.11.4 and Datatypes §2.2.1 (see above): a list of xs:integer and a list
+/// of xs:decimal hold values of one primitive datatype, compared by value.
+#[test]
+fn test_ic_integer_and_decimal_list_keys_share_a_value_space() {
+    const DUP: &str = "cvc-identity-constraint.4.2.2";
+    let errors = ic_list_key_errors(
+        &list_key_schema("xs:integer", "xs:decimal"),
+        &["1 2"],
+        &["1.0 2"],
+    );
+    assert!(
+        errors.is_empty(),
+        "`1.0 2` refers to `1 2`, errors={errors:?}"
+    );
+    let errors = ic_list_key_errors(
+        &list_key_schema("xs:integer", "xs:integer"),
+        &["1 2", "01 2"],
+        &[],
+    );
+    assert!(errors.iter().any(|e| e == DUP), "errors={errors:?}");
+}
+
+/// §3.16.4 String Valid clause 3 ("Every ENTITY value in V is a declared
+/// entity name") applies to the members of a list of a union that the union's
+/// xs:ENTITY member validated — and only to those.
+#[test]
+fn test_entity_in_list_of_union_is_checked_per_member() {
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:simpleType name="intOrEntity"><xs:union memberTypes="xs:integer xs:ENTITY"/></xs:simpleType>
+            <xs:element name="root">
+                <xs:complexType>
+                    <xs:attribute name="pics" use="required">
+                        <xs:simpleType><xs:list itemType="intOrEntity"/></xs:simpleType>
+                    </xs:attribute>
+                </xs:complexType>
+            </xs:element>
+        </xs:schema>"#,
+    );
+    let entity_errors = |value: &str| {
+        let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+        let mut v = validator.start_run(TestSink::new());
+        let mut entities = std::collections::HashSet::new();
+        entities.insert("mylogo".to_string());
+        v.set_unparsed_entities(entities);
+        let ns = empty_ns_context();
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_attribute("pics", "", value);
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+        v.end_validation().ok();
+        v.sink
+            .errors
+            .iter()
+            .filter(|e| e.constraint == "cvc-datatype-valid.1.2.1")
+            .count()
+    };
+    // `5` is an xs:integer, not an entity name; `mylogo` is declared.
+    assert_eq!(entity_errors("5 mylogo"), 0);
+    // `other` is an ENTITY value and is not declared.
+    assert_eq!(entity_errors("other 5"), 1);
 }
 
 /// Phase 3: XSD 1.1 allows same ID value on same element via multiple ID attributes.
@@ -8831,7 +9577,7 @@ fn test_xsd11_ic_ref_resolves_global() {
         </xs:schema>"#,
     );
 
-    let flags = ValidationFlags::default() | ValidationFlags::PROCESS_IDENTITY_CONSTRAINTS;
+    let flags = ValidationFlags::default();
     let validator = SchemaValidator::new(&schema_set, flags);
     let mut v = validator.start_run(TestSink::new());
     let ns = empty_ns_context();
@@ -9719,5 +10465,601 @@ fn test_psvi_optout_numeric_diagnostics_match_psvi_on() {
             on, off,
             "diagnostics for <root>{value}</root> ({ty}) must match on/off: on={on:?} off={off:?}"
         );
+    }
+}
+
+// ── B8: the subject and the positional path of diagnostics ───────────────
+
+mod diagnostic_context_tests {
+    use super::*;
+
+    fn path_of(err: &ValidationError) -> Option<String> {
+        err.instance_path().map(ToString::to_string)
+    }
+
+    #[test]
+    fn sibling_counter_counts_per_name_and_resets() {
+        let mut c = SiblingCounter::default();
+        let (a, b) = (NameId(1), NameId(2));
+        assert_eq!(c.next(None, a), 1);
+        assert_eq!(c.next(None, b), 1);
+        assert_eq!(c.next(None, a), 2);
+        assert_eq!(
+            c.next(Some(NameId(9)), a),
+            1,
+            "another namespace, another name"
+        );
+        // Many more names than slots: names collide, and past the threshold
+        // the collided ones are found by hash; every count is kept.
+        for round in 1..=3 {
+            for i in 0..300u32 {
+                assert_eq!(c.next(None, NameId(100 + i)), round, "name {i}");
+            }
+        }
+        {
+            let table = c.table.as_deref().expect("a table past the linear stage");
+            assert!(c.table_active);
+            assert!(table.collided.len() > SIBLING_COLLIDED_INDEX);
+            assert_eq!(table.collided_index.len(), table.collided.len());
+        }
+        assert_eq!(c.next(None, a), 3);
+        assert_eq!(c.next(None, NameId(120)), 4);
+        assert_eq!(c.next(Some(NameId(9)), a), 2);
+        c.clear();
+        assert!(!c.table_active && c.head.is_none() && c.rest.is_empty());
+        {
+            let table = c.table.as_deref().expect("kept for reuse");
+            assert!(table.slots.iter().all(|&s| s == 0));
+            assert!(table.collided.is_empty() && table.collided_index.is_empty());
+        }
+        assert_eq!(c.next(None, a), 1);
+        assert_eq!(c.next(None, NameId(120)), 1);
+        assert_eq!(c.next(None, a), 2);
+        // A level that only ever has one name allocates nothing.
+        let mut single = SiblingCounter::default();
+        for n in 1..=5 {
+            assert_eq!(single.next(None, a), n);
+        }
+        assert!(single.table.is_none() && single.rest.capacity() == 0);
+        // Re-filling past the linear stage reuses the table.
+        for round in 1..=2 {
+            for i in 0..20u32 {
+                assert_eq!(c.next(None, NameId(500 + i)), round, "name {i}");
+            }
+        }
+        assert!(c.table_active);
+    }
+
+    /// The counter against a naive per-name count, over random sibling
+    /// sequences with clears (a differential check).
+    #[test]
+    fn sibling_counter_matches_a_naive_count() {
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut rand = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let mut c = SiblingCounter::default();
+        for pool in [1u64, 3, 8, 9, 40, 300, 3_000] {
+            for _parent in 0..4 {
+                let mut naive: HashMap<(Option<NameId>, NameId), usize> = HashMap::new();
+                for _ in 0..4_000 {
+                    let k = rand(pool);
+                    let ns = (k % 3 == 0).then_some(NameId(7));
+                    let local = NameId(1_000 + (k / 2) as u32);
+                    let expected = {
+                        let n = naive.entry((ns, local)).or_default();
+                        *n += 1;
+                        *n
+                    };
+                    assert_eq!(c.next(ns, local), expected, "pool {pool}");
+                }
+                c.clear();
+            }
+        }
+    }
+
+    /// A keyref whose referenced key is out of scope when its element closes
+    /// is retried at the ancestors; a failure reported there still names the
+    /// keyref's element.
+    #[test]
+    fn deferred_keyref_error_names_the_keyref_element() {
+        let schema_set = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:sequence>
+                            <xs:element name="item" maxOccurs="unbounded">
+                                <xs:complexType>
+                                    <xs:attribute name="id" type="xs:string"/>
+                                </xs:complexType>
+                            </xs:element>
+                            <xs:element name="group" maxOccurs="unbounded">
+                                <xs:complexType>
+                                    <xs:sequence>
+                                        <xs:element name="ref" maxOccurs="unbounded">
+                                            <xs:complexType>
+                                                <xs:attribute name="to" type="xs:string"/>
+                                            </xs:complexType>
+                                        </xs:element>
+                                    </xs:sequence>
+                                </xs:complexType>
+                                <xs:keyref name="toItem" refer="itemKey">
+                                    <xs:selector xpath="ref"/>
+                                    <xs:field xpath="@to"/>
+                                </xs:keyref>
+                            </xs:element>
+                        </xs:sequence>
+                    </xs:complexType>
+                    <xs:key name="itemKey">
+                        <xs:selector xpath="item"/>
+                        <xs:field xpath="@id"/>
+                    </xs:key>
+                </xs:element>
+            </xs:schema>"#,
+        );
+        let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+        let mut v = validator.start_run(TestSink::new());
+        let ns = empty_ns_context();
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_end_of_attributes();
+        v.validate_element("item", "", None, None, &ns);
+        v.validate_attribute("id", "", "A");
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+        for _ in 0..2 {
+            v.validate_element("group", "", None, None, &ns);
+            v.validate_end_of_attributes();
+            v.validate_element("ref", "", None, None, &ns);
+            v.validate_attribute("to", "", "A");
+            v.validate_end_of_attributes();
+            v.validate_end_element();
+            v.validate_end_element();
+        }
+        // A third group, referring to a missing key value.
+        v.validate_element("group", "", None, None, &ns);
+        v.validate_end_of_attributes();
+        v.validate_element("ref", "", None, None, &ns);
+        v.validate_attribute("to", "", "Z");
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+        v.validate_end_element();
+        v.validate_end_element(); // </root>
+        v.end_validation().ok();
+
+        let keyref: Vec<_> = v
+            .sink
+            .errors
+            .iter()
+            .filter(|e| e.constraint.starts_with("cvc-identity-constraint.4.3"))
+            .collect();
+        // The key is declared on an ancestor, so it is never in a `group`'s
+        // table: every keyref is deferred, and fails when the root closes.
+        let paths: Vec<_> = keyref.iter().map(|e| path_of(e)).collect();
+        assert_eq!(
+            paths,
+            [1, 2, 3].map(|n| Some(format!("/Q{{}}root[1]/Q{{}}group[{n}]"))),
+            "{:?}",
+            v.sink.errors
+        );
+        for e in keyref {
+            assert_eq!(
+                e.subject(),
+                Some(&ValidationSubject::Element(ExpandedName::new(
+                    None, "group"
+                )))
+            );
+        }
+    }
+
+    /// A nested asserted element's assertions are evaluated when the
+    /// outermost asserted element closes; the error still names the nested
+    /// element, with its own path.
+    #[cfg(feature = "xsd11")]
+    #[test]
+    fn deferred_assertion_error_names_the_nested_element() {
+        let schema_set = load_schema_xsd11(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="parent">
+                    <xs:complexType>
+                        <xs:sequence>
+                            <xs:element name="child" maxOccurs="unbounded">
+                                <xs:complexType>
+                                    <xs:attribute name="x" type="xs:integer"/>
+                                    <xs:assert test="@x > 0"/>
+                                </xs:complexType>
+                            </xs:element>
+                        </xs:sequence>
+                        <xs:assert test="true()"/>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+        );
+        let validator =
+            SchemaValidator::new_fragment_buffer(&schema_set, ValidationFlags::default());
+        let mut v = validator.start_run(TestSink::new());
+        let ns = empty_ns_context();
+        v.validate_element("parent", "", None, None, &ns);
+        v.validate_end_of_attributes();
+        for x in ["1", "-1"] {
+            v.validate_element("child", "", None, None, &ns);
+            v.validate_attribute("x", "", x);
+            v.validate_end_of_attributes();
+            v.validate_end_element();
+        }
+        v.validate_end_element();
+        v.end_validation().ok();
+
+        assert_eq!(v.sink.errors.len(), 1, "{:?}", v.sink.errors);
+        let e = &v.sink.errors[0];
+        assert_eq!(e.constraint, "cvc-assertion");
+        assert_eq!(
+            e.subject(),
+            Some(&ValidationSubject::Element(ExpandedName::new(
+                None, "child"
+            )))
+        );
+        assert_eq!(path_of(e).as_deref(), Some("/Q{}parent[1]/Q{}child[2]"));
+        assert_eq!(e.element_path(), Some("/parent/child"));
+    }
+
+    /// An attribute validated after type-alternative selection is still the
+    /// subject of its error.
+    #[cfg(feature = "xsd11")]
+    #[test]
+    fn cta_deferred_attribute_error_names_the_attribute() {
+        let schema_set = load_schema_xsd11(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:complexType name="numType">
+                    <xs:attribute name="kind" type="xs:string"/>
+                    <xs:attribute name="val" type="xs:integer"/>
+                </xs:complexType>
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:attribute name="kind" type="xs:string"/>
+                        <xs:attribute name="val" type="xs:string"/>
+                    </xs:complexType>
+                    <xs:alternative test="@kind='num'" type="numType"/>
+                </xs:element>
+            </xs:schema>"#,
+        );
+        let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+        let mut v = validator.start_run(TestSink::new());
+        let ns = empty_ns_context();
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_attribute("kind", "", "num");
+        v.validate_attribute("val", "", "abc");
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+        v.end_validation().ok();
+
+        assert!(!v.sink.errors.is_empty());
+        for e in &v.sink.errors {
+            assert_eq!(
+                e.subject(),
+                Some(&ValidationSubject::Attribute(ExpandedName::new(
+                    None, "val"
+                ))),
+                "{e:?}"
+            );
+            assert_eq!(path_of(e).as_deref(), Some("/Q{}root[1]/@Q{}val"));
+            assert_eq!(e.element_path(), Some("/root"));
+        }
+    }
+
+    /// An element-level error names its element; a run-level error that
+    /// `end_validation` returns names none.
+    #[test]
+    fn errors_outside_any_element_have_no_subject() {
+        let schema_set = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="root" type="xs:string"/>
+            </xs:schema>"#,
+        );
+        let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+        let mut v = validator.start_run(TestSink::new());
+        let ns = empty_ns_context();
+        v.validate_element("undeclared", "", None, None, &ns);
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+        let err = v.end_validation();
+        assert!(err.is_ok());
+        let e = &v.sink.errors[0];
+        assert_eq!(e.constraint, "cvc-elt.1");
+        assert_eq!(path_of(e).as_deref(), Some("/Q{}undeclared[1]"));
+        // A run-level error returned by end_validation has none.
+        let mut v = validator.start_run(TestSink::new());
+        v.validate_element("root", "", None, None, &ns);
+        let err = v.end_validation().unwrap_err();
+        assert!(err.subject().is_none() && err.instance_path().is_none());
+    }
+}
+
+// ── C18: skipping an attribute ───────────────────────────────────────────
+
+mod skip_attribute_tests {
+    use super::*;
+
+    /// `item` declares `id`, `ref`, `need` (required), `fix` (fixed) and `u`
+    /// (unique); `{urn:wsu}Id` and `w` are declared nowhere.
+    const PAYLOAD: &str = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+        <xs:element name="root">
+            <xs:complexType>
+                <xs:sequence>
+                    <xs:element name="item" minOccurs="0" maxOccurs="unbounded">
+                        <xs:complexType>
+                            <xs:attribute name="id" type="xs:ID"/>
+                            <xs:attribute name="ref" type="xs:IDREF"/>
+                            <xs:attribute name="need" type="xs:int" use="required"/>
+                            <xs:attribute name="fix" type="xs:string" fixed="x"/>
+                            <xs:attribute name="u" type="xs:string"/>
+                        </xs:complexType>
+                    </xs:element>
+                </xs:sequence>
+            </xs:complexType>
+            <xs:unique name="uniqueU">
+                <xs:selector xpath="item"/>
+                <xs:field xpath="@u"/>
+            </xs:unique>
+        </xs:element>
+    </xs:schema>"#;
+
+    const WSU: &str = "urn:wsu";
+
+    type Attr<'a> = (&'a str, &'a str, &'a str, bool);
+
+    /// Validate `<root>` with one `<item>` per entry of `items`; each attribute
+    /// is (local, ns, value, skip).
+    fn run(
+        items: &[&[Attr<'_>]],
+    ) -> (
+        Vec<SchemaInfo>,
+        Vec<Vec<SchemaInfo>>,
+        Vec<ValidationError>,
+        SchemaInfo,
+    ) {
+        run_with(PAYLOAD, items)
+    }
+
+    fn run_with(
+        xsd: &str,
+        items: &[&[Attr<'_>]],
+    ) -> (
+        Vec<SchemaInfo>,
+        Vec<Vec<SchemaInfo>>,
+        Vec<ValidationError>,
+        SchemaInfo,
+    ) {
+        let schema_set = load_schema(xsd);
+        let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+        let mut v = validator.start_run(TestSink::new());
+        let ns = empty_ns_context();
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_end_of_attributes();
+        let (mut ends, mut infos) = (Vec::new(), Vec::new());
+        for attrs in items {
+            v.validate_element("item", "", None, None, &ns);
+            let mut these = Vec::new();
+            for (local, uri, value, skip) in attrs.iter() {
+                these.push(if *skip {
+                    v.skip_attribute(local, uri, value)
+                } else {
+                    v.validate_attribute(local, uri, value)
+                });
+            }
+            v.validate_end_of_attributes();
+            ends.push(v.validate_end_element());
+            infos.push(these);
+        }
+        let root = v.validate_end_element();
+        v.end_validation().ok();
+        (ends, infos, std::mem::take(&mut v.sink.errors), root)
+    }
+
+    fn codes(errors: &[ValidationError]) -> Vec<&'static str> {
+        errors.iter().map(|e| e.constraint).collect()
+    }
+
+    /// An attribute no attribute use matches is not an error once skipped;
+    /// the element stays valid, but was not fully assessed (§3.3.5.1
+    /// `[validation attempted]` clause 3: partial).
+    #[test]
+    fn a_skipped_undeclared_attribute_is_not_assessed() {
+        let (ends, infos, errors, root) = run(&[&[
+            ("need", "", "1", false),
+            ("w", "", "k1", false),
+            ("Id", WSU, "x", true),
+        ]]);
+        // `w` validated (not skipped) is not allowed either.
+        assert_eq!(codes(&errors), ["cvc-complex-type.3.2.2"], "{errors:?}");
+        let skipped = &infos[0][2];
+        assert_eq!(skipped.validity, SchemaValidity::NotKnown);
+        assert_eq!(skipped.validation_attempted, ValidationAttempted::None);
+        assert!(skipped.schema_type.is_none() && skipped.attribute_decl.is_none());
+
+        let _ = (ends, root);
+        let (ends, _, errors, root) = run(&[&[
+            ("need", "", "1", false),
+            ("w", "", "k1", true),
+            ("Id", WSU, "x", true),
+        ]]);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(ends[0].validity, SchemaValidity::Valid);
+        assert_eq!(ends[0].validation_attempted, ValidationAttempted::Partial);
+        assert_eq!(root.validity, SchemaValidity::Valid);
+    }
+
+    /// Structures §3.4.4.2 clause 2.1 comes before 2.2: an attribute an
+    /// attribute use matches is validated by that use, never by a wildcard —
+    /// so asking to skip a declared attribute validates it as usual. The five
+    /// verdicts a skip must not change.
+    #[test]
+    fn a_declared_attribute_is_validated_even_if_asked_to_skip() {
+        // 1. a bad xs:int
+        let (ends, infos, errors, _) = run(&[&[("need", "", "bad", true)]]);
+        assert_eq!(codes(&errors), ["cvc-datatype-valid"], "{errors:?}");
+        assert_eq!(ends[0].validity, SchemaValidity::Invalid);
+        assert_eq!(
+            infos[0][0].validity,
+            SchemaValidity::Invalid,
+            "the real PSVI"
+        );
+        assert!(infos[0][0].schema_type.is_some());
+        // 2. a fixed mismatch
+        let (_, _, errors, _) = run(&[&[("need", "", "1", false), ("fix", "", "y", true)]]);
+        assert_eq!(codes(&errors), ["cvc-attribute.4"], "{errors:?}");
+        // 3. a duplicate xs:ID
+        let (_, _, errors, _) = run(&[
+            &[("need", "", "1", false), ("id", "", "a", true)],
+            &[("need", "", "1", false), ("id", "", "a", true)],
+        ]);
+        assert!(codes(&errors).contains(&"cvc-id.2"), "{errors:?}");
+        // 4. a dangling xs:IDREF
+        let (_, _, errors, _) = run(&[&[("need", "", "1", false), ("ref", "", "zz", true)]]);
+        assert_eq!(codes(&errors), ["cvc-id.1"], "{errors:?}");
+        // 5. an xs:unique duplicate
+        let (_, _, errors, _) = run(&[
+            &[("need", "", "1", false), ("u", "", "same", true)],
+            &[("need", "", "1", false), ("u", "", "same", true)],
+        ]);
+        assert!(
+            codes(&errors).contains(&"cvc-identity-constraint.4.2.2"),
+            "{errors:?}"
+        );
+    }
+
+    /// A skipped attribute is still present: a second one of the same name is
+    /// a duplicate, and the duplicate is about the attribute.
+    #[test]
+    fn a_skipped_attribute_is_present() {
+        let (_, _, errors, _) = run(&[&[
+            ("need", "", "1", false),
+            ("Id", WSU, "a", true),
+            ("Id", WSU, "b", true),
+        ]]);
+        assert_eq!(
+            codes(&errors),
+            ["cvc-complex-type.3"],
+            "a duplicate: {errors:?}"
+        );
+        assert_eq!(
+            errors[0]
+                .instance_path()
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("/Q{}root[1]/Q{}item[1]/@Q{urn:wsu}Id")
+        );
+    }
+
+    /// A skipped attribute has no type, so it is not in the eligible item set
+    /// of the ID/IDREF table (§3.17.5.2), and an identity-constraint field
+    /// that selects it gets no value (as for an attribute matched by a skip
+    /// wildcard): `keyW`'s field is then missing.
+    #[test]
+    fn a_skipped_attribute_gives_no_key_value() {
+        let xsd = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root">
+                <xs:complexType>
+                    <xs:sequence>
+                        <xs:element name="item" maxOccurs="unbounded">
+                            <xs:complexType>
+                                <xs:anyAttribute processContents="lax"/>
+                            </xs:complexType>
+                        </xs:element>
+                    </xs:sequence>
+                </xs:complexType>
+                <xs:key name="keyW">
+                    <xs:selector xpath="item"/>
+                    <xs:field xpath="@w"/>
+                </xs:key>
+            </xs:element>
+        </xs:schema>"#;
+        // Laxly validated by the wildcard, `@w` is a key value.
+        let (_, _, errors, _) = run_with(xsd, &[&[("w", "", "k", false)]]);
+        assert!(errors.is_empty(), "{errors:?}");
+        // Skipped, it is selected but has no value.
+        let (_, _, errors, _) = run_with(xsd, &[&[("w", "", "k", true)]]);
+        assert_eq!(
+            codes(&errors),
+            ["cvc-identity-constraint.4.2.1"],
+            "{errors:?}"
+        );
+    }
+
+    /// With type alternatives the decision waits for the selected type: an
+    /// attribute it declares is validated against it, one it does not is
+    /// skipped; type alternatives see both (they are in E.[attributes],
+    /// §3.12.4), and there is one deferred result per attribute.
+    #[cfg(feature = "xsd11")]
+    #[test]
+    fn with_type_alternatives_the_selected_type_decides() {
+        let schema_set = load_schema_xsd11(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:complexType name="numType">
+                    <xs:attribute name="val" type="xs:integer"/>
+                </xs:complexType>
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:attribute name="val" type="xs:string"/>
+                    </xs:complexType>
+                    <xs:alternative test="@w='num'" type="numType"/>
+                </xs:element>
+            </xs:schema>"#,
+        );
+        let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+        let ns = empty_ns_context();
+        for (val, invalid) in [("abc", true), ("42", false)] {
+            let mut v = validator.start_run(TestSink::new());
+            v.validate_element("root", "", None, None, &ns);
+            let w = v.skip_attribute("w", "", "num");
+            let val_info = v.skip_attribute("val", "", val);
+            assert!(w.deferred_by_cta && val_info.deferred_by_cta);
+            let eoa = v.validate_end_of_attributes();
+            assert!(eoa.cta_selected, "the skipped @w selected numType");
+            let deferred = v.take_deferred_attribute_results();
+            assert_eq!(deferred.len(), 2, "one result per attribute");
+            assert_eq!(deferred[0].validity, SchemaValidity::NotKnown, "@w skipped");
+            let expected = if invalid {
+                SchemaValidity::Invalid
+            } else {
+                SchemaValidity::Valid
+            };
+            assert_eq!(
+                deferred[1].validity, expected,
+                "@val validated as xs:integer"
+            );
+            let end = v.validate_end_element();
+            v.end_validation().ok();
+            assert_eq!(end.validity, expected, "{:?}", v.sink.errors);
+        }
+    }
+
+    /// Assertions see a skipped attribute, untyped.
+    #[cfg(feature = "xsd11")]
+    #[test]
+    fn assertions_see_a_skipped_attribute() {
+        let schema_set = load_schema_xsd11(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:assert test="@note = 'x'"/>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+        );
+        let validator =
+            SchemaValidator::new_fragment_buffer(&schema_set, ValidationFlags::default());
+        for (value, valid) in [("x", SchemaValidity::Valid), ("y", SchemaValidity::Invalid)] {
+            let mut v = validator.start_run(TestSink::new());
+            let ns = empty_ns_context();
+            v.validate_element("root", "", None, None, &ns);
+            v.skip_attribute("note", "", value); // declared nowhere: skipped
+            v.validate_end_of_attributes();
+            let end = v.validate_end_element();
+            v.end_validation().ok();
+            assert_eq!(end.validity, valid, "{value}: {:?}", v.sink.errors);
+        }
     }
 }

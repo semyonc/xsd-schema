@@ -14,20 +14,25 @@
 //!   whole check is compared by verdict, violation kind and state.
 //! - `check_all_group_upa_matches_reference`: `xs:all` models, compared
 //!   exactly.
+//! - `epsilon_closure_matches_reference`: the closure with a reused visited
+//!   set reaches exactly the terms of the 0.2.3 closure, and lists them in
+//!   increasing state order.
 //!
 //! Inputs come from a fixed-seed generator, so a failure reproduces.
 //! `UPA_DIFF_CASES=<n>` and `UPA_DIFF_SEED=<n>` widen or vary a run; under
 //! Miri the default case counts shrink a hundredfold.
 
 use super::reference;
+use std::collections::BTreeSet;
+
 use super::{
     check_all_group_upa, check_all_group_upa_with_substitutions, check_element_element_conflicts,
-    check_upa, check_upa_with_substitutions, epsilon_closure_with_terms, upa_substitution_map,
-    ReachableTerm,
+    check_upa, check_upa_with_substitutions, epsilon_closure_with_terms,
+    epsilon_closure_with_terms_in, upa_substitution_map, ClosureScratch, ReachableTerm,
 };
 use crate::compiler::all_group::{AllGroupModel, AllParticle};
 use crate::compiler::fragment::{fragment_to_table, FragmentBuilder, NfaFragment};
-use crate::compiler::nfa::NfaTerm;
+use crate::compiler::nfa::{NfaTable, NfaTerm, StateId, TransitionKind};
 use crate::compiler::particle::MaxOccurs;
 use crate::compiler::substitution::{SubstitutableNameSet, SubstitutionGroupMap};
 use crate::error::SchemaResult;
@@ -344,9 +349,9 @@ fn random_particle(
 }
 
 /// Verdict, violation kind and state of a whole-model result. The pair an
-/// error names can depend on the epsilon closure's hash-set order, which
-/// differs between two calls; that part is compared state by state on a
-/// shared closure instead.
+/// error names depends, in the reference, on the 0.2.3 epsilon closure's
+/// hash-set order, which differs between two calls; that part is compared
+/// state by state on a shared closure instead.
 fn verdict(result: &SchemaResult<()>) -> String {
     match result {
         Ok(()) => "ok".to_string(),
@@ -503,4 +508,110 @@ fn check_all_group_upa_matches_reference() {
         conflicts > total / 10 && clean > total / 10,
         "degenerate inputs"
     );
+}
+
+/// The terms of one closure, in order, as comparable strings.
+fn term_keys(terms: &[ReachableTerm]) -> Vec<String> {
+    terms
+        .iter()
+        .map(|reachable| format!("{:?} {:?}", reachable.term, reachable.origin))
+        .collect()
+}
+
+/// The epsilon closure of `start` in increasing state order, computed
+/// independently of both implementations.
+fn closure_in_state_order(nfa: &NfaTable, start: StateId) -> Vec<StateId> {
+    let mut seen = BTreeSet::new();
+    let mut stack = vec![start];
+    while let Some(state_id) = stack.pop() {
+        if !seen.insert(state_id) {
+            continue;
+        }
+        if let Some(state) = nfa.get_state(state_id) {
+            for transition in &state.transitions {
+                if transition.kind == TransitionKind::Epsilon {
+                    stack.push(transition.target);
+                }
+            }
+        }
+    }
+    seen.into_iter().collect()
+}
+
+#[test]
+fn epsilon_closure_matches_reference() {
+    let mut rng = seed(4);
+    let total = cases(3_000);
+    let (mut states, mut several) = (0u64, 0u64);
+    let sorted = |mut keys: Vec<String>| {
+        keys.sort();
+        keys
+    };
+
+    for case in 0..total {
+        let version = if case % 2 == 0 {
+            XsdVersion::V1_0
+        } else {
+            XsdVersion::V1_1
+        };
+        let schema = generate_schema(&mut rng, version);
+        let mut next_span = 0;
+        let nfa = fragment_to_table(random_particle(&mut rng, &schema, 3, &mut next_span));
+        // One working storage for every state, as `check_upa_with_substitutions`
+        // uses it.
+        let mut scratch = ClosureScratch::new(&nfa);
+
+        for state in &nfa.states {
+            let new = epsilon_closure_with_terms_in(&nfa, state.id, &mut scratch);
+            let old = reference::epsilon_closure_with_terms(&nfa, state.id);
+            assert_eq!(
+                sorted(term_keys(&old.elements)),
+                sorted(term_keys(&new.elements)),
+                "elements: case {case}, state {}",
+                state.id
+            );
+            assert_eq!(
+                sorted(term_keys(&old.wildcards)),
+                sorted(term_keys(&new.wildcards)),
+                "wildcards: case {case}, state {}",
+                state.id
+            );
+
+            let in_order = |element: bool| -> Vec<String> {
+                closure_in_state_order(&nfa, state.id)
+                    .into_iter()
+                    .filter_map(|id| nfa.get_state(id))
+                    .filter_map(|s| match &s.term {
+                        Some(term) if matches!(term, NfaTerm::Element { .. }) == element => {
+                            Some(format!("{:?} {:?}", term, s.origin))
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            };
+            assert_eq!(
+                in_order(true),
+                term_keys(&new.elements),
+                "element order: case {case}"
+            );
+            assert_eq!(
+                in_order(false),
+                term_keys(&new.wildcards),
+                "wildcard order: case {case}"
+            );
+
+            let fresh = epsilon_closure_with_terms(&nfa, state.id);
+            assert_eq!(term_keys(&fresh.elements), term_keys(&new.elements));
+            assert_eq!(term_keys(&fresh.wildcards), term_keys(&new.wildcards));
+
+            states += 1;
+            several += u64::from(new.elements.len() + new.wildcards.len() > 1);
+        }
+    }
+
+    eprintln!(
+        "epsilon_closure_matches_reference: {total} models, {states} states \
+         ({several} reach two or more terms), 0 differences"
+    );
+    assert!(several > states / 10, "degenerate inputs");
 }

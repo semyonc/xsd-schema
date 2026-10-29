@@ -15,7 +15,7 @@ use crate::xpath::ast::BinaryOpKind;
 use crate::xpath::collation;
 use crate::xpath::context::DynamicContext;
 use crate::xpath::error::XPathError;
-use crate::xpath::operators::{eval_binary, value_gt_collated, value_lt_collated};
+use crate::xpath::operators::{eval_binary_noted, value_gt_collated, value_lt_collated};
 use crate::xpath::DomNavigator;
 
 use super::{atomize_sequence, atomize_to_single_opt, atomize_to_string_opt, XPathValue};
@@ -29,7 +29,7 @@ use super::{atomize_sequence, atomize_to_single_opt, atomize_to_string_opt, XPat
 /// If the sequence is empty, returns $zero (default: integer 0).
 /// Supports numeric types and duration types.
 pub fn sum<N: DomNavigator>(
-    _context: &mut DynamicContext<'_, N>,
+    context: &mut DynamicContext<'_, N>,
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.is_empty() || args.len() > 2 {
@@ -56,7 +56,31 @@ pub fn sum<N: DomNavigator>(
         });
     }
 
-    Ok(XPathValue::from_atomic(accumulate_sum(&values, "sum")?))
+    let mut truncated = false;
+    let total = accumulate_sum(&values, "sum", &mut truncated)?;
+    if truncated {
+        warn_truncated_sum(context, "sum", &total);
+    }
+    Ok(XPathValue::from_atomic(total))
+}
+
+/// Report, once per evaluation, that `fn:{function}` added `xs:dayTimeDuration`
+/// values to a sum whose seconds field keeps its fraction truncated toward zero
+/// (`xs-seconds-capacity`).
+fn warn_truncated_sum<N: DomNavigator>(
+    context: &mut DynamicContext<'_, N>,
+    function: &'static str,
+    sum: &XmlValue,
+) {
+    context.warn_once(
+        crate::xpath::context::WarningSite::Function(function),
+        || {
+            crate::xpath::operators::seconds_capacity_warning(
+                &format!("the sum of the items of fn:{function}"),
+                sum,
+            )
+        },
+    );
 }
 
 // ============================================================================
@@ -68,7 +92,7 @@ pub fn sum<N: DomNavigator>(
 /// If the sequence is empty, returns the empty sequence.
 /// Supports numeric types and duration types.
 pub fn avg<N: DomNavigator>(
-    _context: &mut DynamicContext<'_, N>,
+    context: &mut DynamicContext<'_, N>,
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() != 1 {
@@ -84,7 +108,11 @@ pub fn avg<N: DomNavigator>(
 
     let count = values.len();
 
-    let accumulator = accumulate_sum(&values, "avg")?;
+    let mut truncated = false;
+    let accumulator = accumulate_sum(&values, "avg", &mut truncated)?;
+    if truncated {
+        warn_truncated_sum(context, "avg", &accumulator);
+    }
 
     // Divide by count
     let result = numeric_divide(&accumulator, count)?;
@@ -117,6 +145,9 @@ pub fn min<N: DomNavigator>(
 
     let has_collation_arg = args.len() == 2;
     let collation = call_collation(context, &mut args, has_collation_arg)?;
+    // F&O §15.4.3: the values are compared with `lt` / `gt`, a date/time
+    // value without a timezone in the implicit timezone.
+    let tz = context.implicit_timezone_or_host();
     let seq = args.remove(0);
 
     let values = atomize_sequence(seq)?;
@@ -145,7 +176,7 @@ pub fn min<N: DomNavigator>(
 
     for value in promoted.iter().skip(1) {
         // Use operators::value_lt for comparison
-        if value_lt_collated(value, &min_value, collation.as_ref())? {
+        if value_lt_collated(value, &min_value, collation.as_ref(), tz)? {
             min_value = value.clone();
         }
     }
@@ -173,6 +204,9 @@ pub fn max<N: DomNavigator>(
 
     let has_collation_arg = args.len() == 2;
     let collation = call_collation(context, &mut args, has_collation_arg)?;
+    // F&O §15.4.3: the values are compared with `lt` / `gt`, a date/time
+    // value without a timezone in the implicit timezone.
+    let tz = context.implicit_timezone_or_host();
     let seq = args.remove(0);
 
     let values = atomize_sequence(seq)?;
@@ -201,7 +235,7 @@ pub fn max<N: DomNavigator>(
 
     for value in promoted.iter().skip(1) {
         // Use operators::value_gt for comparison
-        if value_gt_collated(value, &max_value, collation.as_ref())? {
+        if value_gt_collated(value, &max_value, collation.as_ref(), tz)? {
             max_value = value.clone();
         }
     }
@@ -272,7 +306,14 @@ fn is_integer_type(code: XmlTypeCode) -> bool {
 /// a mixture of individually summable types — a number and a duration, or the
 /// two duration types — is FORG0006, not the XPTY0004 the `+` operator itself
 /// would raise for that pair.
-fn accumulate_sum(values: &[XmlValue], function: &str) -> Result<XmlValue, XPathError> {
+///
+/// `truncated` is set when a `xs:dayTimeDuration` sum keeps the fraction of its
+/// seconds truncated ([`eval_binary_noted`](crate::xpath::operators::eval_binary_noted)).
+fn accumulate_sum(
+    values: &[XmlValue],
+    function: &str,
+    truncated: &mut bool,
+) -> Result<XmlValue, XPathError> {
     let mut accumulator = promote_for_sum(&values[0])?;
     let family = sum_family(accumulator.type_code);
 
@@ -287,7 +328,15 @@ fn accumulate_sum(values: &[XmlValue], function: &str) -> Result<XmlValue, XPath
                 ),
             });
         }
-        accumulator = eval_binary(BinaryOpKind::Add, &accumulator, &promoted)?;
+        // No date/time value can be summed, so no implicit timezone is read.
+        accumulator = eval_binary_noted(
+            BinaryOpKind::Add,
+            &accumulator,
+            &promoted,
+            crate::xpath::collation::CollationRef::Codepoint,
+            crate::types::value::TimezoneOffset::UTC,
+            truncated,
+        )?;
     }
 
     Ok(accumulator)

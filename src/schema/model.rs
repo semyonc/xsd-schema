@@ -173,6 +173,24 @@ pub struct SchemaSet {
     /// These are structural errors that make the schema invalid but
     /// were deferred so parsing could continue for better diagnostics.
     pub parsing_errors: Vec<crate::error::SchemaError>,
+
+    /// The namespace bindings in scope at each `<xs:element>` /
+    /// `<xs:attribute>` with a `default` or `fixed` value, keyed by its
+    /// document and start offset (its `SourceRef`): the {value constraint}
+    /// {value} is "the ·actual value· … of the [attribute]" (Structures
+    /// §3.3.2.1, §3.2.2.1 – §3.2.2.3), and an `xs:QName` / `xs:NOTATION` value's actual
+    /// value depends on "the namespace bindings in scope where the literal
+    /// occurs" (Datatypes §3.3.18).
+    value_constraint_namespaces:
+        HashMap<(DocumentId, usize), crate::namespace::context::NamespaceContextSnapshot>,
+
+    /// The directives whose schema document could not be read, in the
+    /// order they were met (see [`SchemaSet::directive_failures`]).
+    directive_failures: Vec<crate::parser::resolver::DirectiveFailure>,
+
+    /// The nesting limit of the passes over the set's components (see
+    /// [`SchemaSet::max_depth`]).
+    max_depth: usize,
 }
 
 impl SchemaSet {
@@ -207,6 +225,9 @@ impl SchemaSet {
             effective_components: HashMap::new(),
             builtin_types: None,
             parsing_errors: Vec::new(),
+            value_constraint_namespaces: HashMap::new(),
+            directive_failures: Vec::new(),
+            max_depth: crate::parser::parse::DEFAULT_MAX_DEPTH,
         };
 
         // Initialize built-in types
@@ -251,6 +272,61 @@ impl SchemaSet {
         self.regex_compatibility
     }
 
+    /// The prepared effective `enumeration` of the simple type `sk`
+    /// ([`EnumerationIndex`](crate::types::facets::EnumerationIndex): the
+    /// expanded names of its QName / NOTATION values and, for a union, every
+    /// literal's value as the union decides it), cached with its effective
+    /// facets; `None` without an enumeration.
+    pub(crate) fn enumeration_index(
+        &self,
+        sk: SimpleTypeKey,
+    ) -> Option<Arc<crate::types::facets::EnumerationIndex>> {
+        let facets = self.effective_facets(sk);
+        let enumeration = facets.enumeration.as_ref()?;
+        let st = self.arenas.simple_types.get(sk)?;
+        Some(self.arenas.enumeration_index(sk, || {
+            if st.variety == crate::parser::frames::SimpleTypeVariety::Union {
+                crate::validation::simple::union_enumeration_index(
+                    enumeration,
+                    &st.resolved_member_types,
+                    self,
+                )
+            } else {
+                crate::types::facets::EnumerationIndex::for_qnames(
+                    enumeration,
+                    &self.name_table,
+                    self.derives_from(sk, self.builtin_types().notation),
+                )
+            }
+        }))
+    }
+
+    /// The namespace bindings in scope at the declaration at `source` when it
+    /// carries a `default` or `fixed` value — the bindings its value is read
+    /// with.
+    pub(crate) fn value_constraint_namespaces(
+        &self,
+        source: Option<&SourceRef>,
+    ) -> Option<&crate::namespace::context::NamespaceContextSnapshot> {
+        let source = source?;
+        self.value_constraint_namespaces
+            .get(&(source.doc_id, source.span.start))
+    }
+
+    /// Record the bindings of the declarations of document `doc_id` that
+    /// carry a `default` or `fixed` value, by start offset.
+    pub(crate) fn record_value_constraint_namespaces(
+        &mut self,
+        doc_id: DocumentId,
+        entries: Vec<(usize, crate::namespace::context::NamespaceContextSnapshot)>,
+    ) {
+        self.value_constraint_namespaces.extend(
+            entries
+                .into_iter()
+                .map(|(start, snapshot)| ((doc_id, start), snapshot)),
+        );
+    }
+
     /// Resolve an optional `SourceRef` to its line/column location.
     /// Returns `None` if the source is absent or cannot be located.
     pub fn locate(&self, source: Option<&SourceRef>) -> Option<SourceLocation> {
@@ -280,6 +356,118 @@ impl SchemaSet {
         source
             .and_then(|s| self.documents.get(s.doc_id as usize))
             .map_or(fallback, |doc| doc.target_namespace)
+    }
+
+    /// The `xs:include`, `xs:import`, `xs:redefine` and `xs:override`
+    /// directives whose schema document could not be read, in the order they
+    /// were met while the set was loaded.
+    ///
+    /// Such a directive is not a schema error: Structures §4.2.3 says "It is
+    /// not an error for the ·actual value· of the schemaLocation \[attribute\]
+    /// to fail to resolve at all, in which case the corresponding inclusion
+    /// must not be performed", and §4.2.6.2 "It is not an error for the
+    /// application schema component reference strategy to fail" — so the set
+    /// compiles without the document. But the schema may then lack
+    /// components the author meant it to have ("Failure to resolve is likely
+    /// to cause less than complete ·assessment· outcomes, of course"): a
+    /// host that needs the whole schema checks that this list is empty, or
+    /// that each failure is of an `xs:import` location hint whose namespace
+    /// another document supplies ([`DirectiveFailure::namespace_supplied`](crate::DirectiveFailure::namespace_supplied)).
+    ///
+    /// A document that was read but is not a schema document (not
+    /// well-formed, no `xs:schema` root, the wrong target namespace) is an
+    /// error, as before, and is not listed here.
+    ///
+    /// ```
+    /// use xsd_schema::SchemaSetBuilder;
+    ///
+    /// let compiled = SchemaSetBuilder::new()
+    ///     .add_source(
+    ///         r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+    ///              <xs:include schemaLocation="no-such-file.xsd"/>
+    ///              <xs:element name="root"/>
+    ///            </xs:schema>"#,
+    ///         "/schemas/main.xsd",
+    ///     )
+    ///     .unwrap()
+    ///     .compile()
+    ///     .expect("the set compiles without the missing document");
+    /// let failures = compiled.directive_failures();
+    /// assert_eq!(failures.len(), 1);
+    /// assert_eq!(failures[0].schema_location(), Some("no-such-file.xsd"));
+    /// assert!(failures[0].to_string().contains("could not be read"));
+    /// ```
+    pub fn directive_failures(&self) -> &[crate::parser::resolver::DirectiveFailure] {
+        &self.directive_failures
+    }
+
+    /// Mark the failed imports whose namespace a document of the set
+    /// supplies (`DirectiveFailure::namespace_supplied`). Run after the
+    /// directives are resolved.
+    pub(crate) fn refresh_directive_failures(&mut self) {
+        let documents = &self.documents;
+        let names = &self.name_table;
+        for failure in &mut self.directive_failures {
+            failure.refresh_supplied(|ns| {
+                names.get(ns).is_some_and(|id| {
+                    documents.iter().any(|d| {
+                        d.target_namespace == Some(id) || d.declared_target_namespace == Some(id)
+                    })
+                })
+            });
+        }
+    }
+
+    /// Record a directive whose schema document could not be read.
+    pub(crate) fn record_directive_failure(
+        &mut self,
+        failure: crate::parser::resolver::DirectiveFailure,
+    ) {
+        self.directive_failures.push(failure);
+    }
+
+    /// The nesting limit the passes over the set's components enforce: the
+    /// longest chain of components nested in each other — model groups in
+    /// model groups (inline or by reference), a type in its base type or in
+    /// the types it lists or unites, an attribute group in the attribute
+    /// groups it references, an element in its substitution group's head —
+    /// may be at most this long. A schema that breaks it is refused with a
+    /// [`SchemaError::LimitExceeded`](crate::SchemaError::LimitExceeded)
+    /// (limit [`SchemaLimit::ComponentDepth`](crate::SchemaLimit::ComponentDepth)).
+    /// `0` is no limit, and turns off this protection against stack
+    /// overflow: the passes' own recursion bounds then refuse only some
+    /// shapes (a content model nesting more group references than the
+    /// content-model compiler's bound), and others overflow the stack.
+    ///
+    /// The schema-document parser bounds the element nesting of each schema
+    /// document with [`ParserConfig::max_depth`](crate::parser::parse::ParserConfig::max_depth);
+    /// [`SchemaSetBuilder::compile`](crate::SchemaSetBuilder::compile) and
+    /// [`load_and_process_schema`](crate::load_and_process_schema) set this
+    /// limit to the same value before they process the set. Both bound the
+    /// recursion of the schema-time passes, so that a deeply nested schema is
+    /// refused with an error instead of overflowing the stack. The default
+    /// is [`DEFAULT_MAX_DEPTH`](crate::parser::parse::DEFAULT_MAX_DEPTH).
+    pub fn max_depth(&self) -> usize {
+        self.max_depth
+    }
+
+    /// Set the nesting limit of the passes over the set's components (see
+    /// [`max_depth`](Self::max_depth)); for a set processed with
+    /// [`process_loaded_schemas`](crate::process_loaded_schemas).
+    pub fn set_max_depth(&mut self, max_depth: usize) {
+        self.max_depth = max_depth;
+    }
+
+    /// The bound for a recursive pass whose own safety bound is `own`: never
+    /// below `own`, and above the nesting limit by a margin, so that the
+    /// bound is never reached by a schema within the limit. With no limit
+    /// (`0`), `own`.
+    pub(crate) fn recursion_bound(&self, own: usize) -> usize {
+        if self.max_depth == 0 {
+            own
+        } else {
+            own.max(self.max_depth.saturating_mul(2).saturating_add(16))
+        }
     }
 
     /// Returns `true` if any parsing errors were collected during error-recovery parsing.
@@ -436,6 +624,60 @@ impl SchemaSet {
         self.builtin_types().get_type_code(type_id)
     }
 
+    /// The built-in type with this code as a host of the XPath 2.0 data model
+    /// sees the set — the lookup for a host that validates nodes against a
+    /// type it names (an annotation it stipulates, a type test): `xs:anyType`,
+    /// every built-in simple type of the set, and in both XSD versions the four
+    /// types the data model adds to the XML Schema namespace (XDM 1.0 §2.6.2):
+    /// `xs:anyAtomicType`, `xs:untypedAtomic`, `xs:dayTimeDuration`,
+    /// `xs:yearMonthDuration` ([`BuiltinTypes::xpath_type`]). `None` for a code
+    /// that names no type of the set (a node kind, `item()`, and in an XSD 1.0
+    /// set `xs:dateTimeStamp` and `xs:error`).
+    ///
+    /// An XSD 1.0 set's schema documents still cannot name those four (XML
+    /// Schema 1.0 has none of them: a reference is `src-resolve`), nor an
+    /// XSD 1.1 set's `xs:untypedAtomic` (no XSD version defines it), and an
+    /// `xsi:type` resolves those only for a validator with
+    /// [`ValidationFlags::XPATH_TYPES`](crate::validation::ValidationFlags::XPATH_TYPES).
+    ///
+    /// ```
+    /// use xsd_schema::{SchemaSet, TypeKey, XmlTypeCode};
+    /// use xsd_schema::validation::validate_simple_type;
+    ///
+    /// let set = SchemaSet::new(); // XML Schema 1.0
+    /// let day_time = set.xpath_type(XmlTypeCode::DayTimeDuration).unwrap();
+    /// let value = validate_simple_type("PT90M", day_time, &set).unwrap();
+    /// assert_eq!(value.typed_value.type_code, XmlTypeCode::DayTimeDuration);
+    /// assert!(validate_simple_type("P1Y", day_time, &set).is_err());
+    /// // Schema documents of the set do not see it.
+    /// assert_eq!(set.builtin_types().day_time_duration, None);
+    /// ```
+    pub fn xpath_type(&self, code: XmlTypeCode) -> Option<TypeKey> {
+        if code == XmlTypeCode::AnyType {
+            return Some(TypeKey::Complex(self.any_type_key()));
+        }
+        self.builtin_types().xpath_type(code).map(TypeKey::Simple)
+    }
+
+    /// The built-in type an `xsi:type` naming `{namespace}local_name`
+    /// resolves to: what a schema document resolves — and, with
+    /// `xpath_types` (a host's [`ValidationFlags::XPATH_TYPES`](crate::validation::ValidationFlags::XPATH_TYPES)),
+    /// the XPath 2.0 data model's types the set's XSD version does not define
+    /// ([`xpath_type`](Self::xpath_type)).
+    pub(crate) fn xsi_type_built_in(
+        &self,
+        namespace: Option<NameId>,
+        local_name: NameId,
+        xpath_types: bool,
+    ) -> Option<TypeKey> {
+        let found = self.get_built_in_type_by_qname(namespace, local_name);
+        if found.is_some() || !xpath_types || namespace != Some(well_known::XS_NAMESPACE) {
+            return found;
+        }
+        let code = XmlTypeCode::from_local_name(self.name_table.resolve_ref(local_name))?;
+        self.builtin_types().xpath_type(code).map(TypeKey::Simple)
+    }
+
     /// Check if `derived` derives from `base` (transitively).
     ///
     /// For built-in types, this uses the standard XSD derivation hierarchy.
@@ -455,6 +697,11 @@ impl SchemaSet {
         let builtin = self.builtin_types();
         if builtin.is_builtin(derived) && builtin.is_builtin(base) {
             return builtin.derives_from(derived, base);
+        }
+        // An XSD 1.0 set's `xs:anyAtomicType` (a host's): every atomic type
+        // derives from it (XDM 1.0 §2.6.2).
+        if builtin.is_detached_any_atomic_type(base) {
+            return self.is_atomic_simple_type(derived);
         }
 
         // For user-defined types (or mixed), walk the resolved base type chain
@@ -511,11 +758,44 @@ impl SchemaSet {
     /// - `true` if `derived == base`
     /// - `true` if `derived` derives from `base` via a non-excluded derivation method
     /// - `false` otherwise
+    ///
+    /// This is the validation-time relation (Structures §3.4.6.5 / §3.16.6.3
+    /// *Type Derivation OK*): a member type of a union `base` counts as derived
+    /// from it (§3.16.6.3 clause 2.2.4), which is what `xsi:type` and
+    /// substitution groups need. XPath 2.0's derives-from (§2.5.4) admits only
+    /// restriction and extension, so a union member does not derive from its
+    /// union there.
     pub fn is_type_derived_from(
         &self,
         derived: TypeKey,
         base: TypeKey,
         exclude_methods: DerivationSet,
+    ) -> bool {
+        self.type_derived_from(derived, base, exclude_methods, true)
+    }
+
+    /// XPath 2.0 §2.5.4 `derives-from(AT, ET)` for two types of this set:
+    /// "AT … is the same as ET or is derived by restriction or extension from
+    /// ET", directly or through an intermediate type — the {base type
+    /// definition} chain only (the built-in hierarchy included; a list or
+    /// union type derives from `xs:anySimpleType`). Unlike
+    /// [`is_type_derived_from`](Self::is_type_derived_from), a member type of a
+    /// union is **not** derived from the union. SequenceType matching
+    /// (`instance of`, `treat as`, element / attribute / schema-element /
+    /// schema-attribute tests and the casts up the hierarchy) uses this one.
+    #[cfg(feature = "xsd11")]
+    pub(crate) fn xpath_derives_from(&self, derived: TypeKey, base: TypeKey) -> bool {
+        self.type_derived_from(derived, base, DerivationSet::empty(), false)
+    }
+
+    /// [`is_type_derived_from`](Self::is_type_derived_from) with the union
+    /// member clause (§3.16.6.3 clause 2.2.4) on or off.
+    fn type_derived_from(
+        &self,
+        derived: TypeKey,
+        base: TypeKey,
+        exclude_methods: DerivationSet,
+        union_members: bool,
     ) -> bool {
         // Same type derives from itself
         if derived == base {
@@ -543,7 +823,7 @@ impl SchemaSet {
         match (derived, base) {
             // Case 1: Both are simple types
             (TypeKey::Simple(d), TypeKey::Simple(b)) => {
-                self.is_simple_type_derived_from(d, b, exclude_methods)
+                self.is_simple_type_derived_from(d, b, exclude_methods, union_members)
             }
 
             // Case 2: Both are complex types
@@ -558,7 +838,7 @@ impl SchemaSet {
             // Case 4: Complex derives from Simple
             // Complex types with simpleContent can derive from simple types
             (TypeKey::Complex(d), TypeKey::Simple(b)) => {
-                self.is_complex_derived_from_simple(d, b, exclude_methods)
+                self.is_complex_derived_from_simple(d, b, exclude_methods, union_members)
             }
         }
     }
@@ -605,11 +885,13 @@ impl SchemaSet {
     /// Implements XSD spec §3.16.6.3 "Type Derivation OK (Simple)":
     /// - Clause 2.2.1/2.2.2: walks the `resolved_base_type` chain
     /// - Clause 2.2.4: if `base` is a union, checks transitive member types
+    ///   (only with `union_members`; XPath's derives-from leaves it out)
     fn is_simple_type_derived_from(
         &self,
         derived: SimpleTypeKey,
         base: SimpleTypeKey,
         exclude_methods: DerivationSet,
+        union_members: bool,
     ) -> bool {
         use crate::parser::frames::SimpleTypeVariety;
 
@@ -620,6 +902,19 @@ impl SchemaSet {
 
         // Clause 2.2.1/2.2.2: Walk the base type chain
         let builtin = self.builtin_types();
+
+        // An XSD 1.0 set's `xs:anyAtomicType`, which only a host reaches: XDM
+        // 1.0 §2.6.2 makes it the base of every primitive atomic type ("All
+        // primitive atomic types … have xs:anyAtomicType as their base type"),
+        // while the {base type definition} of a 1.0 primitive stays
+        // `xs:anySimpleType`. So every atomic type derives from it, by
+        // restriction steps only (a list or union type does not, nor does
+        // `xs:anySimpleType`).
+        if builtin.is_detached_any_atomic_type(base) {
+            return !exclude_methods.contains(DerivationSet::RESTRICTION)
+                && self.is_atomic_simple_type(derived);
+        }
+
         let mut current = derived;
         let mut visited = std::collections::HashSet::new();
 
@@ -668,11 +963,19 @@ impl SchemaSet {
 
         // Clause 2.2.4: If base is a union with no facets, check whether
         // derived is derived from a transitive member type.
+        if !union_members {
+            return false;
+        }
         if let Some(base_def) = self.arenas.simple_types.get(base) {
             if base_def.variety == SimpleTypeVariety::Union && base_def.facets.is_empty() {
                 for &member_type_key in &base_def.resolved_member_types {
                     if let TypeKey::Simple(member_key) = member_type_key {
-                        if self.is_simple_type_derived_from(derived, member_key, exclude_methods) {
+                        if self.is_simple_type_derived_from(
+                            derived,
+                            member_key,
+                            exclude_methods,
+                            union_members,
+                        ) {
                             return true;
                         }
                     }
@@ -681,6 +984,19 @@ impl SchemaSet {
         }
 
         false
+    }
+
+    /// Whether `key` is an atomic simple type: atomic variety and not
+    /// `xs:anySimpleType` (whose built-in component carries the atomic
+    /// variety). A restriction of a list or union type inherits its base's
+    /// variety when references are resolved.
+    fn is_atomic_simple_type(&self, key: SimpleTypeKey) -> bool {
+        key != self.builtin_types().any_simple_type
+            && self
+                .arenas
+                .simple_types
+                .get(key)
+                .is_some_and(|def| def.variety == crate::parser::frames::SimpleTypeVariety::Atomic)
     }
 
     /// Check if complex type `derived` is derived from complex type `base` with method filtering.
@@ -739,6 +1055,7 @@ impl SchemaSet {
         derived: ComplexTypeKey,
         base: SimpleTypeKey,
         exclude_methods: DerivationSet,
+        union_members: bool,
     ) -> bool {
         use crate::parser::frames::DerivationMethod;
 
@@ -768,7 +1085,12 @@ impl SchemaSet {
                         return true;
                     }
                     // Walk further up the simple type chain.
-                    return self.is_simple_type_derived_from(simple_base, base, exclude_methods);
+                    return self.is_simple_type_derived_from(
+                        simple_base,
+                        base,
+                        exclude_methods,
+                        union_members,
+                    );
                 }
                 Some(TypeKey::Complex(complex_base)) => {
                     // Base is another complex type; keep walking.
@@ -1534,6 +1856,21 @@ mod tests {
             !set.is_type_derived_from(string_key, union_key, DerivationSet::empty()),
             "xs:string should NOT be derived from union(float, integer)"
         );
+
+        // XPath 2.0 §2.5.4 derives-from: restriction / extension only, so a
+        // member type does not derive from its union (C69); the union itself
+        // derives from xs:anySimpleType and from itself.
+        #[cfg(feature = "xsd11")]
+        {
+            assert!(!set.xpath_derives_from(integer_key, union_key));
+            assert!(!set.xpath_derives_from(float_key, union_key));
+            assert!(set.xpath_derives_from(union_key, union_key));
+            let any_simple = TypeKey::Simple(set.builtin_types().any_simple_type);
+            assert!(set.xpath_derives_from(union_key, any_simple));
+            assert!(
+                set.xpath_derives_from(integer_key, TypeKey::Simple(set.builtin_types().decimal))
+            );
+        }
     }
 
     /// Clause 2.2.4 with nested unions: D derived from a member of

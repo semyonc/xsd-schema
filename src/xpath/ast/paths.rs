@@ -171,6 +171,72 @@ impl QName {
     }
 }
 
+/// The lexical form: `prefix:local`, or `local` with no prefix.
+impl std::fmt::Display for QName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.prefix.is_empty() {
+            f.write_str(&self.local)
+        } else {
+            write!(f, "{}:{}", self.prefix, self.local)
+        }
+    }
+}
+
+/// The kind test as the XPath 2.0 grammar spells it (§2.5.3), e.g.
+/// `element(p:a, T?)` or `document-node(schema-element(x))`.
+impl std::fmt::Display for KindTest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            KindTest::AnyKind => f.write_str("node()"),
+            KindTest::Text => f.write_str("text()"),
+            KindTest::Comment => f.write_str("comment()"),
+            KindTest::ProcessingInstruction(None) => f.write_str("processing-instruction()"),
+            KindTest::ProcessingInstruction(Some(target)) => {
+                write!(f, "processing-instruction({target})")
+            }
+            KindTest::Document(None) => f.write_str("document-node()"),
+            KindTest::Document(Some(inner)) => write!(f, "document-node({inner})"),
+            KindTest::Element(test) => {
+                f.write_str("element(")?;
+                match (&test.name, &test.type_name) {
+                    (None, None) => {}
+                    (name, type_name) => {
+                        match name {
+                            Some(name) => write!(f, "{name}")?,
+                            None => f.write_str("*")?,
+                        }
+                        if let Some(type_name) = type_name {
+                            write!(f, ", {type_name}")?;
+                            if test.nillable {
+                                f.write_str("?")?;
+                            }
+                        }
+                    }
+                }
+                f.write_str(")")
+            }
+            KindTest::Attribute(test) => {
+                f.write_str("attribute(")?;
+                match (&test.name, &test.type_name) {
+                    (None, None) => {}
+                    (name, type_name) => {
+                        match name {
+                            Some(name) => write!(f, "{name}")?,
+                            None => f.write_str("*")?,
+                        }
+                        if let Some(type_name) = type_name {
+                            write!(f, ", {type_name}")?;
+                        }
+                    }
+                }
+                f.write_str(")")
+            }
+            KindTest::SchemaElement(name) => write!(f, "schema-element({name})"),
+            KindTest::SchemaAttribute(name) => write!(f, "schema-attribute({name})"),
+        }
+    }
+}
+
 /// Single step in a path expression.
 #[derive(Debug, Clone)]
 pub struct PathStepNode {

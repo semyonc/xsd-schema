@@ -164,6 +164,12 @@ fn can_cast(source: XmlTypeCode, target: XmlTypeCode) -> bool {
         return target_ua_or_string || target == XmlTypeCode::AnyUri;
     }
 
+    // QName / NOTATION → uA, string (F&O §17.1.2 gives the result:
+    // `prefix:local`, or the local name); the same type was decided above.
+    if matches!(source, XmlTypeCode::QName | XmlTypeCode::Notation) {
+        return target_ua_or_string;
+    }
+
     false
 }
 
@@ -235,7 +241,9 @@ pub fn cast_to(value: &XmlValue, target_type: XmlTypeCode) -> Result<XmlValue, X
             VALIDATOR_REGISTRY
                 .validate(target_type, string_val.trim())
                 .map_err(|_| {
-                    XPathError::invalid_cast_value(&string_val, format!("xs:{}", type_name))
+                    beyond_value_limits(target_type, string_val.trim()).unwrap_or_else(|| {
+                        XPathError::invalid_cast_value(&string_val, format!("xs:{}", type_name))
+                    })
                 })
         }
 
@@ -325,28 +333,22 @@ fn cast_to_decimal(value: &XmlValue, string_val: &str) -> Result<XmlValue, XPath
             .map_err(|_| XPathError::FOAR0002)?,
         XmlValueKind::Atomic(XmlAtomicValue::Float(f)) => {
             if f.is_nan() || f.is_infinite() {
-                return Err(XPathError::invalid_cast_value(string_val, "xs:decimal"));
+                return Err(special_float_value(string_val));
             }
             if *f == 0.0 {
                 Decimal::ZERO
             } else {
-                crate::types::exact_decimal::unsigned_zero(
-                    Decimal::try_from(*f)
-                        .map_err(|_| XPathError::invalid_cast_value(string_val, "xs:decimal"))?,
-                )
+                decimal_from_binary(Decimal::try_from(*f).ok(), f64::from(*f), string_val)?
             }
         }
         XmlValueKind::Atomic(XmlAtomicValue::Double(d)) => {
             if d.is_nan() || d.is_infinite() {
-                return Err(XPathError::invalid_cast_value(string_val, "xs:decimal"));
+                return Err(special_float_value(string_val));
             }
             if *d == 0.0 {
                 Decimal::ZERO
             } else {
-                crate::types::exact_decimal::unsigned_zero(
-                    Decimal::try_from(*d)
-                        .map_err(|_| XPathError::invalid_cast_value(string_val, "xs:decimal"))?,
-                )
+                decimal_from_binary(Decimal::try_from(*d).ok(), *d, string_val)?
             }
         }
         XmlValueKind::Atomic(XmlAtomicValue::Boolean(b)) => {
@@ -359,6 +361,169 @@ fn cast_to_decimal(value: &XmlValue, string_val: &str) -> Result<XmlValue, XPath
         _ => decimal_from_lexical(string_val)?,
     };
     Ok(XmlValue::decimal(result))
+}
+
+/// F&O §17.1.3.3 (casting to `xs:decimal`) and §17.1.3.4 (to `xs:integer`):
+/// "If SV is one of the special xs:float or xs:double values NaN, INF, or
+/// -INF, an error is raised \[err:FOCA0002\]."
+fn special_float_value(lexical: &str) -> XPathError {
+    XPathError::FOCA0002 {
+        value: lexical.to_string(),
+    }
+}
+
+/// The `xs:decimal` a finite, nonzero `xs:float` / `xs:double` value `value`
+/// casts to, given `converted`, `rust_decimal`'s conversion of it (`None`
+/// when it failed).
+///
+/// F&O 1.0 §17.1.3.3: "TV is the xs:decimal value, within the set of
+/// xs:decimal values that the implementation is capable of representing,
+/// that is numerically closest to SV. If two values are equally close, then
+/// the one that is closest to zero is chosen. If SV is too large to be
+/// accommodated as an xs:decimal … an error is raised \[err:FOCA0001\]."
+/// The conversion fails only beyond the 96-bit mantissa (FOCA0001), and it
+/// gives 0 for every magnitude below 10⁻²⁸, the smallest positive value held
+/// — although above 5 × 10⁻²⁹ the numerically closest held value is
+/// ±10⁻²⁸. Elsewhere the conversion's result is kept: it is the shortest
+/// decimal that round-trips to the same binary value (`xs:decimal(0.1e0)` is
+/// `0.1`), within half a unit of the 28th fraction digit.
+fn decimal_from_binary(
+    converted: Option<Decimal>,
+    value: f64,
+    lexical: &str,
+) -> Result<Decimal, XPathError> {
+    match converted {
+        Some(d) if !d.is_zero() => Ok(crate::types::exact_decimal::unsigned_zero(d)),
+        Some(_) => Ok(if above_half_smallest_decimal(value) {
+            // ±10⁻²⁸.
+            Decimal::new(value.signum() as i64, 28)
+        } else {
+            Decimal::ZERO
+        }),
+        None => Err(XPathError::decimal_too_large(lexical)),
+    }
+}
+
+/// Whether the magnitude of the finite `value` is above 5 × 10⁻²⁹ — closer
+/// to 10⁻²⁸ than to 0 — compared exactly: `value` is `m × 2^e`, so `|value|
+/// > 5 × 10⁻²⁹` is `m × 10²⁹ × 2^max(e, 0) > 5 × 2^max(−e, 0)`.
+fn above_half_smallest_decimal(value: f64) -> bool {
+    use num_bigint::BigUint;
+    let bits = value.abs().to_bits();
+    let exponent_bits = ((bits >> 52) & 0x7ff) as i32;
+    let fraction = bits & ((1u64 << 52) - 1);
+    let (mantissa, exponent) = if exponent_bits == 0 {
+        (fraction, -1074)
+    } else {
+        (fraction | (1u64 << 52), exponent_bits - 1075)
+    };
+    let mut left = BigUint::from(mantissa) * BigUint::from(10u32).pow(29);
+    let mut right = BigUint::from(5u32);
+    if exponent >= 0 {
+        left <<= exponent as usize;
+    } else {
+        right <<= (-exponent) as usize;
+    }
+    left > right
+}
+
+/// The F&O error for a lexically valid date/time or duration literal whose
+/// numbers the value structs cannot hold, or `None` when the literal is not
+/// lexically valid for `target` at all (then the cast fails with FORG0001).
+///
+/// F&O 1.0 §17.1.1: "In casting to xs:date, xs:dateTime, xs:gYear, or
+/// xs:gYearMonth (or types derived from these), if the value is too large or
+/// too small to be represented by the implementation, error \[err:FODT0001\]
+/// is raised. In casting to a duration value, if the value is too large or too
+/// small to be represented by the implementation, error \[err:FODT0002\] is
+/// raised." The limits are those of `types::value`: a year in `i32`, the
+/// year, month, day, hour and minute numbers of a duration in `u32`, whole
+/// seconds below 2⁹⁶. A literal beyond them is recognised by putting held
+/// numbers in their places — a year with the same leap-year status, `0` for a
+/// duration's numbers — and validating the result.
+fn beyond_value_limits(target: XmlTypeCode, lexical: &str) -> Option<XPathError> {
+    use num_bigint::BigInt;
+    match target {
+        XmlTypeCode::Date
+        | XmlTypeCode::DateTime
+        | XmlTypeCode::DateTimeStamp
+        | XmlTypeCode::GYear
+        | XmlTypeCode::GYearMonth => {
+            let (negative, digits) = match lexical.strip_prefix('-') {
+                Some(rest) => (true, rest),
+                None => (false, lexical),
+            };
+            let end = digits
+                .bytes()
+                .position(|b| !b.is_ascii_digit())
+                .unwrap_or(digits.len());
+            let (year, rest) = digits.split_at(end);
+            // A year has four digits or more, and no leading zero beyond four.
+            if year.len() < 4 || (year.len() > 4 && year.starts_with('0')) {
+                return None;
+            }
+            let value: BigInt = year.parse().ok()?;
+            let value = if negative { -value } else { value };
+            if i32::try_from(&value).is_ok() {
+                return None;
+            }
+            // A year of the same leap-year status (the Gregorian cycle is 400
+            // years), positive and of four digits.
+            let cycle: BigInt = ((value % 400) + 400) % 400;
+            let substitute = format!("{}{rest}", 2000 + cycle.to_string().parse::<i32>().ok()?);
+            VALIDATOR_REGISTRY
+                .validate(target, &substitute)
+                .ok()
+                .map(|_| XPathError::FODT0001)
+        }
+        XmlTypeCode::Duration | XmlTypeCode::YearMonthDuration | XmlTypeCode::DayTimeDuration => {
+            let mut too_large = false;
+            let mut substitute = String::with_capacity(lexical.len());
+            let mut chars = lexical.char_indices().peekable();
+            while let Some((start, c)) = chars.next() {
+                if !c.is_ascii_digit() {
+                    substitute.push(c);
+                    continue;
+                }
+                let mut end = start + 1;
+                while let Some(&(i, d)) = chars.peek() {
+                    if d.is_ascii_digit() {
+                        end = i + 1;
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                let number = &lexical[start..end];
+                let designator = lexical[end..].chars().next();
+                let fraction = designator == Some('.');
+                let limit: BigInt =
+                    if fraction || designator == Some('S') || lexical[..start].ends_with('.') {
+                        // Seconds: whole seconds below 2⁹⁶; the fraction is
+                        // truncated to the digits that fit, never refused.
+                        BigInt::from(u128::MAX >> 32)
+                    } else {
+                        BigInt::from(u32::MAX)
+                    };
+                let held = lexical[..start].ends_with('.')
+                    || number.parse::<BigInt>().map_or(true, |n| n <= limit);
+                if held {
+                    substitute.push_str(number);
+                } else {
+                    too_large = true;
+                    substitute.push('0');
+                }
+            }
+            if !too_large {
+                return None;
+            }
+            VALIDATOR_REGISTRY
+                .validate(target, &substitute)
+                .ok()
+                .map(|_| XPathError::FODT0002)
+        }
+        _ => None,
+    }
 }
 
 /// The `xs:decimal` a string or `xs:untypedAtomic` value casts to, and the
@@ -414,7 +579,7 @@ fn cast_to_integer(value: &XmlValue, string_val: &str) -> Result<XmlValue, XPath
         }
         XmlValueKind::Atomic(XmlAtomicValue::Float(f)) => {
             if f.is_nan() || f.is_infinite() {
-                return Err(XPathError::invalid_cast_value(string_val, "xs:integer"));
+                return Err(special_float_value(string_val));
             }
             let truncated = f.trunc() as f64;
             // Use string round-trip to handle values outside i64 range
@@ -425,7 +590,7 @@ fn cast_to_integer(value: &XmlValue, string_val: &str) -> Result<XmlValue, XPath
         }
         XmlValueKind::Atomic(XmlAtomicValue::Double(d)) => {
             if d.is_nan() || d.is_infinite() {
-                return Err(XPathError::invalid_cast_value(string_val, "xs:integer"));
+                return Err(special_float_value(string_val));
             }
             // Use string round-trip to handle values outside i64 range
             let s = format!("{:.0}", d.trunc());
@@ -1114,20 +1279,23 @@ pub fn cast_to_integer_subtype(
         .as_integer()
         .ok_or_else(|| XPathError::internal("Expected integer after cast"))?;
 
-    // Then validate range for the specific subtype
-    let (min, max): (i128, i128) = match target_type {
-        XmlTypeCode::Byte => (i8::MIN as i128, i8::MAX as i128),
-        XmlTypeCode::Short => (i16::MIN as i128, i16::MAX as i128),
-        XmlTypeCode::Int => (i32::MIN as i128, i32::MAX as i128),
-        XmlTypeCode::Long => (i64::MIN as i128, i64::MAX as i128),
-        XmlTypeCode::UnsignedByte => (0, u8::MAX as i128),
-        XmlTypeCode::UnsignedShort => (0, u16::MAX as i128),
-        XmlTypeCode::UnsignedInt => (0, u32::MAX as i128),
-        XmlTypeCode::UnsignedLong => (0, u64::MAX as i128),
-        XmlTypeCode::PositiveInteger => (1, i128::MAX),
-        XmlTypeCode::NonNegativeInteger => (0, i128::MAX),
-        XmlTypeCode::NegativeInteger => (i128::MIN, -1),
-        XmlTypeCode::NonPositiveInteger => (i128::MIN, 0),
+    // Then validate range for the specific subtype. `xs:integer` has no size
+    // limit here (`BigInt`), and neither have the four types whose value
+    // space is unbounded on one side (Datatypes 1.1 §3.4.14, §3.4.15,
+    // §3.4.20, §3.4.25): they have one bound only.
+    let (min, max): (Option<i128>, Option<i128>) = match target_type {
+        XmlTypeCode::Byte => (Some(i8::MIN.into()), Some(i8::MAX.into())),
+        XmlTypeCode::Short => (Some(i16::MIN.into()), Some(i16::MAX.into())),
+        XmlTypeCode::Int => (Some(i32::MIN.into()), Some(i32::MAX.into())),
+        XmlTypeCode::Long => (Some(i64::MIN.into()), Some(i64::MAX.into())),
+        XmlTypeCode::UnsignedByte => (Some(0), Some(u8::MAX.into())),
+        XmlTypeCode::UnsignedShort => (Some(0), Some(u16::MAX.into())),
+        XmlTypeCode::UnsignedInt => (Some(0), Some(u32::MAX.into())),
+        XmlTypeCode::UnsignedLong => (Some(0), Some(u64::MAX.into())),
+        XmlTypeCode::PositiveInteger => (Some(1), None),
+        XmlTypeCode::NonNegativeInteger => (Some(0), None),
+        XmlTypeCode::NegativeInteger => (None, Some(-1)),
+        XmlTypeCode::NonPositiveInteger => (None, Some(0)),
         XmlTypeCode::Integer => return Ok(int_val),
         _ => {
             return Err(XPathError::type_mismatch(
@@ -1138,11 +1306,9 @@ pub fn cast_to_integer_subtype(
     };
 
     // Check range
-    let val_i128: i128 = bigint.to_string().parse().map_err(|_| {
-        XPathError::invalid_cast_value(bigint.to_string(), format!("{:?}", target_type))
-    })?;
-
-    if val_i128 < min || val_i128 > max {
+    if min.is_some_and(|min| *bigint < BigInt::from(min))
+        || max.is_some_and(|max| *bigint > BigInt::from(max))
+    {
         return Err(XPathError::invalid_cast_value(
             bigint.to_string(),
             format!("{:?}", target_type),

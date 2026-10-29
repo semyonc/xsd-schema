@@ -31,13 +31,12 @@
 use std::collections::HashSet;
 
 use quick_xml::events::Event;
-use quick_xml::XmlVersion;
 
 use crate::error::{SchemaError, SchemaResult};
 use crate::ids::{DocumentId, NameId};
 use crate::namespace::{is_ncname, NameTable, NamespaceContext, XS_NAMESPACE};
 use crate::parser::assemble::assemble_schema;
-use crate::parser::attrs::{categorize_attributes, parse_attributes, AttributeMap};
+use crate::parser::attrs::{categorize_attributes, parse_attributes_in, AttributeMap};
 use crate::parser::frames::{
     create_frame, create_frame_recovering, xsd_names, Frame, FrameResult, SchemaFrameResult,
     SkipFrame,
@@ -56,6 +55,16 @@ use crate::schema::annotation::ForeignAttribute;
 use crate::schema::model::XsdVersion;
 use crate::SchemaSet;
 
+/// The default nesting limit of schemas: [`ParserConfig::max_depth`] and
+/// [`SchemaSet::max_depth`](crate::SchemaSet::max_depth).
+///
+/// The deepest schema of the W3C XSD test suite nests its elements 16 deep,
+/// the deepest of 1,700 real-world WSDL / XSD files 25 deep; the limit leaves
+/// a margin of five over that, and keeps the recursion of every schema-time
+/// pass well inside a 2 MiB thread stack (the default of spawned threads),
+/// in debug builds too.
+pub const DEFAULT_MAX_DEPTH: usize = 128;
+
 /// Parser configuration options
 #[derive(Debug, Clone)]
 pub struct ParserConfig {
@@ -63,7 +72,27 @@ pub struct ParserConfig {
     pub error_recovery: bool,
     /// Whether to collect foreign attributes
     pub collect_foreign_attributes: bool,
-    /// Maximum nesting depth (0 = unlimited)
+    /// The nesting limit of schemas (`0` = unlimited); default
+    /// [`DEFAULT_MAX_DEPTH`].
+    ///
+    /// A schema document whose elements nest deeper is refused when it is
+    /// read, with a [`SchemaError::LimitExceeded`] (limit
+    /// [`SchemaLimit::ElementDepth`]) at the element that breaks the limit:
+    /// `Schema limit ParserConfig::max_depth exceeded at main.xsd:1:2177:
+    /// element depth 129, the limit is 128`; the `xs:schema` element is at
+    /// depth one. [`SchemaSetBuilder::compile`](crate::SchemaSetBuilder::compile)
+    /// and [`load_and_process_schema`](crate::load_and_process_schema) also
+    /// bound the nesting of the schema's components through references with
+    /// it (see [`SchemaSet::max_depth`](crate::SchemaSet::max_depth)).
+    /// Together they bound the recursion of the schema-time passes, so that
+    /// a schema nested deeply enough to overflow the stack is refused
+    /// instead. Raising the limit needs a larger stack for such schemas;
+    /// `0` turns this protection off — the crate's own recursion bounds then
+    /// refuse only some shapes, and a deeply nested schema can overflow the
+    /// stack and abort the process.
+    ///
+    /// [`SchemaError::LimitExceeded`]: crate::SchemaError::LimitExceeded
+    /// [`SchemaLimit::ElementDepth`]: crate::SchemaLimit::ElementDepth
     pub max_depth: usize,
     /// XSD version mode (1.0 or 1.1).
     /// Derived from `SchemaSet.xsd_version` in `parse_schema_with_config`.
@@ -75,7 +104,7 @@ impl Default for ParserConfig {
         Self {
             error_recovery: true,
             collect_foreign_attributes: true,
-            max_depth: 0,
+            max_depth: DEFAULT_MAX_DEPTH,
             xsd_version: XsdVersion::V1_0,
         }
     }
@@ -91,6 +120,8 @@ struct ParserState<'a, 'b, 'c> {
     doc_id: DocumentId,
     /// Errors collected during parsing
     errors: Vec<SchemaError>,
+    /// Per frame on `frame_stack`: `errors.len()` when it was pushed
+    error_marks: Vec<usize>,
     /// Parser configuration
     config: &'b ParserConfig,
     /// XSD namespace ID (cached)
@@ -111,6 +142,12 @@ struct ParserState<'a, 'b, 'c> {
     /// references inside the included document resolve to the includer's
     /// target namespace (matching how top-level definitions are re-namespaced).
     chameleon_namespace: Option<NameId>,
+    /// The version of XML the document is read with (its declaration).
+    xml_version: crate::xml::XmlVersion,
+    /// The namespace bindings at each `<xs:element>` / `<xs:attribute>` that
+    /// carries a `default` or `fixed` value, by start offset (see
+    /// `SchemaSet::value_constraint_namespaces`).
+    value_constraint_namespaces: Vec<(usize, crate::namespace::NamespaceContextSnapshot)>,
 }
 
 impl<'a, 'b, 'c> ParserState<'a, 'b, 'c> {
@@ -127,6 +164,7 @@ impl<'a, 'b, 'c> ParserState<'a, 'b, 'c> {
             frame_stack: Vec::new(),
             doc_id,
             errors: Vec::new(),
+            error_marks: Vec::new(),
             config,
             xsd_ns_id: None,
             source_map,
@@ -134,6 +172,16 @@ impl<'a, 'b, 'c> ParserState<'a, 'b, 'c> {
             id_values: HashSet::new(),
             vc_schema_excluded: false,
             chameleon_namespace,
+            xml_version: crate::xml::XmlVersion::V1_0,
+            value_constraint_namespaces: Vec::new(),
+        }
+    }
+
+    /// The document's XML version, as quick-xml's normalization takes it.
+    fn quick_xml_version(&self) -> quick_xml::XmlVersion {
+        match self.xml_version {
+            crate::xml::XmlVersion::V1_1 => quick_xml::XmlVersion::Explicit1_1,
+            _ => quick_xml::XmlVersion::Implicit1_0,
         }
     }
 
@@ -292,18 +340,34 @@ pub fn parse_schema_with_chameleon(
         chameleon_namespace,
     );
 
-    // Create XML reader
-    let mut reader = TrackedReader::from_bytes(xml);
+    // Create XML reader; the nesting limit is checked on the raw markup.
+    let mut reader = if config.max_depth == 0 {
+        TrackedReader::from_bytes(xml)
+    } else {
+        TrackedReader::from_bytes_with_limits(
+            xml,
+            &crate::xml::ParseLimits::none().with_max_depth(config.max_depth),
+        )
+    };
     let mut buf = Vec::new();
 
     // Track if we've seen the root schema element
     let mut seen_root = false;
 
-    // Main event loop
+    // Main event loop. The reader clears `buf` itself.
     loop {
-        buf.clear();
-        let tracked_event = reader.read_event(&mut buf)?;
+        let tracked_event = match reader.read_event(&mut buf) {
+            Ok(event) => event,
+            // A well-formedness error names its byte position: locate it.
+            Err(e) => {
+                return Err(match reader.error_position() {
+                    Some(pos) => e.with_location(source_map.locate(pos)),
+                    None => e,
+                })
+            }
+        };
         let span = tracked_event.span;
+        state.xml_version = reader.xml_version();
 
         match tracked_event.event {
             Event::Start(ref e) => {
@@ -359,6 +423,7 @@ pub fn parse_schema_with_chameleon(
         .root_schema
         .take()
         .ok_or_else(|| SchemaError::internal("No schema result produced during parsing"))?;
+    let value_constraint_namespaces = std::mem::take(&mut state.value_constraint_namespaces);
     drop(state);
 
     // Record the declared targetNamespace before chameleon adoption.
@@ -416,6 +481,7 @@ pub fn parse_schema_with_chameleon(
     };
     doc.declared_target_namespace = declared_target_namespace;
     schema_set.documents.push(doc);
+    schema_set.record_value_constraint_namespaces(doc_id, value_constraint_namespaces);
     // Deferred (error-recovery) parsing errors are kept only for a document
     // that made it into the set.
     schema_set.parsing_errors.extend(parsing_errors);
@@ -511,8 +577,9 @@ fn handle_start_element(
             attr_result.map_err(|e| SchemaError::xml(format!("Attribute error: {}", e), None))?;
 
         let attr_name = attr.key.as_ref();
+        // Normalized as the reader normalized it for its namespace checks.
         let attr_value = attr
-            .normalized_value(XmlVersion::Implicit1_0)
+            .normalized_value(state.quick_xml_version())
             .map_err(|e| SchemaError::xml(format!("Attribute value error: {}", e), None))?;
 
         // Check for xmlns declarations
@@ -543,17 +610,19 @@ fn handle_start_element(
             return Err(SchemaError::structural(
                 "sch-props-correct",
                 format!("Root element must be xs:schema, found '{}'", local_name),
-                None,
+                Some(state.source_map.locate(span.start)),
             ));
         }
     }
 
     // Parse and categorize attributes
     let source_ref = Some(state.source_ref(span));
-    let parsed_attrs = parse_attributes(
+    let version = state.quick_xml_version();
+    let parsed_attrs = parse_attributes_in(
         element.attributes(),
         &mut state.ns_context,
         source_ref.clone(),
+        version,
     )?;
     // sch-props-correct: attributes on XSD-namespace elements must be
     // unqualified — an explicit `xsd:`/`xs:` prefix on an XSD attribute
@@ -684,7 +753,7 @@ fn handle_start_element(
             // subtree so subsequent valid content can still be parsed.
             let location = source_ref.as_ref().map(|s| s.to_location(state.source_map));
             state.recover_or_fail(SchemaError::structural(
-                "sch-props-correct",
+                "s4s-elt-invalid-content",
                 format!(
                     "Foreign-namespace element '{}' is not allowed here",
                     local_name
@@ -696,21 +765,18 @@ fn handle_start_element(
         }
 
         if !allows_child {
+            let error = SchemaError::structural(
+                "s4s-elt-invalid-content",
+                format!("Unexpected element '{}' in current context", local_name),
+                source_ref.as_ref().map(|s| s.to_location(state.source_map)),
+            );
             if state.config.error_recovery {
                 // Push a skip frame for error recovery
-                state.add_error(SchemaError::structural(
-                    "sch-props-correct",
-                    format!("Unexpected element '{}' in current context", local_name),
-                    None,
-                ));
+                state.add_error(error);
                 push_skip_frame(state, source_ref, foreign_attrs)?;
                 return Ok(());
             } else {
-                return Err(SchemaError::structural(
-                    "sch-props-correct",
-                    format!("Unexpected element '{}' in current context", local_name),
-                    None,
-                ));
+                return Err(error);
             }
         }
 
@@ -741,6 +807,11 @@ fn handle_start_element(
         state.ns_context.name_table(),
         &validation_ctx,
     ) {
+        // Located at the element, unless the check located it itself.
+        let e = match &source_ref {
+            Some(src) => e.with_location(state.source_map.locate(src.span.start)),
+            None => e,
+        };
         state.recover_or_fail(e)?;
     }
 
@@ -822,8 +893,27 @@ fn handle_start_element(
     // Create namespace snapshot for QName resolution during frame construction
     let ns_snapshot = state.ns_context.snapshot();
 
-    // Create the new frame
+    // The bindings a `default` / `fixed` value of a declaration is read with
+    // (an `xs:QName` value resolves its prefix with them).
+    if is_in_xsd_ns && matches!(local_name, xsd_names::ELEMENT | xsd_names::ATTRIBUTE) {
+        let names = state.ns_context.name_table();
+        let has_value_constraint = attr_map.get_value_by_name(names, "default").is_some()
+            || attr_map.get_value_by_name(names, "fixed").is_some();
+        if let (true, Some(source)) = (has_value_constraint, source_ref.as_ref()) {
+            state
+                .value_constraint_namespaces
+                .push((source.span.start, ns_snapshot.clone()));
+        }
+    }
+
+    // Create the new frame. An error from reading the element's attributes
+    // (an unresolvable QName, say) is located at the element.
+    let locate = |e: SchemaError, state: &ParserState| match &source_ref {
+        Some(src) => e.with_location(state.source_map.locate(src.span.start)),
+        None => e,
+    };
     let frame = if state.config.error_recovery {
+        let reported = state.errors.len();
         let mut frame = create_frame_recovering(
             local_name,
             &attr_map,
@@ -832,6 +922,11 @@ fn handle_start_element(
             &ns_snapshot,
             &mut state.errors,
         );
+        let new: Vec<SchemaError> = state.errors.drain(reported..).collect();
+        for e in new {
+            let e = locate(e, state);
+            state.errors.push(e);
+        }
         frame.set_foreign_attributes(foreign_attrs);
         // Set namespace context for annotation content frames
         if matches!(local_name, xsd_names::APPINFO | xsd_names::DOCUMENTATION) {
@@ -845,7 +940,8 @@ fn handle_start_element(
             state.ns_context.name_table(),
             source_ref.clone(),
             &ns_snapshot,
-        )?;
+        )
+        .map_err(|e| locate(e, state))?;
         frame.set_foreign_attributes(foreign_attrs);
         // Set namespace context for annotation content frames
         if matches!(local_name, xsd_names::APPINFO | xsd_names::DOCUMENTATION) {
@@ -855,6 +951,7 @@ fn handle_start_element(
     };
 
     // Push frame onto stack
+    state.error_marks.push(state.errors.len());
     state.frame_stack.push(frame);
 
     Ok(())
@@ -887,12 +984,17 @@ fn handle_end_element(state: &mut ParserState, _span: SourceSpan) -> SchemaResul
             return Err(SchemaError::internal("End element with no frame on stack"));
         }
     };
+    let mark = state.error_marks.pop().unwrap_or(state.errors.len());
 
     // Save source ref before finish() consumes the frame
     let source_ref = frame.source().cloned();
 
     let result = match frame.finish() {
         Ok(r) => r,
+        // In error-recovery mode an element whose child was refused (and
+        // skipped) may then fail for lacking that child: report the cause —
+        // the first error collected inside the element, as without recovery.
+        Err(_) if state.errors.len() > mark => return Err(state.errors.remove(mark)),
         Err(e) => {
             // Add source location to error if available
             let e = if let Some(ref src) = source_ref {
@@ -923,6 +1025,13 @@ fn handle_end_element(state: &mut ParserState, _span: SourceSpan) -> SchemaResul
     // If no parent, store the root schema result
     else if let FrameResult::Schema(schema_result) = result {
         state.root_schema = Some(schema_result);
+    }
+    // In error-recovery mode a root `xs:schema` whose attributes were refused
+    // (an attribute it does not allow, an invalid value) was skipped like any
+    // other element: report that cause. It was collected when the root
+    // started, before anything else, so it is the document's first error.
+    else if !state.errors.is_empty() {
+        return Err(state.errors.remove(0));
     } else {
         return Err(SchemaError::internal(
             "Root frame did not produce a schema result",
@@ -938,8 +1047,9 @@ fn handle_text(
     text: &quick_xml::events::BytesText,
     span: SourceSpan,
 ) -> SchemaResult<()> {
+    let version = state.quick_xml_version();
     let text_content = text
-        .xml10_content()
+        .xml_content(version)
         .map_err(|e| SchemaError::xml(format!("Text content error: {}", e), None))?;
 
     apply_text(state, &text_content, span)
@@ -1167,8 +1277,27 @@ fn vc_token_available(
     })
 }
 
+/// Whether `xs:{local_name}` is a type ·automatically known· to the
+/// processor for `vc:typeAvailable` / `vc:typeUnavailable` (Structures 1.1
+/// §4.2.2: an element is ignored when "any item in the ·actual value· T is not
+/// the expanded name of some type definition ·automatically known· to the
+/// processor", or for `vc:typeUnavailable` when every item is one
+/// "·automatically known· to and supported by the processor"): the built-in
+/// types a schema document of `xsd_version` can name.
+///
+/// §3.16.7.4 defines the term: "A type about which a processor possesses
+/// prior knowledge, and which the processor can support without any
+/// declaration of the type being supplied by the user", which "can be included
+/// automatically by that processor in all schemas, but need not be". The
+/// XPath 2.0 data model's `xs:untypedAtomic` is not a type definition of any
+/// schema here (a schema document naming it is `src-resolve`, Structures 1.1
+/// §1.3.1.1), so it is not available in either version — an element guarded
+/// by `vc:typeAvailable="xs:untypedAtomic"` is ignored, one guarded by
+/// `vc:typeUnavailable` kept — and XSD 1.1's additions are available in 1.1
+/// only.
 fn vc_is_xs_type_available(local_name: &str, xsd_version: XsdVersion) -> bool {
     match crate::types::XmlTypeCode::from_local_name(local_name) {
+        Some(crate::types::XmlTypeCode::UntypedAtomic) => false,
         Some(code) => !code.is_xsd11() || xsd_version == XsdVersion::V1_1,
         None => false,
     }
@@ -1202,6 +1331,7 @@ fn push_skip_frame(
 ) -> SchemaResult<()> {
     let mut frame: Box<dyn Frame> = Box::new(SkipFrame::new(source));
     frame.set_foreign_attributes(foreign_attrs);
+    state.error_marks.push(state.errors.len());
     state.frame_stack.push(frame);
     Ok(())
 }
@@ -1441,6 +1571,60 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// C57: an attribute the schema for schemas does not allow on `xs:schema`
+    /// (or an invalid value of one it does) is reported with its own message,
+    /// code and location — as on any other XSD element — not as an internal
+    /// error about the root frame.
+    #[test]
+    fn test_bad_attribute_on_schema_root_reports_the_attribute() {
+        let cases = [
+            (
+                "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" bogus=\"1\">\n  <xs:element name=\"a\"/>\n</xs:schema>",
+                "Attribute 'bogus' is not allowed here",
+            ),
+            (
+                "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" bogus=\"1\"/>",
+                "Attribute 'bogus' is not allowed here",
+            ),
+            (
+                "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" elementFormDefault=\"bogus\"/>",
+                "bogus",
+            ),
+        ];
+        for (xsd, expected) in cases {
+            let mut schema_set = SchemaSet::new();
+            let error = parse_schema(xsd.as_bytes(), "test.xsd", &mut schema_set)
+                .expect_err("schema refused");
+            let text = error.to_string();
+            assert!(
+                text.contains(expected) && !text.contains("Internal error"),
+                "{xsd}: {text}"
+            );
+            assert!(
+                text.contains("test.xsd:1:1"),
+                "{xsd}: located at the root: {text}"
+            );
+        }
+        // The same attribute on another XSD element, for comparison.
+        let mut schema_set = SchemaSet::new();
+        let text = match parse_schema(
+            b"<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\"><xs:element name=\"a\" bogus=\"1\"/></xs:schema>",
+            "test.xsd",
+            &mut schema_set,
+        ) {
+            Err(error) => error.to_string(),
+            Ok(_) => schema_set
+                .parsing_errors
+                .first()
+                .map(|e| e.to_string())
+                .unwrap_or_default(),
+        };
+        assert!(
+            text.contains("Attribute 'bogus' is not allowed here"),
+            "{text}"
+        );
+    }
+
     #[test]
     fn test_parse_form_choice() {
         assert_eq!(
@@ -1462,7 +1646,7 @@ mod tests {
         let config = ParserConfig::default();
         assert!(config.error_recovery);
         assert!(config.collect_foreign_attributes);
-        assert_eq!(config.max_depth, 0);
+        assert_eq!(config.max_depth, DEFAULT_MAX_DEPTH);
     }
 
     #[test]

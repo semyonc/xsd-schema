@@ -117,13 +117,32 @@ fn numeric_abs(value: &XmlValue) -> Result<XmlValue, XPathError> {
     }
 }
 
+/// An integer argument of `fn:ceiling`, `fn:floor`, `fn:round` or
+/// `fn:round-half-to-even` as their result: the same number, an `xs:integer`.
+///
+/// F&O §6.4: "If the type of $arg is one of the four numeric types xs:float,
+/// xs:double, xs:decimal or xs:integer the type of the result is the same as
+/// the type of $arg. If the type of $arg is a type derived from one of the
+/// numeric types, the result is an instance of the base numeric type." So
+/// neither a built-in subtype such as `xs:short` nor a user-defined type
+/// (`XmlValue::schema_type`) survives.
+fn base_integer(value: &XmlValue) -> Result<XmlValue, XPathError> {
+    let i = value.as_integer().ok_or_else(|| XPathError::XPTY0004 {
+        expected: "xs:integer".to_string(),
+        found: format!("{:?}", value.type_code),
+    })?;
+    Ok(XmlValue::integer(i.clone()))
+}
+
 // ============================================================================
 // fn:ceiling($arg as numeric?) as numeric?
 // ============================================================================
 
 /// Implements fn:ceiling - returns the smallest integer greater than or equal to the argument.
 ///
-/// The function preserves the numeric type of the input.
+/// The result has the type of the input when that is `xs:float`,
+/// `xs:double`, `xs:decimal` or `xs:integer`, and otherwise the one of those
+/// four it derives from (F&O §6.4; see `base_integer`).
 pub fn ceiling<N: DomNavigator>(
     _context: &mut DynamicContext<'_, N>,
     mut args: Vec<XPathValue<N>>,
@@ -178,10 +197,7 @@ fn numeric_ceiling(value: &XmlValue) -> Result<XmlValue, XPathError> {
             // `(-0.5).trunc()` is a negative zero: ceiling(-0.5) is 0.
             Ok(XmlValue::decimal(unsigned_zero(result)))
         }
-        _ if is_integer_type(value.type_code) => {
-            // For integers, ceiling is identity
-            Ok(value.clone())
-        }
+        _ if is_integer_type(value.type_code) => base_integer(value),
         _ => Err(XPathError::XPTY0004 {
             expected: "xs:numeric".to_string(),
             found: format!("{:?}", value.type_code),
@@ -195,7 +211,9 @@ fn numeric_ceiling(value: &XmlValue) -> Result<XmlValue, XPathError> {
 
 /// Implements fn:floor - returns the largest integer less than or equal to the argument.
 ///
-/// The function preserves the numeric type of the input.
+/// The result has the type of the input when that is `xs:float`,
+/// `xs:double`, `xs:decimal` or `xs:integer`, and otherwise the one of those
+/// four it derives from (F&O §6.4; see `base_integer`).
 pub fn floor<N: DomNavigator>(
     _context: &mut DynamicContext<'_, N>,
     mut args: Vec<XPathValue<N>>,
@@ -249,10 +267,7 @@ fn numeric_floor(value: &XmlValue) -> Result<XmlValue, XPathError> {
             };
             Ok(XmlValue::decimal(unsigned_zero(result)))
         }
-        _ if is_integer_type(value.type_code) => {
-            // For integers, floor is identity
-            Ok(value.clone())
-        }
+        _ if is_integer_type(value.type_code) => base_integer(value),
         _ => Err(XPathError::XPTY0004 {
             expected: "xs:numeric".to_string(),
             found: format!("{:?}", value.type_code),
@@ -274,7 +289,9 @@ fn numeric_floor(value: &XmlValue) -> Result<XmlValue, XPathError> {
 /// `round(-2.5)` is -2, not -3 — and the spec's own examples spell the negative
 /// case out: "round(-2.5) returns -2 (not the possible alternative, -3)".
 ///
-/// The function preserves the numeric type of the input.
+/// The result has the type of the input when that is `xs:float`,
+/// `xs:double`, `xs:decimal` or `xs:integer`, and otherwise the one of those
+/// four it derives from (F&O §6.4; see `base_integer`).
 pub fn round<N: DomNavigator>(
     _context: &mut DynamicContext<'_, N>,
     mut args: Vec<XPathValue<N>>,
@@ -323,10 +340,7 @@ fn numeric_round(value: &XmlValue) -> Result<XmlValue, XPathError> {
                 round_half_toward_positive_infinity_decimal(d),
             )))
         }
-        _ if is_integer_type(value.type_code) => {
-            // For integers, round is identity
-            Ok(value.clone())
-        }
+        _ if is_integer_type(value.type_code) => base_integer(value),
         _ => Err(XPathError::XPTY0004 {
             expected: "xs:numeric".to_string(),
             found: format!("{:?}", value.type_code),
@@ -484,9 +498,9 @@ fn numeric_round_half_to_even(value: &XmlValue, precision: i32) -> Result<XmlVal
             )))
         }
         _ if is_integer_type(value.type_code) => {
-            // For integers with non-negative precision, return as-is
+            // For integers with non-negative precision, the value itself.
             if precision >= 0 {
-                return Ok(value.clone());
+                return base_integer(value);
             }
 
             // For negative precision, round to powers of 10

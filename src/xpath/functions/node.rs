@@ -15,7 +15,7 @@
 use crate::ids::NameId;
 use crate::namespace::qname::QualifiedName;
 use crate::namespace::table::NameTable;
-use crate::types::value::{XmlAtomicValue, XmlValue, XmlValueKind};
+use crate::types::value::{QNameValue, XmlAtomicValue, XmlValue, XmlValueKind};
 use crate::types::XmlTypeCode;
 use crate::xpath::context::DynamicContext;
 use crate::xpath::error::XPathError;
@@ -139,7 +139,7 @@ pub fn node_name<N: DomNavigator>(
                     let qname = QualifiedName::new(namespace_uri, local_name, prefix);
                     Ok(XPathValue::from_atomic(XmlValue::new(
                         XmlTypeCode::QName,
-                        XmlValueKind::Atomic(XmlAtomicValue::QName(qname)),
+                        XmlValueKind::Atomic(XmlAtomicValue::QName(QNameValue::new(qname, names))),
                     )))
                 }
                 DomNodeType::ProcessingInstruction => {
@@ -148,7 +148,7 @@ pub fn node_name<N: DomNavigator>(
                     let qname = QualifiedName::new(None, local_name, None);
                     Ok(XPathValue::from_atomic(XmlValue::new(
                         XmlTypeCode::QName,
-                        XmlValueKind::Atomic(XmlAtomicValue::QName(qname)),
+                        XmlValueKind::Atomic(XmlAtomicValue::QName(QNameValue::new(qname, names))),
                     )))
                 }
                 DomNodeType::Namespace => {
@@ -157,7 +157,7 @@ pub fn node_name<N: DomNavigator>(
                     let qname = QualifiedName::new(None, local_name, None);
                     Ok(XPathValue::from_atomic(XmlValue::new(
                         XmlTypeCode::QName,
-                        XmlValueKind::Atomic(XmlAtomicValue::QName(qname)),
+                        XmlValueKind::Atomic(XmlAtomicValue::QName(QNameValue::new(qname, names))),
                     )))
                 }
                 // Text, Comment, Document nodes have no name
@@ -371,7 +371,8 @@ pub fn root<N: DomNavigator>(
 // fn:id($arg as xs:string*, $node as node()) as element()*
 // ============================================================================
 
-/// Implements fn:id - selects elements by their ID attribute value.
+/// Implements fn:id - selects elements by their ID value: an ID attribute's,
+/// or the element's own typed value when that is a single `xs:ID`.
 ///
 /// If 1 arg: uses context item as reference node.
 /// If 2 args: second arg is the reference node.
@@ -395,7 +396,48 @@ pub fn id<N: DomNavigator>(
     }
 
     let mut args = args;
+    let root_nav = target_document(context, &mut args, "fn:id")?;
 
+    // Collect all ID tokens from the first argument
+    let id_arg = args.into_iter().next().unwrap();
+    let tokens = collect_id_tokens(id_arg);
+
+    // Look up each token, dedup by position
+    let mut result_nodes: Vec<N> = Vec::new();
+    for token in &tokens {
+        if let Some(found) = root_nav.find_element_by_id(token)? {
+            // Deduplicate: only add if not already present
+            let already_present = result_nodes.iter().any(|n| n.is_same_position(&found));
+            if !already_present {
+                result_nodes.push(found);
+            }
+        }
+    }
+
+    // Sort in document order
+    result_nodes.sort_by(|a, b| {
+        use crate::xpath::node_ops::compare_document_order;
+        compare_document_order(a, b)
+    });
+
+    // Convert to XPathValue
+    let items: Vec<XmlItem<N>> = result_nodes.into_iter().map(XmlItem::Node).collect();
+    Ok(XPathValue::from_sequence(items))
+}
+
+/// The root of the target document of `fn:id` / `fn:idref`: the tree of the
+/// second argument (removed from `args`), or of the context item when there is
+/// none. F&O 1.0 §15.5.2 / §15.5.3: "If $node, or the context item if the
+/// second argument is omitted, is a node in a tree whose root is not a
+/// document node [err:FODC0001] is raised. If the second argument is the
+/// context item, or is omitted, the following errors may be raised: if there
+/// is no context item, [err:XPDY0002]; if the context item is not a node
+/// [err:XPTY0004]."
+fn target_document<N: DomNavigator>(
+    context: &mut DynamicContext<'_, N>,
+    args: &mut Vec<XPathValue<N>>,
+    function: &str,
+) -> Result<N, XPathError> {
     // Get the reference node (arg 2 or context item)
     let ref_node = if args.len() == 2 {
         let node_arg = args.remove(1);
@@ -442,38 +484,93 @@ pub fn id<N: DomNavigator>(
     let mut root_nav = ref_node;
     root_nav.move_to_root();
     if root_nav.node_type() != DomNodeType::Root {
+        let message =
+            format!("{function}: the node is in a tree whose root is not a document node");
         return Err(XPathError::raised(
             crate::xpath::error::XQT_ERRORS_NAMESPACE,
             "FODC0001",
-            Some("fn:id: the node is in a tree whose root is not a document node"),
+            Some(&message),
         ));
     }
+    Ok(root_nav)
+}
 
-    // Collect all ID tokens from the first argument
-    let id_arg = args.into_iter().next().unwrap();
-    let tokens = collect_id_tokens(id_arg);
+// ============================================================================
+// fn:idref($arg as xs:string*, $node as node()) as node()*
+// ============================================================================
 
-    // Look up each token, dedup by position
+/// Implements fn:idref - the element and attribute nodes that refer to one of
+/// the IDs in `$arg`.
+///
+/// F&O 1.0 §15.5.3: "Returns the sequence of element or attribute nodes with
+/// an IDREF value matching the value of one or more of the ID values supplied
+/// in $arg", "in document order with duplicates eliminated": the nodes `$N`
+/// whose "is-idrefs property … is true" and for which
+/// "fn:tokenize(fn:normalize-space(fn:string($N)), ' ') contains a string
+/// that is equal to V". The target document and its errors are `fn:id`'s
+/// (`FODC0001`, `XPDY0002`, `XPTY0004`). "Each xs:string in $arg is parsed as
+/// if it were of lexically of type xs:ID … If any of the strings in $arg is
+/// not a lexically valid xs:ID (that is, if it is not lexically an
+/// xs:NCName), it is ignored" — formally `$arg[. castable as xs:NCName]`: a
+/// string is taken with its XML white space collapsed, as `xs:ID` reads it
+/// (so `' a '` is the candidate `a`), and a string with white space inside
+/// it is no candidate — `$arg` is not tokenized.
+///
+/// A navigator whose nodes are never is-idrefs — an untyped tree, a
+/// schema-unaware backend — gives the empty sequence (the trait's default
+/// `find_nodes_by_idref`).
+pub fn idref<N: DomNavigator>(
+    context: &mut DynamicContext<'_, N>,
+    args: Vec<XPathValue<N>>,
+) -> Result<XPathValue<N>, XPathError> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(XPathError::wrong_number_of_arguments(
+            "idref",
+            1,
+            args.len(),
+        ));
+    }
+    let mut args = args;
+    let root_nav = target_document(context, &mut args, "fn:idref")?;
+
+    let candidates = collect_idref_candidates(args.into_iter().next().unwrap());
     let mut result_nodes: Vec<N> = Vec::new();
-    for token in &tokens {
-        if let Some(found) = root_nav.find_element_by_id(token)? {
-            // Deduplicate: only add if not already present
-            let already_present = result_nodes.iter().any(|n| n.is_same_position(&found));
-            if !already_present {
+    for candidate in &candidates {
+        for found in root_nav.find_nodes_by_idref(candidate)? {
+            if !result_nodes.iter().any(|n| n.is_same_position(&found)) {
                 result_nodes.push(found);
             }
         }
     }
-
-    // Sort in document order
     result_nodes.sort_by(|a, b| {
         use crate::xpath::node_ops::compare_document_order;
         compare_document_order(a, b)
     });
-
-    // Convert to XPathValue
     let items: Vec<XmlItem<N>> = result_nodes.into_iter().map(XmlItem::Node).collect();
     Ok(XPathValue::from_sequence(items))
+}
+
+/// The candidate ID values of an `fn:idref` argument: each string, its XML
+/// white space collapsed, when that is an NCName (`$arg[. castable as
+/// xs:NCName]`, F&O 1.0 §15.5.3), each once.
+fn collect_idref_candidates<N: DomNavigator>(value: XPathValue<N>) -> Vec<String> {
+    let mut candidates: Vec<String> = Vec::new();
+    let mut push = |s: String| {
+        let trimmed = s.trim_matches(|c| matches!(c, ' ' | '\t' | '\r' | '\n'));
+        if crate::namespace::is_ncname(trimmed) && !candidates.iter().any(|c| c == trimmed) {
+            candidates.push(trimmed.to_string());
+        }
+    };
+    match value {
+        XPathValue::Empty => {}
+        XPathValue::Item(item) => push(item_string_value(item)),
+        XPathValue::Sequence(items) => {
+            for item in items {
+                push(item_string_value(item));
+            }
+        }
+    }
+    candidates
 }
 
 /// Collect the candidate IDREF values of an `fn:id` argument.
@@ -650,9 +747,14 @@ fn compute_base_uri<N: DomNavigator>(node: &N, static_base_uri: Option<&str>) ->
             // observe a `Root` node above the test element. The
             // navigator still surfaces the document-level base URI
             // via `nav.base_uri()` once no `xml:base` is found, so
-            // pick it up here as the bottom of the chain.
+            // pick it up here as the bottom of the chain — unless it is
+            // the topmost element's own `xml:base`, already collected,
+            // which a navigator may report there instead
+            // (`DomNavigator::base_uri`).
             let doc_base = nav.base_uri();
-            if !doc_base.is_empty() {
+            let own_xml_base = nav.node_type() == DomNodeType::Element
+                && get_xml_base_attr(&nav).is_some_and(|own| own == doc_base);
+            if !doc_base.is_empty() && !own_xml_base {
                 xml_bases.push(doc_base.to_string());
             }
             break;
@@ -688,43 +790,15 @@ fn get_xml_base_attr<N: DomNavigator>(nav: &N) -> Option<String> {
     None
 }
 
-/// Resolve a URI reference against a base URI.
-///
-/// Simple implementation that handles:
-/// - Absolute URIs (returned as-is)
-/// - Relative paths resolved against base
+/// Resolve a URI reference against a base URI (RFC 3986 §5.2, the crate's
+/// `parser::uri::resolve`).
 fn resolve_uri(uri: &str, base: Option<&str>) -> String {
-    // If URI is absolute (has scheme), return as-is
-    if uri.contains("://") || uri.starts_with("file:") {
-        return uri.to_string();
-    }
-
+    // XML Base §4.2 / RFC 3986 §5.2: the reference resolved against the base
+    // URI, dot segments removed (§5.2.4). Without a base URI the reference is
+    // all there is.
     match base {
+        Some(base) => crate::parser::uri::resolve(base, uri),
         None => uri.to_string(),
-        Some(base_uri) => {
-            if uri.is_empty() {
-                return base_uri.to_string();
-            }
-
-            // Simple resolution: append relative to base directory
-            if uri.starts_with('/') {
-                // Absolute path - find scheme://host and append
-                if let Some(scheme_end) = base_uri.find("://") {
-                    if let Some(path_start) = base_uri[scheme_end + 3..].find('/') {
-                        let host_end = scheme_end + 3 + path_start;
-                        return format!("{}{}", &base_uri[..host_end], uri);
-                    }
-                }
-                uri.to_string()
-            } else {
-                // Relative path - append to base directory
-                if let Some(last_slash) = base_uri.rfind('/') {
-                    format!("{}/{}", &base_uri[..last_slash], uri)
-                } else {
-                    uri.to_string()
-                }
-            }
-        }
     }
 }
 

@@ -668,7 +668,9 @@ pub fn effective_arena_facets_for_builtin(builtin: BuiltInType) -> FacetSet {
 
     // String/NormalizedString leave whiteSpace unfixed so descendants can
     // tighten preserve→replace→collapse; AnySimpleType/AnyAtomicType/XsError
-    // omit it entirely (cos-applicable-facets rejects whiteSpace on unions).
+    // omit it entirely (cos-applicable-facets rejects whiteSpace on unions),
+    // and so does the XPath data model's UntypedAtomic, whose values are not
+    // normalized (XDM 1.0 §2.6.4: "no validation takes place").
     match builtin {
         BuiltInType::String => {
             facets.set_whitespace(WhitespaceMode::Preserve, FacetFixed::Default, None);
@@ -676,7 +678,10 @@ pub fn effective_arena_facets_for_builtin(builtin: BuiltInType) -> FacetSet {
         BuiltInType::NormalizedString => {
             facets.set_whitespace(WhitespaceMode::Replace, FacetFixed::Default, None);
         }
-        BuiltInType::AnySimpleType | BuiltInType::AnyAtomicType | BuiltInType::XsError => {}
+        BuiltInType::AnySimpleType
+        | BuiltInType::AnyAtomicType
+        | BuiltInType::UntypedAtomic
+        | BuiltInType::XsError => {}
         _ => {
             facets.set_whitespace(WhitespaceMode::Collapse, FacetFixed::Fixed, None);
         }

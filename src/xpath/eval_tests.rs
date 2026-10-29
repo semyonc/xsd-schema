@@ -2121,13 +2121,13 @@ mod integration_tests {
     #[test]
     fn test_parse_bind_eval_if_expression() {
         let result = eval_xpath("if (true()) then 'yes' else 'no'").unwrap();
-        assert_eq!(result.as_str(), Some("yes".to_string()));
+        assert_eq!(result.to_owned_string(), Some("yes".to_string()));
     }
 
     #[test]
     fn test_parse_bind_eval_nested_functions() {
         let result = eval_xpath("upper-case(concat('a', 'b'))").unwrap();
-        assert_eq!(result.as_str(), Some("AB".to_string()));
+        assert_eq!(result.to_owned_string(), Some("AB".to_string()));
     }
 
     #[test]
@@ -2524,7 +2524,7 @@ mod type_expr_tests {
         let root = wrap_in_expr(&mut arena, type_expr);
 
         let result = bind_and_eval(&mut arena, root);
-        assert!(matches!(result, Err(XPathError::XPDY0050)));
+        assert!(matches!(result, Err(XPathError::XPDY0050 { .. })));
     }
 
     #[test]
@@ -2741,6 +2741,63 @@ mod type_expr_tests {
             }
             _ => panic!("Expected boolean false"),
         }
+    }
+
+    /// N2: the item type the binder resolves for `instance of` / `treat as` is
+    /// a cache inside the node. A node a host builds and evaluates unbound has
+    /// none and is resolved on the fly; a bound node whose `target_type` the
+    /// host edits is right again once it is bound again.
+    #[test]
+    fn instance_of_matches_unbound_and_rebound_nodes() {
+        use crate::xpath::ast::{ElementTest, KindTest};
+
+        let names = NameTable::new();
+        let ctx = XPathContext::new(&names);
+        let span = SourceSpan::new(0, 20);
+        let mut arena = AstArena::new();
+        let value = arena.add(AstNode::Value(ValueNode::String("a".to_string())));
+        let item = SequenceTypeNode::single(AstItemTypeNode::Item, OccurrenceIndicator::One, span);
+        let id = arena.add(AstNode::TypeExpr(TypeExprNode::new(
+            TypeExprKind::InstanceOf,
+            value,
+            item,
+            span,
+        )));
+        let eval = |arena: &AstArena| -> Option<bool> {
+            let mut dynamic: DynamicContext<'_, RoXmlNavigator<'static>> =
+                DynamicContext::new(&ctx, 0);
+            match eval_node(arena, id, &mut dynamic).expect("evaluate") {
+                XPathValue::Item(XmlItem::Atomic(v)) => v.as_boolean(),
+                _ => None,
+            }
+        };
+        // Unbound: resolved on the fly.
+        assert_eq!(eval(&arena), Some(true));
+        // Bound, then edited in place to `element()`.
+        bind_node(&mut arena, id, &ctx, &mut NameBinder::new()).expect("bind");
+        assert_eq!(eval(&arena), Some(true));
+        if let AstNode::TypeExpr(node) = arena.get_mut(id) {
+            node.target_type = SequenceTypeNode::single(
+                AstItemTypeNode::Kind(KindTest::Element(ElementTest::default())),
+                OccurrenceIndicator::One,
+                span,
+            );
+        }
+        bind_node(&mut arena, id, &ctx, &mut NameBinder::new()).expect("bind again");
+        assert_eq!(eval(&arena), Some(false));
+        // A fresh node built by the host, never bound, for the edited type.
+        let rebuilt = TypeExprNode::new(
+            TypeExprKind::InstanceOf,
+            value,
+            SequenceTypeNode::single(
+                AstItemTypeNode::Kind(KindTest::Element(ElementTest::default())),
+                OccurrenceIndicator::One,
+                span,
+            ),
+            span,
+        );
+        *arena.get_mut(id) = AstNode::TypeExpr(rebuilt);
+        assert_eq!(eval(&arena), Some(false));
     }
 } // end type_expr_tests
 
@@ -4946,6 +5003,14 @@ mod list_atomization_tests {
         <xs:union memberTypes="xs:integer xs:float"/>
       </xs:simpleType>
       <xs:simpleType name="numList"><xs:list itemType="intOrFloat"/></xs:simpleType>
+      <xs:simpleType name="smallInt">
+        <xs:restriction base="xs:integer"><xs:maxInclusive value="100"/></xs:restriction>
+      </xs:simpleType>
+      <xs:simpleType name="smallList"><xs:list itemType="smallInt"/></xs:simpleType>
+      <xs:simpleType name="smallOrString">
+        <xs:union memberTypes="smallInt xs:string"/>
+      </xs:simpleType>
+      <xs:simpleType name="smallOrStringList"><xs:list itemType="smallOrString"/></xs:simpleType>
       <xs:complexType name="intListWithKind">
         <xs:simpleContent>
           <xs:extension base="intList">
@@ -4987,12 +5052,16 @@ mod list_atomization_tests {
           <xs:attribute name="m" type="mixedList"/>
           <xs:attribute name="m2" type="mixedList"/>
           <xs:attribute name="b" type="xs:boolean"/>
+          <xs:attribute name="m3" type="mixedList"/>
+          <xs:attribute name="s" type="smallList"/>
+          <xs:attribute name="su" type="smallOrStringList"/>
         </xs:complexType>
       </xs:element>
     </xs:schema>"#;
 
     const INSTANCE: &str = concat!(
         r#"<doc l="a b" one="c" n="1 2 3" n1=" 5 " e="" r="a b" m="1 x" m2="x 1" b="true""#,
+        r#" m3="01 x" s="5 7" su="5 x 500""#,
         r#" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">"#,
         r#"<l>p q</l><sc kind="k">4 5</sc><ni xsi:nil="true"/>"#,
         r#"<d>1 NaN</d><d> 1  NaN </d><d>1 2</d>"#,
@@ -5071,8 +5140,8 @@ mod list_atomization_tests {
         );
     }
 
-    /// `fn:data` and the typed value: one item per member, typed with the
-    /// list's item type; `fn:string` is untouched.
+    /// `fn:data` and the typed value: one item per member, each of the type
+    /// that validated it (here the list's item type); `fn:string` is untouched.
     #[test]
     fn data_yields_one_item_per_member() {
         check(
@@ -5345,12 +5414,15 @@ mod list_atomization_tests {
         check(&[("count(data(/doc/@r))", "2")], false);
     }
 
-    /// A list whose item type is a union: one item per member.
+    /// A list whose item type is a union: one item per member, each an
+    /// instance of the member type that validated it.
     ///
-    /// The member type actually chosen (XDM §3.3.1.2) is not recorded per
-    /// member, so a member is typed with the list's recorded item type, or
-    /// `xs:string` when it holds a lexical form that type cannot hold — and an
-    /// operation on it then fails with an error code, never an internal error.
+    /// XPath 2.0 §2.5.2: the typed value of a list-typed node is "a sequence
+    /// of three values (7, 8, 9), each of type hatsize" (the item type, also a
+    /// user-defined one), and "when the type annotation of a node is a union
+    /// type, the typed value of the node will be an instance of one of the
+    /// member types of the union" — for a list of a union, each member is an
+    /// instance of the member type that validated it.
     #[test]
     fn a_list_of_a_union_yields_one_item_per_member() {
         check(
@@ -5358,20 +5430,95 @@ mod list_atomization_tests {
                 ("count(data(/doc/@m))", "2"),
                 ("data(/doc/@m)", "1|x"),
                 ("/doc/@m = 'x'", "true"),
+                ("data(/doc/@m)[1] instance of xs:integer", "true"),
+                ("data(/doc/@m)[1] eq 1", "true"),
+                ("data(/doc/@m)[2] instance of xs:string", "true"),
+                ("deep-equal(data(/doc/@m), (1, 'x'))", "true"),
                 ("data(/doc/@m2)", "x|1"),
                 ("data(/doc/@m2)[1] instance of xs:string", "true"),
                 ("data(/doc/@m2)[1] instance of xs:integer", "false"),
                 ("/doc/@m2 = 'x'", "true"),
-                // The specification's answer is 2 (the member is an
-                // xs:integer); without the chosen member type it is a type
-                // error with its code.
-                ("data(/doc/@m2)[2] + 1", "error:XPTY0004"),
+                ("data(/doc/@m2)[2] instance of xs:integer", "true"),
+                ("data(/doc/@m2)[2] + 1", "2"),
+                // The typed value, not the spelling: `01` is the integer 1.
+                ("data(/doc/@m3)", "1|x"),
                 // XQTS `validateexpr-24` (XQuery-only): a list of a union of
-                // xs:integer and xs:float, `1 1.0e0`, has two items.
+                // xs:integer and xs:float, `1 1.0e0`, is an xs:integer and an
+                // xs:float.
                 ("count(data(/doc/lu))", "2"),
                 ("data(/doc/lu)", "1|1"),
+                (
+                    "(data(/doc/lu)[1] instance of xs:integer, data(/doc/lu)[2] instance of xs:float)",
+                    "true|true",
+                ),
+                ("data(/doc/lu)[2] instance of xs:integer", "false"),
             ],
             false,
+        );
+    }
+
+    /// A member keeps its type — the item type (XPath 2.0 §2.5.2's
+    /// `hatsizelist`: "each of type hatsize"), or the member type a union
+    /// chose — with its `schema_type`, a user-defined type included.
+    #[test]
+    fn list_members_keep_their_user_defined_types() {
+        check(
+            &[
+                ("data(/doc/@s)[2] instance of xs:integer", "true"),
+                ("data(/doc/@su)", "5|x|500"),
+                ("data(/doc/@su)[1] instance of xs:integer", "true"),
+                ("data(/doc/@su)[1] + 1", "6"),
+                ("data(/doc/@su)[2] instance of xs:string", "true"),
+                // 500 is above smallInt's maxInclusive: xs:string took it.
+                ("data(/doc/@su)[3] instance of xs:string", "true"),
+                ("data(/doc/@su)[3] instance of xs:integer", "false"),
+            ],
+            false,
+        );
+
+        // The schema types themselves (`instance of` a user-defined atomic
+        // type is not decided by the evaluator, so read them directly).
+        let mut schema_set = SchemaSet::xsd11();
+        load_and_process_schema(SCHEMA.as_bytes(), "test.xsd", &mut schema_set, None)
+            .expect("the fixture schema loads");
+        let arena = Bump::new();
+        let doc = build_typed_document(
+            INSTANCE.as_bytes(),
+            &arena,
+            &schema_set,
+            BufferDocumentOptions::default(),
+        )
+        .expect("the fixture document is built");
+        let ctx = XPathContext::new(&schema_set.name_table).with_schema_set(&schema_set);
+        let named = |name: &str| {
+            let id = schema_set.name_table.get(name).expect("interned");
+            schema_set
+                .lookup_type(None, id)
+                .and_then(|tk| tk.as_simple())
+        };
+        let string = schema_set.get_built_in_simple_type_by_code(crate::types::XmlTypeCode::String);
+        let schema_types = |expr: &str| {
+            XPathExpr::compile(expr, &ctx)
+                .expect("compiles")
+                .evaluator(&ctx)
+                .run_with_node(doc.create_navigator())
+                .expect("evaluates")
+                .into_vec()
+                .into_iter()
+                .map(|item| match item {
+                    XmlItem::Atomic(v) => v.schema_type,
+                    XmlItem::Node(_) => panic!("a node"),
+                })
+                .collect::<Vec<_>>()
+        };
+        assert!(named("smallInt").is_some() && string.is_some());
+        assert_eq!(
+            schema_types("data(/doc/@s)"),
+            [named("smallInt"), named("smallInt")]
+        );
+        assert_eq!(
+            schema_types("data(/doc/@su)"),
+            [named("smallInt"), string, string]
         );
     }
 
@@ -5395,6 +5542,355 @@ mod list_atomization_tests {
                 ("distinct-values((data(/doc/@l), data(/doc/l)))", "a|b|p|q"),
             ],
             false,
+        );
+    }
+}
+
+/// `xs:QName` and `xs:NOTATION` values as strings.
+///
+/// F&O §17.1.2 (casting to xs:string and xs:untypedAtomic): "If ST is
+/// xs:QName or xs:NOTATION: if the qualified name has a prefix, then TV is the
+/// concatenation of the prefix of SV, a single colon (:), and the local name of
+/// SV. otherwise TV is the local-name." §2.3: `fn:string` of an atomic value
+/// "returns the same string as is returned by the expression " $arg cast as
+/// xs:string "". §11.2.1 `op:QName-equal` ignores the prefixes.
+mod qname_string_tests {
+    use bumpalo::Bump;
+
+    use crate::document::typed_builder::build_typed_document;
+    use crate::document::BufferDocumentOptions;
+    use crate::namespace::context::NamespaceContextSnapshot;
+    use crate::namespace::table::NameTable;
+    use crate::pipeline::load_and_process_schema;
+    use crate::schema::SchemaSet;
+    use crate::xpath::api::XPathExpr;
+    use crate::xpath::iterator::XmlItem;
+    use crate::xpath::{DomNavigator, RoXmlNavigator, XPathContext};
+
+    fn render<N: DomNavigator>(items: Vec<XmlItem<N>>) -> String {
+        if items.is_empty() {
+            return "()".to_string();
+        }
+        items
+            .iter()
+            .map(|item| match item {
+                XmlItem::Atomic(v) => v.to_string_value(),
+                XmlItem::Node(_) => "<node>".to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join("|")
+    }
+
+    fn code(e: crate::xpath::XPathError) -> String {
+        format!(
+            "error:{}",
+            e.error_code()
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("<no code> {e}"))
+        )
+    }
+
+    fn report(wrong: Vec<String>, total: usize) {
+        assert!(
+            wrong.is_empty(),
+            "{} of {} cases wrong:\n{}",
+            wrong.len(),
+            total,
+            wrong.join("\n")
+        );
+    }
+
+    /// Evaluate each case over an untyped document with `xs` bound.
+    fn check_untyped(xml: &str, cases: &[(&str, &str)]) {
+        let names = NameTable::new();
+        let mut namespaces = NamespaceContextSnapshot::default();
+        namespaces.bindings.push((
+            names.add("xs"),
+            names.add("http://www.w3.org/2001/XMLSchema"),
+        ));
+        let ctx = XPathContext::new(&names).with_namespaces(namespaces);
+        let doc = roxmltree::Document::parse(xml).expect("parse xml");
+        let mut wrong = Vec::new();
+        for (expr, expected) in cases {
+            let got = match XPathExpr::compile(expr, &ctx) {
+                Err(e) => code(e),
+                Ok(compiled) => compiled
+                    .evaluator(&ctx)
+                    .run_with_node(RoXmlNavigator::new(&doc))
+                    .map(|v| render(v.into_vec()))
+                    .unwrap_or_else(code),
+            };
+            if got != *expected {
+                wrong.push(format!("{expr}  =>  {got}   (expected {expected})"));
+            }
+        }
+        report(wrong, cases.len());
+    }
+
+    const SCHEMA: &str = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+      <xs:notation name="png" public="image/png"/>
+      <xs:simpleType name="fmt">
+        <xs:restriction base="xs:NOTATION"><xs:enumeration value="png"/></xs:restriction>
+      </xs:simpleType>
+      <xs:simpleType name="qnames"><xs:list itemType="xs:QName"/></xs:simpleType>
+      <xs:element name="doc">
+        <xs:complexType>
+          <xs:sequence><xs:element name="q" type="xs:QName"/></xs:sequence>
+          <xs:attribute name="q" type="xs:QName"/>
+          <xs:attribute name="u" type="xs:QName"/>
+          <xs:attribute name="f" type="fmt"/>
+          <xs:attribute name="ql" type="qnames"/>
+        </xs:complexType>
+      </xs:element>
+    </xs:schema>"#;
+
+    const INSTANCE: &str =
+        r#"<doc xmlns:p="urn:p" q="p:local" u="plain" f="png" ql="p:a p:b"><q>p:elem</q></doc>"#;
+
+    /// Evaluate each case over the validated instance (typed values from the
+    /// schema), with `xs` bound.
+    fn check_typed(cases: &[(&str, &str)]) {
+        let mut schema_set = SchemaSet::xsd11();
+        load_and_process_schema(SCHEMA.as_bytes(), "test.xsd", &mut schema_set, None)
+            .expect("the fixture schema loads");
+        let arena = Bump::new();
+        let doc = build_typed_document(
+            INSTANCE.as_bytes(),
+            &arena,
+            &schema_set,
+            BufferDocumentOptions::default(),
+        )
+        .expect("the fixture document is built");
+        let mut namespaces = NamespaceContextSnapshot::default();
+        namespaces.bindings.push((
+            schema_set.name_table.add("xs"),
+            schema_set
+                .name_table
+                .add("http://www.w3.org/2001/XMLSchema"),
+        ));
+        let ctx = XPathContext::new(&schema_set.name_table)
+            .with_namespaces(namespaces)
+            .with_schema_set(&schema_set);
+        let mut wrong = Vec::new();
+        for (expr, expected) in cases {
+            let got = match XPathExpr::compile(expr, &ctx) {
+                Err(e) => code(e),
+                Ok(compiled) => compiled
+                    .evaluator(&ctx)
+                    .run_with_node(doc.create_navigator())
+                    .map(|v| render(v.into_vec()))
+                    .unwrap_or_else(code),
+            };
+            if got != *expected {
+                wrong.push(format!("{expr}  =>  {got}   (expected {expected})"));
+            }
+        }
+        report(wrong, cases.len());
+    }
+
+    /// Every string conversion of a QName gives its lexical form.
+    #[test]
+    fn a_qname_converts_to_its_lexical_form() {
+        check_untyped(
+            r#"<p:e xmlns:p="urn:p" a="1"/>"#,
+            &[
+                ("QName('urn:x', 'p:l')", "p:l"),
+                ("string(QName('urn:x', 'p:l'))", "p:l"),
+                ("string(QName('', 'l'))", "l"),
+                ("xs:string(QName('urn:x', 'p:l'))", "p:l"),
+                ("QName('urn:x', 'p:l') cast as xs:string", "p:l"),
+                ("QName('urn:x', 'p:l') cast as xs:untypedAtomic", "p:l"),
+                ("xs:untypedAtomic(QName('', 'l'))", "l"),
+                ("QName('urn:x', 'p:l') castable as xs:string", "true"),
+                ("concat('[', QName('urn:x', 'p:l'), ']')", "[p:l]"),
+                (
+                    "string-join(for $q in (QName('urn:x', 'p:a'), QName('', 'b')) return string($q), ',')",
+                    "p:a,b",
+                ),
+                ("xs:QName('xs:integer')", "xs:integer"),
+                ("string(xs:QName('xs:integer'))", "xs:integer"),
+                ("node-name(/*)", "p:e"),
+                ("string(node-name(/*))", "p:e"),
+                ("string(node-name(/*/@a))", "a"),
+                ("resolve-QName('p:x', /*)", "p:x"),
+                ("string(resolve-QName('y', /*))", "y"),
+            ],
+        );
+    }
+
+    /// QName equality stays prefix-blind (F&O §11.2.1), also where values are
+    /// hashed.
+    #[test]
+    fn qname_equality_ignores_the_prefix() {
+        check_untyped(
+            "<e/>",
+            &[
+                ("QName('urn:x', 'p:l') eq QName('urn:x', 'q:l')", "true"),
+                ("QName('urn:x', 'p:l') eq QName('urn:y', 'p:l')", "false"),
+                ("QName('urn:x', 'p:l') = QName('urn:x', 'q:l')", "true"),
+                (
+                    "count(distinct-values((QName('urn:x', 'p:l'), QName('urn:x', 'q:l'))))",
+                    "1",
+                ),
+                (
+                    "index-of((QName('urn:y', 'l'), QName('urn:x', 'q:l')), QName('urn:x', 'p:l'))",
+                    "2",
+                ),
+            ],
+        );
+    }
+
+    /// The typed value of a QName- or NOTATION-typed node converts to its
+    /// lexical form too, members of a list of xs:QName included.
+    #[test]
+    fn typed_qname_and_notation_values_convert_to_their_lexical_form() {
+        check_typed(&[
+            ("data(/doc/@q)", "p:local"),
+            ("string(data(/doc/@q))", "p:local"),
+            ("data(/doc/@q) cast as xs:string", "p:local"),
+            ("string(data(/doc/@u))", "plain"),
+            ("data(/doc/q)", "p:elem"),
+            ("xs:string(data(/doc/q))", "p:elem"),
+            ("data(/doc/@f)", "png"),
+            ("xs:string(data(/doc/@f))", "png"),
+            ("data(/doc/@f) cast as xs:untypedAtomic", "png"),
+            ("data(/doc/@q) eq QName('urn:p', 'other:local')", "true"),
+            ("local-name-from-QName(data(/doc/@q))", "local"),
+            ("prefix-from-QName(data(/doc/@q))", "p"),
+            ("namespace-uri-from-QName(data(/doc/@q))", "urn:p"),
+            ("data(/doc/@ql)", "p:a|p:b"),
+            ("data(/doc/@ql)[2] eq QName('urn:p', 'b')", "true"),
+            ("namespace-uri-from-QName(data(/doc/@ql)[1])", "urn:p"),
+        ]);
+    }
+}
+
+/// `xs:NOTATION` values in the indexed general comparison and the compare
+/// cache, past the 64-pair prefix the pairwise loop walks first. XPath 2.0
+/// §3.5.1: "A eq B xs:NOTATION xs:NOTATION op:NOTATION-equal(A, B)", which
+/// ignores the prefixes as `op:QName-equal` does; §3.5.2: `=` is true when some
+/// pair compares true, `!=` when some pair compares false.
+mod notation_index_tests {
+    use bumpalo::Bump;
+
+    use crate::document::typed_builder::build_typed_document;
+    use crate::document::BufferDocumentOptions;
+    use crate::namespace::context::NamespaceContextSnapshot;
+    use crate::pipeline::load_and_process_schema;
+    use crate::schema::SchemaSet;
+    use crate::xpath::api::XPathExpr;
+    use crate::xpath::iterator::XmlItem;
+    use crate::xpath::XPathContext;
+
+    /// Two prefixes, `n` and `m`, bound to the target namespace; the
+    /// enumeration lists both spellings.
+    const SCHEMA: &str = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+        xmlns:n="urn:n" xmlns:m="urn:n" targetNamespace="urn:n">
+      <xs:notation name="gif" public="gif"/>
+      <xs:notation name="png" public="png"/>
+      <xs:notation name="jpg" public="jpg"/>
+      <xs:simpleType name="nt"><xs:restriction base="xs:NOTATION">
+        <xs:enumeration value="n:gif"/><xs:enumeration value="n:png"/>
+        <xs:enumeration value="n:jpg"/><xs:enumeration value="m:gif"/>
+        <xs:enumeration value="m:png"/><xs:enumeration value="m:jpg"/>
+      </xs:restriction></xs:simpleType>
+      <xs:complexType name="v"><xs:attribute name="v" type="n:nt"/></xs:complexType>
+      <xs:element name="doc"><xs:complexType><xs:sequence>
+        <xs:element name="a" form="unqualified" type="n:v" maxOccurs="unbounded"/>
+        <xs:element name="b" form="unqualified" type="n:v" maxOccurs="unbounded"/>
+        <xs:element name="c" form="unqualified" type="n:v" maxOccurs="unbounded"/>
+        <xs:element name="d" form="unqualified" type="n:v" maxOccurs="unbounded"/>
+        <xs:element name="q" form="unqualified">
+          <xs:complexType><xs:attribute name="v" type="xs:QName"/></xs:complexType>
+        </xs:element>
+      </xs:sequence></xs:complexType></xs:element>
+    </xs:schema>"#;
+
+    /// 70 + 1 `a` and 70 + 1 `b` (one equal pair, the last); 70 `c` and 70 `d`
+    /// that are all the same NOTATION, spelled `n:gif` and `m:gif`.
+    fn instance() -> String {
+        let mut xml = String::from(r#"<n:doc xmlns:n="urn:n" xmlns:m="urn:n">"#);
+        xml.push_str(&r#"<a v="n:png"/>"#.repeat(70));
+        xml.push_str(r#"<a v="n:gif"/>"#);
+        xml.push_str(&r#"<b v="m:jpg"/>"#.repeat(70));
+        xml.push_str(r#"<b v="m:gif"/>"#);
+        xml.push_str(&r#"<c v="n:gif"/>"#.repeat(70));
+        xml.push_str(&r#"<d v="m:gif"/>"#.repeat(70));
+        xml.push_str(r#"<q v="n:gif"/></n:doc>"#);
+        xml
+    }
+
+    #[test]
+    fn notations_with_different_prefixes_pair_in_the_index() {
+        let mut schema_set = SchemaSet::xsd11();
+        load_and_process_schema(SCHEMA.as_bytes(), "n.xsd", &mut schema_set, None)
+            .expect("the fixture schema loads");
+        let arena = Bump::new();
+        let xml = instance();
+        let doc = build_typed_document(
+            xml.as_bytes(),
+            &arena,
+            &schema_set,
+            BufferDocumentOptions::default(),
+        )
+        .expect("the fixture document is built");
+        let mut namespaces = NamespaceContextSnapshot::default();
+        namespaces.bindings.push((
+            schema_set.name_table.add("n"),
+            schema_set.name_table.add("urn:n"),
+        ));
+        let ctx = XPathContext::new(&schema_set.name_table)
+            .with_namespaces(namespaces)
+            .with_schema_set(&schema_set);
+        let cases = [
+            (
+                "data(/n:doc/a[last()]/@v) eq data(/n:doc/b[last()]/@v)",
+                "true",
+            ),
+            ("/n:doc/a/@v = /n:doc/b/@v", "true"),
+            ("data(/n:doc/a/@v) = data(/n:doc/b/@v)", "true"),
+            ("/n:doc/a[position() < 71]/@v = /n:doc/b/@v", "false"),
+            // The compare cache: the right operand is invariant in the predicate.
+            ("count(/n:doc/b[@v = /n:doc/a/@v])", "1"),
+            ("count(/n:doc/a[@v = /n:doc/b/@v])", "1"),
+            ("/n:doc/c/@v = /n:doc/d/@v", "true"),
+            ("/n:doc/c/@v != /n:doc/d/@v", "false"),
+            ("count(/n:doc/d[@v != /n:doc/c/@v])", "0"),
+            ("count(/n:doc/d[@v = /n:doc/c/@v])", "70"),
+            ("count(distinct-values(data(/n:doc/(c|d)/@v)))", "1"),
+            // A QName never meets a NOTATION (no row of the §3.5.1 table).
+            ("/n:doc/q/@v = /n:doc/c/@v", "error:XPTY0004"),
+        ];
+        let mut wrong = Vec::new();
+        for (expr, expected) in cases {
+            let got = match XPathExpr::compile(expr, &ctx) {
+                Err(e) => format!("static {e}"),
+                Ok(compiled) => match compiled
+                    .evaluator(&ctx)
+                    .run_with_node(doc.create_navigator())
+                {
+                    Err(e) => format!("error:{}", e.error_code().unwrap_or("<none>")),
+                    Ok(v) => v
+                        .into_vec()
+                        .iter()
+                        .map(|item| match item {
+                            XmlItem::Atomic(v) => v.to_string_value(),
+                            XmlItem::Node(_) => "<node>".to_string(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join("|"),
+                },
+            };
+            if got != expected {
+                wrong.push(format!("{expr}  =>  {got}   (expected {expected})"));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} of {} cases wrong:\n{}",
+            wrong.len(),
+            cases.len(),
+            wrong.join("\n")
         );
     }
 }
@@ -5607,10 +6103,11 @@ mod release_review_tests {
     /// X-02. XPath 2.0 §3.10.2 / §3.10.3: "In addition, the target type cannot
     /// be xs:NOTATION or xs:anyAtomicType [err:XPST0080]" — a static error,
     /// raised when the expression is compiled. Both stay legal in `instance of`
-    /// and `treat as`, where they are ordinary atomic types.
+    /// and `treat as`, where they are ordinary atomic types. Since 0.3.0 the
+    /// code has a variant of its own.
     #[test]
     fn cast_to_notation_or_any_atomic_type_is_xpst0080() {
-        use crate::xpath::error::{XPathError, XQT_ERRORS_NAMESPACE};
+        use crate::xpath::error::XPathError;
         let names = NameTable::new();
         let mut namespaces = crate::namespace::context::NamespaceContextSnapshot::default();
         namespaces.bindings.push((
@@ -5632,9 +6129,11 @@ mod release_review_tests {
                 Err(err) => err,
             };
             assert_eq!(err.error_code(), Some("XPST0080"), "{expr}: {err}");
-            let raised = err.raised_error().expect("an error QName");
-            assert_eq!(raised.namespace_uri, XQT_ERRORS_NAMESPACE);
-            assert!(!matches!(err, XPathError::XPST0051 { .. }));
+            assert!(
+                matches!(err, XPathError::XPST0080 { .. }),
+                "{expr}: {err:?}"
+            );
+            assert!(err.raised_error().is_none());
         }
         check(&[
             ("1 instance of xs:anyAtomicType", "true"),
@@ -5974,5 +6473,285 @@ mod release_review_tests {
             ("resolve-uri('a', 'file:///d/e')", "file:///d/a"),
             ("resolve-uri('http://y/z', '')", "http://y/z"),
         ]);
+    }
+
+    /// C63. F&O §8.1 raises FORG0002 when `$relative` "is not a valid URI
+    /// according to the rules of the xs:anyURI data type, or if it is not a
+    /// suitable relative reference"; Datatypes §3.3.17.2: "Spaces are, in
+    /// principle, allowed in the ·lexical space· of anyURI". A character the
+    /// IRI-to-URI escaping takes care of (a space, `<`, `{`, a non-ASCII
+    /// letter) resolves, and the result is not percent-encoded (W3C bug 20672);
+    /// a reference that stays malformed after escaping (two `#`, an empty
+    /// scheme) is still FORG0002.
+    #[test]
+    fn resolve_uri_resolves_references_with_characters_any_uri_allows() {
+        let base = "http://base.example.org/ns/";
+        let resolve = |relative: &str| format!("resolve-uri('{relative}', '{base}')");
+        check(&[
+            (
+                &resolve("two organizations"),
+                "http://base.example.org/ns/two organizations",
+            ),
+            (
+                &resolve("Hello There"),
+                "http://base.example.org/ns/Hello There",
+            ),
+            (
+                &resolve("Az Az , AA 13121-1314"),
+                "http://base.example.org/ns/Az Az , AA 13121-1314",
+            ),
+            (
+                &resolve("a<b>{c}|d^e`f\\g"),
+                "http://base.example.org/ns/a<b>{c}|d^e`f\\g",
+            ),
+            (
+                &resolve("caf\u{e9} x/../y z"),
+                "http://base.example.org/ns/y z",
+            ),
+            (
+                &resolve("a b?q r#f g"),
+                "http://base.example.org/ns/a b?q r#f g",
+            ),
+            // Absolute references are returned unchanged.
+            (&resolve("a:_underscore_"), "a:_underscore_"),
+            (&resolve("DOM:co"), "DOM:co"),
+            // A base with a space is a valid xs:anyURI too.
+            ("resolve-uri('c d', 'http://x/a b/')", "http://x/a b/c d"),
+            // Still FORG0002: malformed after escaping, or no suitable base.
+            (&resolve("##some.uri"), "error:FORG0002"),
+            (&resolve(":"), "error:FORG0002"),
+            (
+                "resolve-uri('a', 'http://localhost/base/##frag')",
+                "error:FORG0002",
+            ),
+            ("resolve-uri('a', 'http://x/a b/#f')", "error:FORG0002"),
+            ("resolve-uri('a', 'a b/')", "error:FORG0002"),
+        ]);
+    }
+
+    /// C64. F&O §11.2.2 `fn:prefix-from-QName($arg as xs:QName?) as
+    /// xs:NCName?`, §11.2.3 `fn:local-name-from-QName($arg as xs:QName?) as
+    /// xs:NCName?`, §11.2.4 `fn:namespace-uri-from-QName(…) as xs:anyURI?`;
+    /// §11.2.6 `fn:in-scope-prefixes`: "For namespaces that have a prefix, it
+    /// returns the prefix as an xs:NCName. For the default namespace, which has
+    /// no prefix, it returns the zero-length string." `fn:local-name` and
+    /// `fn:name` (§14.1, §14.2) return an `xs:string`.
+    #[test]
+    fn qname_accessors_return_the_types_f_and_o_names() {
+        let q = "QName('http://e/', 'p:person')";
+        let xml = r#"<a xmlns="urn:d" xmlns:p="urn:p"/>"#;
+        check_on(
+            Some(xml),
+            &[
+                (
+                    &format!("local-name-from-QName({q}) instance of xs:NCName"),
+                    "true",
+                ),
+                (&format!("local-name-from-QName({q})"), "person"),
+                (
+                    &format!("prefix-from-QName({q}) instance of xs:NCName"),
+                    "true",
+                ),
+                (&format!("prefix-from-QName({q})"), "p"),
+                ("prefix-from-QName(QName('http://e/', 'person'))", "()"),
+                ("local-name-from-QName(())", "()"),
+                (
+                    &format!("namespace-uri-from-QName({q}) instance of xs:anyURI"),
+                    "true",
+                ),
+                (
+                    "namespace-uri-for-prefix('p', /*) instance of xs:anyURI",
+                    "true",
+                ),
+                (
+                    "in-scope-prefixes(/*)[. = 'p'] instance of xs:NCName",
+                    "true",
+                ),
+                (
+                    "in-scope-prefixes(/*)[. = 'xml'] instance of xs:NCName",
+                    "true",
+                ),
+                (
+                    "in-scope-prefixes(/*)[. = ''] instance of xs:NCName",
+                    "false",
+                ),
+                (
+                    "in-scope-prefixes(/*)[. = ''] instance of xs:string",
+                    "true",
+                ),
+                ("count(in-scope-prefixes(/*))", "3"),
+                // The node accessors stay xs:string.
+                ("local-name(/*) instance of xs:NCName", "false"),
+                ("local-name(/*) instance of xs:string", "true"),
+                ("name(/*) instance of xs:NCName", "false"),
+            ],
+        );
+    }
+}
+
+/// Wave B (B2, B3): `fn:error` as a built-in, the XPDY0050 audit and its
+/// messages.
+mod wave_b_error_tests {
+    use super::spec_helpers::{error_code, one};
+    use crate::namespace::table::NameTable;
+    use crate::xpath::api::XPathExpr;
+    use crate::xpath::error::{XPathError, DEFAULT_RAISED_ERROR, XQT_ERRORS_NAMESPACE};
+    use crate::xpath::{RoXmlNavigator, XPathContext};
+
+    /// Compile and evaluate `expr` over `<a/>`, expecting an error.
+    fn raised(expr: &str) -> XPathError {
+        let names = NameTable::new();
+        let mut namespaces = crate::namespace::context::NamespaceContextSnapshot::default();
+        namespaces.bindings.push((
+            names.add("xs"),
+            names.add("http://www.w3.org/2001/XMLSchema"),
+        ));
+        let ctx = XPathContext::new(&names).with_namespaces(namespaces);
+        let compiled = XPathExpr::compile(expr, &ctx).unwrap_or_else(|e| panic!("{expr}: {e}"));
+        let doc = roxmltree::Document::parse("<a/>").expect("parse xml");
+        match compiled
+            .evaluator(&ctx)
+            .run_with_node(RoXmlNavigator::new(&doc))
+        {
+            Ok(value) => panic!("{expr}: expected an error, got {} items", value.len()),
+            Err(e) => e,
+        }
+    }
+
+    /// F&O 1.0 §3: `fn:error() as none`, `fn:error($error as xs:QName) as
+    /// none`, `fn:error($error as xs:QName?, $description as xs:string) as
+    /// none`, `fn:error($error as xs:QName?, $description as xs:string,
+    /// $error-object as item()*) as none` — a built-in, with no host
+    /// registration.
+    #[test]
+    fn fn_error_is_a_built_in_with_four_signatures() {
+        // No arguments: `err:FOER0000`.
+        let e = raised("error()");
+        assert_eq!(e.error_code(), Some("FOER0000"));
+        let r = e.raised_error().expect("an error QName");
+        assert_eq!(
+            (r.namespace_uri, r.local_name),
+            (XQT_ERRORS_NAMESPACE, DEFAULT_RAISED_ERROR)
+        );
+        // One argument: the QName as given.
+        let e = raised("error(QName('urn:x', 'x:boom'))");
+        let r = e.raised_error().expect("an error QName");
+        assert_eq!((r.namespace_uri, r.local_name), ("urn:x", "boom"));
+        assert_eq!(r.description, None);
+        assert_eq!(e.error_code(), None);
+        // Two arguments; an empty first argument is `err:FOER0000`.
+        let e = raised("error((), 'why')");
+        assert_eq!(e.error_code(), Some("FOER0000"));
+        assert_eq!(e.raised_error().unwrap().description, Some("why"));
+        let e = raised("error(QName('', 'local'), 'why')");
+        let r = e.raised_error().unwrap();
+        assert_eq!((r.namespace_uri, r.local_name), ("", "local"));
+        // Three arguments.
+        let e = raised("error(QName('urn:x', 'x:boom'), 'why', (1, 'two', /a))");
+        assert_eq!(e.raised_error().unwrap().local_name, "boom");
+        // The declared argument types are enforced.
+        assert_eq!(error_code("error(())", "<a/>"), "XPTY0004");
+        assert_eq!(error_code("error((), 42)", "<a/>"), "XPTY0004");
+        // Arity 4 is not a signature.
+        assert_eq!(error_code("error((), 'a', 1, 2)", "<a/>"), "XPST0017");
+        // A call that is never evaluated raises nothing.
+        assert_eq!(one("if (true()) then 1 else error()", "<a/>"), "1");
+    }
+
+    /// XPath 2.0 §3.10.5: a failed `treat as` "raises a dynamic error
+    /// [err:XPDY0050]"; the message says what was expected and what was found.
+    #[test]
+    fn a_failed_treat_says_what_was_expected_and_found() {
+        let e = raised("(1, 2) treat as xs:integer");
+        assert_eq!(e.error_code(), Some("XPDY0050"));
+        let text = e.to_string();
+        assert!(text.contains("xs:integer"), "{text}");
+        assert!(text.contains("2 items"), "{text}");
+
+        let e = raised("'a' treat as xs:integer?");
+        let text = e.to_string();
+        assert!(text.contains("xs:integer?"), "{text}");
+        assert!(text.contains("xs:string"), "{text}");
+
+        let e = raised("() treat as element(a)+");
+        let text = e.to_string();
+        assert!(text.contains("element(a)+"), "{text}");
+        assert!(text.contains("empty sequence"), "{text}");
+
+        let e = raised("/a treat as attribute()");
+        let text = e.to_string();
+        assert!(text.contains("attribute()"), "{text}");
+        assert!(text.contains("element"), "{text}");
+
+        let e = raised("1 treat as empty-sequence()");
+        assert!(e.to_string().contains("empty-sequence()"), "{e}");
+    }
+
+    /// XPath 2.0 §3.10.4: "For every atomic type in the in-scope schema types
+    /// (except xs:NOTATION and xs:anyAtomicType, which are not instantiable), a
+    /// constructor function is implicitly defined." So `xs:NOTATION(…)` and
+    /// `xs:anyAtomicType(…)` name no function at all (XPST0017), while the
+    /// `cast` to either is XPST0080 (§3.10.2).
+    #[test]
+    fn there_is_no_constructor_for_notation_or_any_atomic_type() {
+        use super::spec_helpers::try_items;
+        assert_eq!(
+            [
+                try_items("xs:NOTATION('a')", "<a/>"),
+                try_items("xs:anyAtomicType('a')", "<a/>"),
+                try_items("'a' cast as xs:anyAtomicType", "<a/>"),
+                try_items("xs:string('a')", "<a/>"),
+            ],
+            [
+                Err("XPST0017".to_string()),
+                Err("XPST0017".to_string()),
+                Err("XPST0080".to_string()),
+                Ok(vec!["a".to_string()]),
+            ]
+        );
+    }
+
+    /// R13: XPath 2.0 §2.5.1 — "The in-scope schema types in the static
+    /// context are initialized with a set of predefined schema types that is
+    /// determined by the host language." This engine's predefined types are
+    /// the built-in types it knows, the XSD 1.1 `xs:dateTimeStamp` and
+    /// `xs:error` included, whatever schema set (or none) is attached — the
+    /// same set for an `AtomicType`, a cast, a constructor function and the
+    /// `TypeName` of an element or attribute test.
+    #[test]
+    fn the_predefined_types_include_the_xsd_1_1_built_ins_without_a_schema() {
+        use super::spec_helpers::try_items;
+        assert_eq!(
+            [
+                try_items(
+                    "xs:dateTimeStamp('2000-01-01T00:00:00Z') instance of xs:dateTimeStamp",
+                    "<a/>"
+                ),
+                try_items(
+                    "'2000-01-01T00:00:00Z' castable as xs:dateTimeStamp",
+                    "<a/>"
+                ),
+                try_items("/a instance of element(*, xs:dateTimeStamp)", "<a/>"),
+                try_items("/a instance of element(*, xs:error)", "<a/>"),
+                try_items("/a instance of element(*, xs:nosuch)", "<a/>"),
+            ],
+            [
+                Ok(vec!["true".to_string()]),
+                Ok(vec!["true".to_string()]),
+                Ok(vec!["false".to_string()]),
+                Ok(vec!["false".to_string()]),
+                Err("XPST0008".to_string()),
+            ]
+        );
+    }
+
+    /// "More than one item where one is expected" is XPTY0004 (§3.1.5, §3.4,
+    /// §3.10.2), not `treat as`'s XPDY0050.
+    #[test]
+    fn more_than_one_item_is_a_type_error() {
+        assert_eq!(
+            XPathError::more_than_one_item().error_code(),
+            Some("XPTY0004")
+        );
     }
 }

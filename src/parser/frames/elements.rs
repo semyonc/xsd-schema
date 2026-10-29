@@ -304,7 +304,7 @@ pub struct AttributeFrame {
     fixed_value: Option<String>,
     use_kind: Option<String>,
     form: Option<String>,
-    inheritable: bool,
+    inheritable: Option<bool>,
     id: Option<String>,
     annotation: Option<Annotation>,
     /// True once a non-annotation child has been seen — annotation must come first.
@@ -357,7 +357,7 @@ impl AttributeFrame {
             .get_value_by_name(name_table, "form")
             .map(String::from);
 
-        let inheritable = parse_bool_attr_default(attrs, name_table, "inheritable", false)?;
+        let inheritable = parse_optional_bool_attr(attrs, name_table, "inheritable")?;
 
         let id = attrs
             .get_value_by_name(name_table, "id")

@@ -156,7 +156,7 @@ impl ExactDecimal {
     }
 
     /// [`ExactDecimal::from_value`] for one atomic payload typed `type_code`
-    /// (a list member, say, typed by its list's item type).
+    /// (the payload of a value whose type code is known apart from it).
     pub(crate) fn from_atomic(type_code: XmlTypeCode, atom: &XmlAtomicValue) -> Option<Self> {
         match atom {
             XmlAtomicValue::Decimal(d) => Some(Self::from_decimal(d)),
@@ -426,69 +426,23 @@ pub(crate) fn lexical_decimal(value: &XmlValue) -> Option<&str> {
 }
 
 /// The first `xs:decimal` value inside `value` — the value itself, a union's
-/// member value, or a list member — that is carried in lexical form.
+/// member value, or a list member — that is carried in lexical form. A list
+/// member carries the type that validated it, so a member of a list whose
+/// item type is a union counts exactly when the union's decimal member type
+/// accepted it.
 pub(crate) fn first_lexical_decimal(value: &XmlValue) -> Option<&str> {
     match &value.value {
         XmlValueKind::Atomic(_) => lexical_decimal(value),
         XmlValueKind::Union(inner) => first_lexical_decimal(inner),
-        XmlValueKind::List { item_type, items }
-            if list_strings_are_capacity_decimals(*item_type, items, None) =>
-        {
-            items.iter().find_map(|atom| match atom {
-                XmlAtomicValue::String(s) => Some(s.as_str()),
-                _ => None,
-            })
-        }
-        _ => None,
+        XmlValueKind::List { items, .. } => items.iter().find_map(first_lexical_decimal),
+        XmlValueKind::UntypedAtomic(_) => None,
     }
-}
-
-/// Whether `member`, a list member stored as a string, spells an `xs:decimal`
-/// that `rust_decimal::Decimal` cannot hold exactly — the only kind of decimal
-/// the validator stores as a string.
-pub(crate) fn is_capacity_decimal_member(member: &str) -> bool {
-    super::validators::is_valid_xsd_decimal_lexical(member) && parse_decimal_exact(member).is_err()
-}
-
-/// Whether the members of a packed list value that are stored as strings are
-/// `xs:decimal` values beyond `rust_decimal`'s capacity, so that they are
-/// typed `xs:decimal` (with their canonical string as the value) rather than
-/// `xs:string`.
-///
-/// A list whose item type is in the `xs:decimal` family stores exactly its
-/// members beyond capacity as strings (every other member is a `Decimal` or
-/// `Integer`). A list whose item type is a **union** stores *every* member as
-/// a string, whichever member type validated it, and its `item_type` is the
-/// type of its last member — so `item_type == Decimal` says nothing about the
-/// other members, and a string such as `20` that a union's `xs:string` member
-/// validated must stay an `xs:string` (as in 0.2.2). `item_type_is_union` is
-/// that fact when the caller has the schema (`Some`); without it (`None`), a
-/// list counts only when every member it stores as a string is a decimal
-/// spelling no `Decimal` holds — never one holding a representable number or
-/// a non-numeric string, which only a union list stores as a string.
-pub(crate) fn list_strings_are_capacity_decimals(
-    item_type: XmlTypeCode,
-    items: &[XmlAtomicValue],
-    item_type_is_union: Option<bool>,
-) -> bool {
-    if item_type != XmlTypeCode::Decimal || item_type_is_union == Some(true) {
-        return false;
-    }
-    let mut any = false;
-    for atom in items {
-        if let XmlAtomicValue::String(s) = atom {
-            if !is_capacity_decimal_member(s) {
-                return false;
-            }
-            any = true;
-        }
-    }
-    any
 }
 
 /// Value equality of two `xs:decimal`-family values when at least one of them
 /// is not a plain `Decimal`/`Integer` pair that `PartialEq` already compares
 /// by value; `None` when either is not of the family.
+#[cfg_attr(not(feature = "xsd11"), allow(dead_code))] // XPath only
 pub(crate) fn decimal_values_equal(a: &XmlValue, b: &XmlValue) -> Option<bool> {
     Some(ExactDecimal::from_value(a)? == ExactDecimal::from_value(b)?)
 }

@@ -12,16 +12,24 @@
 //!
 //! The verdicts and the reported errors must not change, so the tests compare
 //! the code below with the current code. Only the parts that changed are
-//! copied; the element–wildcard and wildcard–wildcard checks, the epsilon
-//! closure and the error conversion are shared.
+//! copied; the element–wildcard and wildcard–wildcard checks and the error
+//! conversion are shared.
+//!
+//! The epsilon closure changed after 0.2.3 (P15): it reuses its visited set
+//! and collects the terms in state order instead of a `HashSet`'s order, which
+//! fixes the pair a conflict reports. The 0.2.3 closure is copied below; with
+//! it the reported pair depends on hashing, so the tests compare it with the
+//! current one by the terms reached, and whole checks by verdict, violation
+//! kind and state.
+
+use std::collections::HashSet;
 
 use super::{
-    check_element_wildcard_conflicts, check_wildcard_wildcard_conflicts,
-    epsilon_closure_with_terms, same_particle_origin, upa_error_to_schema_error, ReachableTerm,
-    UpaError, UpaResult,
+    check_element_wildcard_conflicts, check_wildcard_wildcard_conflicts, same_particle_origin,
+    upa_error_to_schema_error, ReachableTerm, ReachableTerms, UpaError, UpaResult,
 };
 use crate::compiler::all_group::AllGroupModel;
-use crate::compiler::nfa::{NfaTable, NfaTerm, StateId};
+use crate::compiler::nfa::{NfaTable, NfaTerm, StateId, TransitionKind};
 use crate::compiler::substitution::{
     build_substitution_group_map, build_substitution_group_map_with_abstract, SubstitutableNameSet,
     SubstitutionGroupMap,
@@ -179,7 +187,6 @@ pub(super) fn check_upa(
                 &reachable.wildcards,
                 state.id,
                 target_namespace,
-                xsd_version,
                 schema_set,
                 &substitution_sets,
             ) {
@@ -188,12 +195,9 @@ pub(super) fn check_upa(
         }
 
         // Check wildcard-wildcard conflicts (always an error)
-        if let Err(error) = check_wildcard_wildcard_conflicts(
-            &reachable.wildcards,
-            state.id,
-            target_namespace,
-            xsd_version,
-        ) {
+        if let Err(error) =
+            check_wildcard_wildcard_conflicts(&reachable.wildcards, state.id, target_namespace)
+        {
             return Err(upa_error_to_schema_error(schema_set, error));
         }
     }
@@ -207,7 +211,6 @@ pub(super) fn check_all_group_upa(
     schema_set: &SchemaSet,
     target_namespace: Option<NameId>,
 ) -> SchemaResult<()> {
-    let xsd_version = schema_set.xsd_version;
     let substitution_sets = substitution_map_per_call(schema_set);
 
     let mut elements: Vec<ReachableTerm> = Vec::new();
@@ -236,14 +239,54 @@ pub(super) fn check_all_group_upa(
         return Err(upa_error_to_schema_error(schema_set, error));
     }
 
-    if let Err(error) = check_wildcard_wildcard_conflicts(
-        &wildcards,
-        ALL_GROUP_STATE_ID,
-        target_namespace,
-        xsd_version,
-    ) {
+    if let Err(error) =
+        check_wildcard_wildcard_conflicts(&wildcards, ALL_GROUP_STATE_ID, target_namespace)
+    {
         return Err(upa_error_to_schema_error(schema_set, error));
     }
 
     Ok(())
+}
+
+/// 0.2.3 `epsilon_closure_with_terms`: the closure in a fresh `HashSet` per
+/// state, its terms in that set's iteration order.
+pub(super) fn epsilon_closure_with_terms(nfa: &NfaTable, start_state: StateId) -> ReachableTerms {
+    let mut result = ReachableTerms::default();
+    let mut closure = HashSet::new();
+    let mut stack = vec![start_state];
+
+    // Compute epsilon closure
+    while let Some(state_id) = stack.pop() {
+        if !closure.insert(state_id) {
+            continue;
+        }
+
+        if let Some(state) = nfa.get_state(state_id) {
+            for transition in &state.transitions {
+                if transition.kind == TransitionKind::Epsilon {
+                    stack.push(transition.target);
+                }
+            }
+        }
+    }
+
+    // Collect terms from states in the closure that have terms
+    // These are the states where we can consume input
+    for &state_id in &closure {
+        if let Some(state) = nfa.get_state(state_id) {
+            if let Some(term) = &state.term {
+                let reachable = ReachableTerm {
+                    term: term.clone(),
+                    origin: state.origin.clone(),
+                };
+
+                match term {
+                    NfaTerm::Element { .. } => result.elements.push(reachable),
+                    NfaTerm::Wildcard { .. } => result.wildcards.push(reachable),
+                }
+            }
+        }
+    }
+
+    result
 }

@@ -15,7 +15,7 @@ where
         Some(value) => {
             let parsed = parse(value).map_err(|err| {
                 SchemaError::structural(
-                    "ct-props-correct",
+                    "s4s-att-invalid-value",
                     format!("Invalid value for attribute '{}': {}", name, err),
                     None,
                 )
@@ -64,7 +64,7 @@ fn parse_occurs_attr_raw(
         Some(value) => {
             let parsed = parse_occurs(value).map_err(|err| {
                 SchemaError::structural(
-                    "ct-props-correct",
+                    "s4s-att-invalid-value",
                     format!("Invalid value for attribute '{}': {}", name, err),
                     None,
                 )
@@ -84,7 +84,7 @@ fn parse_min_occurs_attr(
         None => Ok(1),
         Some(Some(value)) => Ok(value),
         Some(None) => Err(SchemaError::structural(
-            "ct-props-correct",
+            "s4s-att-invalid-value",
             format!("Invalid value for attribute '{}': 'unbounded'", name),
             None,
         )),
@@ -438,6 +438,9 @@ pub(crate) fn parse_not_qname(
 /// as `nonNegativeInteger`/`positiveInteger`) and strips an optional leading `+`.
 fn parse_nonneg_integer<T: std::str::FromStr>(value: &str, facet_name: &str) -> SchemaResult<T> {
     let trimmed = value.trim();
+    // An `xs:nonNegativeInteger`: zero "may be preceded by a positive ("+") or
+    // a negative ("-") sign" (XSD 1.0 §3.3.20.1, Datatypes 1.1 §3.4.20.1).
+    let trimmed = crate::types::validators::unsigned_lexical(trimmed);
     let text = trimmed.strip_prefix('+').unwrap_or(trimmed);
     text.parse().map_err(|_| {
         SchemaError::structural(
@@ -450,7 +453,7 @@ fn parse_nonneg_integer<T: std::str::FromStr>(value: &str, facet_name: &str) -> 
 
 /// Apply a facet to a facet set
 fn apply_facet(facets: &mut FacetSet, facet: FacetResult) -> SchemaResult<()> {
-    use crate::types::facets::{FacetFixed, WhitespaceMode};
+    use crate::types::facets::{normalize_whitespace, FacetFixed, WhitespaceMode};
 
     let fixed = if facet.fixed {
         FacetFixed::Fixed
@@ -520,11 +523,24 @@ fn apply_facet(facets: &mut FacetSet, facet: FacetResult) -> SchemaResult<()> {
         }
         FacetKind::WhiteSpace => {
             if facets.whitespace.is_some() { return Err(dup("whiteSpace")); }
-            let mode = match facet.value.as_str() {
+            // The `value` is an `xs:NMTOKEN` in the schema for schemas
+            // (Datatypes Appendix A), so it is read after whitespace collapse;
+            // §4.3.6 (XSD 1.0 alike): "The value of whiteSpace must be one of
+            // {preserve, replace, collapse}".
+            let mode = match normalize_whitespace(&facet.value, WhitespaceMode::Collapse).as_ref() {
                 "preserve" => WhitespaceMode::Preserve,
                 "replace" => WhitespaceMode::Replace,
                 "collapse" => WhitespaceMode::Collapse,
-                _ => WhitespaceMode::Collapse,
+                other => {
+                    return Err(SchemaError::structural(
+                        "st-props-correct",
+                        format!(
+                            "Invalid whiteSpace value '{}': expected 'preserve', 'replace', or 'collapse'",
+                            other
+                        ),
+                        None,
+                    ));
+                }
             };
             facets.set_whitespace(mode, fixed, facet.source);
         }
@@ -539,8 +555,9 @@ fn apply_facet(facets: &mut FacetSet, facet: FacetResult) -> SchemaResult<()> {
         }
         FacetKind::ExplicitTimezone => {
             if facets.explicit_timezone.is_some() { return Err(dup("explicitTimezone")); }
-            // XSD 1.1 §4.3.16: explicitTimezone value must be one of required/prohibited/optional.
-            let mode = match facet.value.as_str() {
+            // XSD 1.1 §4.3.16: explicitTimezone value must be one of required/prohibited/optional
+            // (an `xs:NMTOKEN`, read after whitespace collapse, as for whiteSpace).
+            let mode = match normalize_whitespace(&facet.value, WhitespaceMode::Collapse).as_ref() {
                 "required" => ExplicitTimezone::Required,
                 "prohibited" => ExplicitTimezone::Prohibited,
                 "optional" => ExplicitTimezone::Optional,

@@ -28,6 +28,7 @@
 mod attributes;
 mod complex;
 mod constraints;
+mod counts;
 mod normalize;
 mod particle;
 mod redefine;

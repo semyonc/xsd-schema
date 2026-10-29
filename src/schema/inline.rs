@@ -30,12 +30,11 @@ use std::collections::{HashMap, HashSet};
 
 use crate::error::{SchemaError, SchemaResult};
 use crate::ids::*;
-use crate::namespace::NameTable;
 use crate::parser::frames::{
-    ComplexContentResult, ElementFrameResult, IdentityKind, IdentityResult, ParticleResult,
-    ParticleTerm, QNameRef, TypeFrameResult, TypeRefResult,
+    ComplexContentResult, ElementFrameResult, IdentityKind, ParticleResult, ParticleTerm, QNameRef,
+    TypeFrameResult, TypeRefResult,
 };
-use crate::parser::location::{SourceMapStorage, SourceRef};
+use crate::parser::location::SourceRef;
 use crate::schema::model::DerivationSet;
 use crate::schema::SchemaSet;
 
@@ -533,59 +532,6 @@ fn collect_content_particle_elements_recursive(
     }
 }
 
-/// Check that a keyref's refer target is not a keyref and has matching field count.
-fn check_keyref_target(
-    ic: &IdentityResult,
-    target_kind: IdentityKind,
-    target_field_count: usize,
-    refer_name: NameId,
-    name_table: &NameTable,
-    source_maps: &SourceMapStorage,
-) -> SchemaResult<()> {
-    if target_kind == IdentityKind::Keyref {
-        let ic_name = name_table.resolve_ref(ic.name);
-        let refer_name_str = name_table.resolve_ref(refer_name);
-        let location = ic.source.as_ref().and_then(|s| source_maps.locate(s));
-        return Err(SchemaError::structural(
-            "src-identity-constraint",
-            format!(
-                "Keyref '{}': refer target '{}' is a keyref, not a key or unique",
-                ic_name, refer_name_str
-            ),
-            location,
-        ));
-    }
-    if ic.fields.len() != target_field_count {
-        let ic_name = name_table.resolve_ref(ic.name);
-        let refer_name_str = name_table.resolve_ref(refer_name);
-        let location = ic.source.as_ref().and_then(|s| source_maps.locate(s));
-        return Err(SchemaError::structural(
-            "src-identity-constraint",
-            format!(
-                "Keyref '{}': has {} field(s) but refer target '{}' has {} field(s)",
-                ic_name,
-                ic.fields.len(),
-                refer_name_str,
-                target_field_count
-            ),
-            location,
-        ));
-    }
-    Ok(())
-}
-
-/// Validate keyref constraints: refer must resolve to a key/unique with matching
-/// field count (§3.11.4, §3.11.6).
-///
-/// First checks the current element's ICs. If not found locally, performs a
-/// global fallback search across the arena (the spec's `{referenced key}` is
-/// resolved globally in the IC definition symbol space, not restricted to the
-/// same element — the target may be on an ancestor element).
-/// Resolve an XSD 1.1 identity constraint @ref to the referenced IC key.
-///
-/// §3.11.2: the corresponding schema component is the identity-constraint
-/// definition resolved to by the actual value of the ref [attribute].
-/// §3.11.6 clause 5: the referenced IC's category must match the element tag.
 /// Resolve an XSD 1.1 identity constraint @ref to the referenced IC key.
 ///
 /// §3.11.2: the corresponding schema component is the identity-constraint
@@ -676,91 +622,81 @@ pub(crate) fn resolve_ic_ref(
     Ok(target_key)
 }
 
-pub(crate) fn validate_keyref_refers(
-    identity_constraints: &[IdentityResult],
-    target_namespace: Option<NameId>,
-    name_table: &NameTable,
-    source_maps: &SourceMapStorage,
-    ic_arena: &slotmap::SlotMap<IdentityConstraintKey, IdentityConstraintData>,
-    documents: &[crate::schema::model::SchemaDocument],
+/// Validate every keyref's `refer` (§3.11.2 {referenced key}, §3.11.6
+/// Identity-constraint Definition Properties Correct clause 2): it must name a
+/// key or unique, with as many fields as the keyref has.
+///
+/// Run once every identity-constraint definition of the schema is in the
+/// arena — top-level and local elements, every schema document — because the
+/// definitions form one symbol space (§3.11.1): a `refer` may name a
+/// definition that comes later in its document, sits on a local element
+/// allocated later, or lives in another schema document of the namespace.
+/// An unqualified `refer` without a default namespace falls back to the
+/// keyref's target namespace, as the runtime's lookup does.
+pub(crate) fn validate_all_keyref_refers(
+    schema_set: &crate::schema::SchemaSet,
 ) -> SchemaResult<()> {
-    for ic in identity_constraints {
+    let doc_ns = |source: Option<&SourceRef>| {
+        source
+            .and_then(|s| schema_set.documents.get(s.doc_id as usize))
+            .and_then(|d| d.target_namespace)
+    };
+    for (_key, ic) in schema_set.arenas.identity_constraints.iter() {
         if ic.kind != IdentityKind::Keyref {
             continue;
         }
-        if let Some(refer) = &ic.refer {
-            let refer_name = refer.local_name;
-            let refer_ns = refer.namespace;
-            // Find the referenced constraint on the same element
-            let target = identity_constraints.iter().find(|other| {
-                other.name == refer_name && (refer_ns.is_none() || refer_ns == target_namespace)
+        let Some(refer) = &ic.refer else {
+            continue;
+        };
+        let refer_ns = refer.namespace.or(doc_ns(ic.source.as_ref()));
+        let target = schema_set
+            .arenas
+            .identity_constraints
+            .values()
+            .find(|other| {
+                other.name == refer.local_name && doc_ns(other.source.as_ref()) == refer_ns
             });
-            match target {
-                None => {
-                    // Not found locally — search globally in the IC arena
-                    // (target may be on an ancestor element)
-                    // Fall back to target_namespace for unqualified refer (matches runtime
-                    // resolve_refer_key which does refer.namespace.or(compiled.target_namespace))
-                    let effective_refer_ns = refer_ns.or(target_namespace);
-                    let global_target = ic_arena.values().find(|ic_data| {
-                        if ic_data.name != refer_name {
-                            return false;
-                        }
-                        // Resolve the IC's namespace via its source document.
-                        // If the document is not yet in `documents` (current
-                        // schema being assembled — `documents.push` happens
-                        // after `assemble_schema` returns), fall back to the
-                        // assembler's `target_namespace`. Distinguish "doc
-                        // missing" from "doc.target_namespace is None" so
-                        // genuinely no-namespace ICs are not coerced.
-                        let ic_ns = match ic_data
-                            .source
-                            .as_ref()
-                            .map(|s| documents.get(s.doc_id as usize))
-                        {
-                            Some(Some(d)) => d.target_namespace,
-                            Some(None) => target_namespace,
-                            None => None,
-                        };
-                        effective_refer_ns == ic_ns
-                    });
-                    match global_target {
-                        Some(target_data) => {
-                            check_keyref_target(
-                                ic,
-                                target_data.kind,
-                                target_data.fields.len(),
-                                refer_name,
-                                name_table,
-                                source_maps,
-                            )?;
-                        }
-                        None => {
-                            let ic_name = name_table.resolve_ref(ic.name);
-                            let refer_name_str = name_table.resolve_ref(refer_name);
-                            let location = ic.source.as_ref().and_then(|s| source_maps.locate(s));
-                            return Err(SchemaError::structural(
-                                "src-identity-constraint",
-                                format!(
-                                    "Keyref '{}': refer target '{}' not found among identity constraints",
-                                    ic_name, refer_name_str
-                                ),
-                                location,
-                            ));
-                        }
-                    }
-                }
-                Some(target_ic) => {
-                    check_keyref_target(
-                        ic,
-                        target_ic.kind,
-                        target_ic.fields.len(),
-                        refer_name,
-                        name_table,
-                        source_maps,
-                    )?;
-                }
+        let location = ic
+            .source
+            .as_ref()
+            .and_then(|s| schema_set.source_maps.locate(s));
+        let ic_name = schema_set.name_table.resolve_ref(ic.name);
+        let refer_name = schema_set.name_table.resolve_ref(refer.local_name);
+        match target {
+            None => {
+                return Err(SchemaError::structural(
+                    "src-identity-constraint",
+                    format!(
+                        "Keyref '{}': refer target '{}' not found among identity constraints",
+                        ic_name, refer_name
+                    ),
+                    location,
+                ));
             }
+            Some(target) if target.kind == IdentityKind::Keyref => {
+                return Err(SchemaError::structural(
+                    "src-identity-constraint",
+                    format!(
+                        "Keyref '{}': refer target '{}' is a keyref, not a key or unique",
+                        ic_name, refer_name
+                    ),
+                    location,
+                ));
+            }
+            Some(target) if target.fields.len() != ic.fields.len() => {
+                return Err(SchemaError::structural(
+                    "src-identity-constraint",
+                    format!(
+                        "Keyref '{}': has {} field(s) but refer target '{}' has {} field(s)",
+                        ic_name,
+                        ic.fields.len(),
+                        refer_name,
+                        target.fields.len()
+                    ),
+                    location,
+                ));
+            }
+            Some(_) => {}
         }
     }
     Ok(())
@@ -898,14 +834,6 @@ pub fn allocate_content_particle_elements(schema_set: &mut SchemaSet) -> SchemaR
             job.elem.source.as_ref(),
             job.target_namespace,
         );
-        validate_keyref_refers(
-            &job.elem.identity_constraints,
-            job.target_namespace,
-            &schema_set.name_table,
-            &schema_set.source_maps,
-            &schema_set.arenas.identity_constraints,
-            &schema_set.documents,
-        )?;
         let mut identity_constraint_keys = Vec::with_capacity(job.elem.identity_constraints.len());
         for ic in job.elem.identity_constraints {
             // Check per-document uniqueness using the IC's source document
@@ -1177,14 +1105,6 @@ pub fn allocate_model_group_particle_elements(schema_set: &mut SchemaSet) -> Sch
             job.elem.source.as_ref(),
             job.target_namespace,
         );
-        validate_keyref_refers(
-            &job.elem.identity_constraints,
-            job.target_namespace,
-            &schema_set.name_table,
-            &schema_set.source_maps,
-            &schema_set.arenas.identity_constraints,
-            &schema_set.documents,
-        )?;
         let mut identity_constraint_keys = Vec::with_capacity(job.elem.identity_constraints.len());
         for ic in job.elem.identity_constraints {
             // Check per-document uniqueness using the IC's source document

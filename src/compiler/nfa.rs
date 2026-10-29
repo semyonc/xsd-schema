@@ -845,13 +845,16 @@ pub fn epsilon_closure(
 }
 
 /// Match an element name against an NfaTerm with optional substitution groups.
+///
+/// `_xsd_version` is not used: no wildcard namespace constraint depends on the
+/// XSD version (`NamespaceConstraint::matches`).
 pub fn term_matches(
     term: &NfaTerm,
     element_name: NameId,
     element_namespace: Option<NameId>,
     target_namespace: Option<NameId>,
     substitution_groups: Option<&SubstitutionGroupMap>,
-    xsd_version: XsdVersion,
+    _xsd_version: XsdVersion,
 ) -> bool {
     match term {
         NfaTerm::Element {
@@ -872,7 +875,7 @@ pub fn term_matches(
             not_qnames,
             ..
         } => {
-            if !namespace_constraint.matches(element_namespace, target_namespace, xsd_version) {
+            if !namespace_constraint.matches(element_namespace, target_namespace) {
                 return false;
             }
             !not_qnames_exclude(not_qnames, element_namespace, element_name)

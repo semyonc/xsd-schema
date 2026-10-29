@@ -1,13 +1,13 @@
 <?xml version='1.0' encoding='UTF-8'?>
 <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema" targetNamespace="http://www.w3.org/1999/xlink" xmlns:xlink="http://www.w3.org/1999/xlink">
-
+ 
  <xs:annotation>
   <xs:documentation>This schema is not normative, or even definitive.  The
 prose copy in the XLink 1.1 recommendation (http://www.w3.org/TR/xlink11/) is
 definitive, although it should not differ from this file, except for the
 absence of these two initial comments.</xs:documentation>
  </xs:annotation>
-
+ 
  <xs:annotation>
   <xs:documentation>In keeping with the W3C's standard versioning
    policy, this schema document will persist at
@@ -23,7 +23,7 @@ absence of these two initial comments.</xs:documentation>
    http://www.w3.org/2008/06/xlink.xsd will not change.
 </xs:documentation>
  </xs:annotation>
-
+ 
  <xs:annotation>
   <xs:documentation>This schema document provides attribute declarations and
 attribute group, complex type and simple type definitions which can be used in

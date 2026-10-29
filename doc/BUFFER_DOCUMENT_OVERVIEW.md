@@ -23,7 +23,8 @@ XPath functions stay DOM-agnostic.
 
 ## Two Modes
 
-```rust
+```rust,ignore
+// Not compiled: an outline of `document::DocumentKind` (src/document/mod.rs).
 pub enum DocumentKind {
     Full,        // Whole document; element index, IDs, source spans active
     Fragment,    // Synthetic root wrapping a single asserted element subtree
@@ -49,7 +50,8 @@ source spans, ID map) are skipped in `Fragment` mode.
 
 Each node is exactly 16 bytes: four `u32` words.
 
-```rust
+```rust,ignore
+// Not compiled: an outline of `document::node::Node` (src/document/node.rs).
 pub struct Node {
     pub next_sibling: u32,   // NULL = u32::MAX
     pub parent:       u32,
@@ -65,6 +67,7 @@ pub struct Node {
 | `[3:0]` | `NodeType` (Root, Element, Attribute, ChildValue, Text, Whitespace, SignificantWhitespace, Comment, PI, Nul) |
 | `[7:4]` | Flags: `HAS_ATTRIBUTE`, `HAS_CHILDREN`, `IS_COMPLEX_TYPE`, `HAS_NMSP_DECLS` |
 | `[8]` | `IS_NIL` — per-instance `xsi:nil="true"` flag |
+| `[9]` | `IS_IDREFS` — the XDM is-idrefs property (XDM 1.0 §6.2.4, §6.3.4) |
 | `[31:12]` | 20-bit `binding_index` into the document-local `BindingRemapTable` |
 
 ### Two-node pattern
@@ -83,7 +86,7 @@ all three cases.
 
 ## Addressing
 
-`NodeRef` is a plain `u32` index into a flat array of fixed-size pages:
+A node reference is a plain `u32` index into a flat array of fixed-size pages:
 
 - Page size: 4096 nodes (`PAGE_SHIFT = 12`), so each page is 64 KB.
 - Page/slot decoding is a bitshift / mask — no bit-packed addressing.
@@ -96,7 +99,7 @@ Capacity (~4 billion nodes, ~64 GB) is well past any practical document.
 
 ### Identity and order across documents
 
-A `NodeRef` is only meaningful inside its own document, so a navigator's
+A node reference is only meaningful inside its own document, so a navigator's
 identity is the pair (document, cursor): `is_same_position` compares the
 document pointer before the node index, the virtual attribute/namespace
 cursor and the namespace chain position. Every `BufferDocument` also gets a
@@ -119,7 +122,8 @@ different defaults.
 
 Each typed node therefore carries a binding, not just a type:
 
-```rust
+```rust,ignore
+// Not compiled: an outline of `document::type_remap::NodeSchemaBinding`.
 pub struct NodeSchemaBinding {
     pub type_key:        TypeKey,
     pub element_decl:    Option<ElementKey>,    // for elements
@@ -137,18 +141,34 @@ identical `NodeSchemaBinding`s collapse to one entry. Index `0` means
 Two flags optimize hot paths off this design:
 
 - `IS_COMPLEX_TYPE` (bit 6) records simple-vs-complex without a table lookup.
-- `IS_NIL` is kept *out* of the binding so dedup works — nil state is
-  per-instance, not per-declaration.
+- `IS_NIL` and `IS_IDREFS` are kept *out* of the binding so dedup works —
+  nil state is per-instance, not per-declaration, and whether a union-typed
+  node holds an IDREF depends on the member type its value has.
 
 The binding's `type_key` is what `DomNavigator::type_annotation()` returns
 for element and attribute nodes — complex or simple — while `schema_type()`
 is its simple-type projection (`None` for a complex type). Both are `None`
 on unbound nodes.
 
-`typed_value()` uses `element_decl` directly: when an element is empty and
-its declaration carries `ValueConstraint::Default` or `Fixed`, the declared
-value is parsed as the typed value. This is what lets assertions consume
-default-aware values without synthetic text nodes or caller fallback logic.
+**Defaults as nodes.** The typed build (`build_typed_document_with`,
+`TypedBuilderHandler`) makes the tree the XDM instance of the PSVI (XDM 1.0
+§6.2.4, §6.7.4): each defaulted attribute is an attribute node, and a valid
+empty element that takes its declaration's `default` / `fixed` value gets a
+text node with it — a QName in such a value written with a prefix the
+instance binds, declared on the element when none is.
+`TypedBuildOptions::defaults_as_nodes = false` (or
+`TypedBuilderHandler::with_defaults_as_nodes(false)`) builds neither.
+`typed_value()` still reads `element_decl` for an empty element without such
+a text node: when its declaration carries a `default` or `fixed` value, the
+declared value is the typed value, so assertions and a tree built without
+defaults as nodes see default-aware values too.
+
+**White space and normalized values.** A text node that is all white space is
+not built in element-only content. A valid attribute, and a valid element of a
+simple type or with simple content, has its schema normalized value as its
+string value — one text node beside its comments and processing instructions,
+none for an empty value. Mixed content and invalid nodes keep their text as
+read; source spans still point at the text as read.
 
 ---
 
@@ -159,29 +179,77 @@ Kept off the main node array because their access patterns differ:
 | Table | When | Purpose |
 | --- | --- | --- |
 | `NamespacePageFactory` | always | In-scope namespace chains (namespace axis has different semantics) |
+| `NamespaceScopes` | always | Which chain is in scope at each node, and how to walk it (below) |
 | `ElementIndex` | `Full` only | Fast `//name` lookup |
 | `NodeSourceSpans` | `Full` + tracking enabled | Line/column for error reporting |
-| `id_elements: HashMap` | `Full` only | `xs:ID` → element node, for `id()` and IDREF resolution |
+| id index (`id_elements`) | `Full` only | `xs:ID` → element node, for `fn:id` and `find_element_by_id`: an element whose typed value is a single `xs:ID` (simple type or simple content), the owner of an ID-typed attribute, or a node a host registered (`register_xml_id`) |
+| idrefs index | `Full` only | each IDREF token → the element and attribute nodes with the is-idrefs property, for `fn:idref` and `find_nodes_by_idref` |
 
 The shared `NameTable` (from `src/namespace/`) and a per-document
 `QNameTable` / `StringStore` carry the actual string data.
+
+**Namespace scope.** An element that declares namespaces owns a chain: its own
+declarations, last first, followed by the chain in scope at its parent, so one
+chain holds every binding in scope there, each prefix's binding in force first.
+`NamespaceScopes` answers the two questions a reader of the chain asks — the
+namespace axis, `fn:in-scope-prefixes`, the validation drivers' namespace
+context, the serializer's declarations, the typed value of an `xs:QName` — in
+time that does not grow with the element's depth:
+
+- *Which chain is in scope at a node.* The builder adds nodes in document
+  order, and the chain in scope changes only where a declaring element starts
+  and right after it ends. Those changes are recorded in node order (8 bytes
+  each, two at most per declaring element), and a binary search finds the one
+  in force at any node, attributes and text included.
+- *Where a walk of the bindings goes next.* One link per namespace node (4
+  bytes): its `next`, except at an element's last own declaration, where the
+  walk skips the leading run of the parent's bindings whose prefixes the
+  element declares itself — hidden there and below. So an element that
+  declares the default namespace again, as some generators do on every
+  element, does not make the walk revisit every ancestor's declaration. A
+  skipped node always has a prefix the walk has already met, so the bindings
+  read, and their order, are those of the full chain.
+
+A document without declarations has no scope entries; the bench catalogue
+(16 MB, no declarations) gains nothing per node. Each declaration costs 16 bytes
+in all (12 in the chain, 4 for the walk) and each declaring element up to 16
+more.
 
 ---
 
 ## Construction
 
 `BufferDocumentBuilder` exposes both a low-level push API and a
-`quick-xml`-driven adapter (`from_reader`). The arena (`bumpalo::Bump`) is
+`quick-xml`-driven adapter (`build`, which `BufferDocument::from_reader`
+runs). The adapter reads through the crate's well-formedness layer
+(`xsd_schema::xml`): a document that is not well-formed — input that ends
+inside an element included — is `BufferDocumentError::NotWellFormed`, the
+rules follow the XML declaration (XML 1.0 or 1.1), and the declaration is kept
+(`BufferDocument::xml_declaration`). `BufferDocumentBuilder::with_parse_limits`
+sets parse limits (`ParseLimits`), checked before anything of the markup that
+breaks one is interned; the push API is not limited. The arena (`bumpalo::Bump`) is
 **caller-owned**: the builder borrows it. This is what lets
 `ValidationRuntime` reuse a single builder across nested asserted elements
 without allocating per-element arenas, and what makes the second
 `unsafe` block in the crate necessary (see [`UNSAFE.md`](UNSAFE.md)).
 
 ```rust
+use bumpalo::Bump;
+use xsd_schema::document::{BufferDocument, BufferDocumentBuilder, BufferDocumentOptions};
+use xsd_schema::namespace::NameTable;
+use xsd_schema::xml::ParseLimits;
+
 let arena = Bump::new();
 let names = NameTable::new();
-let doc = BufferDocument::from_reader_default(reader, &arena, &names)?;
+let doc = BufferDocument::from_reader_default("<a><b/></a>".as_bytes(), &arena, &names)?;
 let nav = doc.create_navigator();
+
+// With limits:
+let limited = BufferDocumentBuilder::new(&arena, &names, None, BufferDocumentOptions::default())?
+    .with_parse_limits(ParseLimits::none().with_max_depth(256).with_max_nodes(1_000_000))
+    .build("<a><b/></a>".as_bytes())?;
+# let _ = (nav, limited);
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 Schema binding assignment is performed by an external driver
@@ -198,9 +266,21 @@ over `DomNavigator`, not over `BufferDocument`, so the same code serializes a
 engine brings of its own; it touches no `pub(crate)` node pages.
 
 ```rust
+use bumpalo::Bump;
+use xsd_schema::document::{serialize, BufferDocument, SerializeOptions};
+use xsd_schema::namespace::NameTable;
+
+let arena = Bump::new();
+let names = NameTable::new();
+let doc = BufferDocument::from_reader_default("<a><b/></a>".as_bytes(), &arena, &names)?;
+
 let compact = serialize::to_string(&doc.create_navigator(), &SerializeOptions::default())?;
+assert_eq!(compact, "<a><b/></a>");
 let formatted = SerializeOptions { indent: Some(2), ..SerializeOptions::default() };
+let mut out = Vec::new();
 serialize::serialize_document(&doc.create_navigator(), &mut out, &formatted)?;
+assert_eq!(String::from_utf8(out)?, "<a>\n  <b/>\n</a>");
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 Three entry points — `serialize_document` (a whole document, optionally with an
@@ -265,12 +345,13 @@ names would not read back the same, and leaves repairing them to whoever built
 it. Declarations on one element come out in prefix order, since the namespace
 axis has no order of its own to preserve.
 
-**What `from_reader` cannot give it back.** The parse keeps no XML declaration
-(version, encoding, `standalone`), no `<!DOCTYPE` or internal entity
-declarations, no CDATA section markers (the content is kept, as text), and no
-text outside the document element. A round trip is therefore an identity on the
-*tree*, not on the bytes; `tests/serialize_roundtrip.rs` holds the whole XSD
-conformance corpus to that standard, in compact mode.
+**What `from_reader` cannot give it back.** The parse keeps the XML declaration
+(`BufferDocument::xml_declaration`), but the serializer writes its own
+(`SerializeOptions::xml_declaration`); it keeps no `<!DOCTYPE` or internal
+entity declarations, no CDATA section markers (the content is kept, as text),
+and no text outside the document element. A round trip is therefore an
+identity on the *tree*, not on the bytes; `tests/serialize_roundtrip.rs` holds
+the whole XSD conformance corpus to that standard, in compact mode.
 
 ---
 
@@ -283,10 +364,24 @@ as new nodes with new identities. Four additive methods on the builder, plus
 `CopyOptions`, `CopyError`, the `CopySource` trait and `NamespaceFixup`:
 
 ```rust
-builder.copy_subtree(&node, CopyOptions::default())?;     // element/text/comment/PI/document
-builder.copy_attribute(&attr, CopyOptions::default())?;   // onto the open element
-builder.append_content(&items, CopyOptions::default())?;  // a whole XPathValue sequence
-builder.append_atomic(&value)?;                           // one atomic value as text
+use xsd_schema::document::copy::{CopyError, CopyOptions, CopySource};
+use xsd_schema::document::BufferDocumentBuilder;
+use xsd_schema::types::value::XmlValue;
+use xsd_schema::xpath::XmlItem;
+
+fn copy_into<N: CopySource>(
+    builder: &mut BufferDocumentBuilder<'_>,
+    node: &N,
+    attr: &N,
+    items: &[XmlItem<N>],
+    value: &XmlValue,
+) -> Result<(), CopyError> {
+    builder.copy_subtree(node, CopyOptions::default())?; // element/text/comment/PI/document
+    builder.copy_attribute(attr, CopyOptions::default())?; // onto the open element
+    builder.append_content(items, CopyOptions::default())?; // a whole XPathValue sequence
+    builder.append_atomic(value)?; // one atomic value as text
+    Ok(())
+}
 ```
 
 **Constructor semantics.** `append_content` applies the rules an XQuery element
@@ -329,7 +424,9 @@ guarantees the invariant the serializer only *checks* (`UnboundName`), so every
 tree built through this module can be written out.
 
 **Annotations.** A copy is untyped by default: no binding, no nil flag, so it
-atomizes as `xs:untypedAtomic` whatever the source was.
+atomizes as `xs:untypedAtomic` whatever the source was (a host that wants the
+copy of an ID or IDREF node to keep that role registers it with
+`register_xml_id` / `register_idrefs`).
 `Annotations::Preserve` replays `set_node_binding` and `set_nil` from the
 source — but only when the source document is bound to the *same* `SchemaSet`
 as the target, compared by address, since a `TypeKey` means nothing in another
@@ -374,6 +471,7 @@ path described in [`OVERVIEW.md`](OVERVIEW.md) under *XSD 1.1 Assertion Bufferin
 | `NodeSchemaBinding`, remap | `src/document/type_remap.rs` |
 | Namespaces | `src/document/namespace.rs` |
 | Element index / source spans | `src/document/element_index.rs`, `source_spans.rs` |
-| Document, navigator, builder | `src/document/document.rs`, `navigator.rs`, `builder.rs` |
+| Document, navigator, builder | `src/document/buffer.rs`, `navigator.rs`, `builder.rs` |
+| Typed build (validation + build in one pass) | `src/document/typed_builder.rs` |
 | XML output | `src/document/serialize.rs` |
 | Subtree copy, content rules, namespace fixup | `src/document/copy.rs` |

@@ -133,7 +133,7 @@ pub fn validate_wildcard_disallowed_names(schema_set: &SchemaSet) -> SchemaResul
         target_ns: Option<NameId>,
         depth: usize,
     ) -> SchemaResult<()> {
-        if depth > 100 {
+        if depth > schema_set.recursion_bound(100) {
             return Ok(());
         }
         match &particle.term {
@@ -235,7 +235,7 @@ pub fn validate_wildcard_element_type_table_consistency(
         wildcards: &mut Vec<&'a WildcardResult>,
         depth: usize,
     ) {
-        if depth > 100 {
+        if depth > schema_set.recursion_bound(100) {
             return;
         }
         match &particle.term {

@@ -374,13 +374,11 @@ fn test_element_wildcard_any() {
         None,
         &NamespaceConstraint::Any,
         None,
-        XsdVersion::V1_0
     ));
     assert!(element_wildcard_overlap(
         Some(NameId(1)),
         &NamespaceConstraint::Any,
         None,
-        XsdVersion::V1_0
     ));
 }
 
@@ -515,7 +513,6 @@ fn test_element_wildcard_other() {
         target_ns,
         &NamespaceConstraint::Other,
         target_ns,
-        XsdVersion::V1_0
     ));
 
     // Element in other namespace matches ##other
@@ -523,7 +520,6 @@ fn test_element_wildcard_other() {
         other_ns,
         &NamespaceConstraint::Other,
         target_ns,
-        XsdVersion::V1_0
     ));
 }
 
@@ -535,7 +531,6 @@ fn test_element_wildcard_other_absent_namespace_xsd10() {
         None,
         &NamespaceConstraint::Other,
         target_ns,
-        XsdVersion::V1_0
     ));
 }
 
@@ -550,7 +545,6 @@ fn test_element_wildcard_other_absent_namespace_xsd11() {
         None,
         &NamespaceConstraint::Other,
         target_ns,
-        XsdVersion::V1_1
     ));
 }
 
@@ -563,7 +557,6 @@ fn test_element_wildcard_target_namespace() {
         target_ns,
         &NamespaceConstraint::TargetNamespace,
         target_ns,
-        XsdVersion::V1_0
     ));
 
     // Element with no namespace does NOT match ##targetNamespace (if target is set)
@@ -571,7 +564,6 @@ fn test_element_wildcard_target_namespace() {
         None,
         &NamespaceConstraint::TargetNamespace,
         target_ns,
-        XsdVersion::V1_0
     ));
 }
 
@@ -582,7 +574,6 @@ fn test_element_wildcard_local() {
         None,
         &NamespaceConstraint::Local,
         Some(NameId(1)),
-        XsdVersion::V1_0
     ));
 
     // Element with namespace does NOT match ##local
@@ -590,7 +581,6 @@ fn test_element_wildcard_local() {
         Some(NameId(2)),
         &NamespaceConstraint::Local,
         Some(NameId(1)),
-        XsdVersion::V1_0
     ));
 }
 
@@ -601,13 +591,11 @@ fn test_wildcards_overlap_any() {
         &NamespaceConstraint::Any,
         &NamespaceConstraint::Any,
         target,
-        XsdVersion::V1_0
     ));
     assert!(wildcards_overlap(
         &NamespaceConstraint::Any,
         &NamespaceConstraint::Other,
         target,
-        XsdVersion::V1_0
     ));
 }
 
@@ -619,7 +607,6 @@ fn test_wildcards_overlap_target_other() {
         &NamespaceConstraint::TargetNamespace,
         &NamespaceConstraint::Other,
         target,
-        XsdVersion::V1_0
     ));
 }
 
@@ -630,7 +617,6 @@ fn test_wildcards_overlap_other_local_xsd10() {
         &NamespaceConstraint::Other,
         &NamespaceConstraint::Local,
         target,
-        XsdVersion::V1_0
     ));
 }
 
@@ -644,7 +630,6 @@ fn test_wildcards_overlap_other_local_xsd11() {
         &NamespaceConstraint::Other,
         &NamespaceConstraint::Local,
         target,
-        XsdVersion::V1_1
     ));
 }
 
@@ -660,7 +645,6 @@ fn test_element_wildcard_not_excluded() {
         ns1,
         &NamespaceConstraint::Not(vec![ns1]),
         None,
-        XsdVersion::V1_1
     ));
 }
 
@@ -673,7 +657,6 @@ fn test_element_wildcard_not_allowed() {
         ns2,
         &NamespaceConstraint::Not(vec![ns1]),
         None,
-        XsdVersion::V1_1
     ));
 }
 
@@ -684,7 +667,6 @@ fn test_element_wildcard_not_absent_excluded() {
         None,
         &NamespaceConstraint::Not(vec![None]),
         None,
-        XsdVersion::V1_1
     ));
 }
 
@@ -697,7 +679,6 @@ fn test_wildcards_overlap_not_not() {
         &NamespaceConstraint::Not(vec![ns1]),
         &NamespaceConstraint::Not(vec![ns2]),
         None,
-        XsdVersion::V1_1
     ));
 }
 
@@ -708,7 +689,6 @@ fn test_wildcards_overlap_not_any() {
         &NamespaceConstraint::Not(vec![ns1]),
         &NamespaceConstraint::Any,
         None,
-        XsdVersion::V1_1
     ));
 }
 
@@ -720,7 +700,6 @@ fn test_wildcards_overlap_not_target_excluded() {
         &NamespaceConstraint::Not(vec![target]),
         &NamespaceConstraint::TargetNamespace,
         target,
-        XsdVersion::V1_1
     ));
 }
 
@@ -733,7 +712,6 @@ fn test_wildcards_overlap_not_target_not_excluded() {
         &NamespaceConstraint::Not(vec![ns2]),
         &NamespaceConstraint::TargetNamespace,
         target,
-        XsdVersion::V1_1
     ));
 }
 
@@ -746,7 +724,6 @@ fn test_wildcards_overlap_not_list_partial() {
         &NamespaceConstraint::Not(vec![ns1]),
         &NamespaceConstraint::List(vec![ns1, ns2]),
         None,
-        XsdVersion::V1_1
     ));
 }
 
@@ -758,7 +735,6 @@ fn test_wildcards_overlap_not_list_all_excluded() {
         &NamespaceConstraint::Not(vec![ns1]),
         &NamespaceConstraint::List(vec![ns1]),
         None,
-        XsdVersion::V1_1
     ));
 }
 
@@ -1524,5 +1500,76 @@ fn test_upa_extension_of_all_group_base_is_counter_free() {
             );
         }
         other => panic!("expected an NFA UPA model, got {other:?}"),
+    }
+}
+
+// ========================================================================
+// P15: the reported pair does not depend on hashing
+// ========================================================================
+
+/// A competing pair is reported in the order the epsilon closure collects the
+/// terms, which follows the NFA's state order, not a hash set's: the same
+/// schema names the same two particles on every compile, in every process.
+///
+/// The model is Exchange Web Services' `ArrayOfTransitionsType`: four
+/// optional, repeatable element references, the last the head of a
+/// substitution group whose members are the other three. The closure of the
+/// start state reaches all four, and the head competes with each member.
+#[test]
+fn test_reported_conflict_pair_is_deterministic() {
+    let xsd = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+        xmlns:t="urn:ews" targetNamespace="urn:ews" elementFormDefault="qualified">
+      <xs:complexType name="TransitionType">
+        <xs:sequence><xs:element name="To" type="xs:string"/></xs:sequence>
+      </xs:complexType>
+      <xs:complexType name="AbsoluteDateTransitionType">
+        <xs:complexContent><xs:extension base="t:TransitionType">
+          <xs:sequence><xs:element name="DateTime" type="xs:dateTime"/></xs:sequence>
+        </xs:extension></xs:complexContent>
+      </xs:complexType>
+      <xs:element name="Transition" type="t:TransitionType"/>
+      <xs:element name="AbsoluteDateTransition" type="t:AbsoluteDateTransitionType"
+          substitutionGroup="t:Transition"/>
+      <xs:element name="RecurringDayTransition" type="t:AbsoluteDateTransitionType"
+          substitutionGroup="t:Transition"/>
+      <xs:element name="RecurringDateTransition" type="t:AbsoluteDateTransitionType"
+          substitutionGroup="t:Transition"/>
+      <xs:complexType name="ArrayOfTransitionsType">
+        <xs:sequence>
+          <xs:element ref="t:AbsoluteDateTransition" minOccurs="0" maxOccurs="unbounded"/>
+          <xs:element ref="t:RecurringDayTransition" minOccurs="0" maxOccurs="unbounded"/>
+          <xs:element ref="t:RecurringDateTransition" minOccurs="0" maxOccurs="unbounded"/>
+          <xs:element ref="t:Transition" minOccurs="0" maxOccurs="unbounded"/>
+        </xs:sequence>
+      </xs:complexType>
+    </xs:schema>"#;
+
+    for version in [XsdVersion::V1_0, XsdVersion::V1_1] {
+        let messages: std::collections::BTreeSet<String> = (0..24)
+            .map(|_| {
+                let Err(error) = crate::SchemaSetBuilder::with_version(version)
+                    .add_source(xsd, "file:///ews-transitions.xsd")
+                    .expect("schema source accepted")
+                    .compile()
+                else {
+                    panic!("{version:?}: ArrayOfTransitionsType violates UPA");
+                };
+                assert!(
+                    error.to_string().contains("cos-nonambig"),
+                    "{version:?}: expected cos-nonambig, got {error}"
+                );
+                error.to_string()
+            })
+            .collect();
+        assert_eq!(
+            messages.len(),
+            1,
+            "{version:?}: the reported pair varies between compiles: {messages:#?}"
+        );
+        let message = messages.into_iter().next().unwrap();
+        assert!(
+            message.contains("elements 'AbsoluteDateTransition' and 'Transition' conflict"),
+            "{version:?}: the first competing pair in state order: {message}"
+        );
     }
 }

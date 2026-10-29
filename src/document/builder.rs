@@ -12,8 +12,6 @@ use std::io::BufRead;
 
 use bumpalo::Bump;
 use quick_xml::events::Event;
-use quick_xml::Reader;
-use quick_xml::XmlVersion;
 
 use crate::ids::{NameId, SimpleTypeKey, TypeKey};
 use crate::namespace::table::XML_NAMESPACE;
@@ -24,6 +22,7 @@ use crate::schema::SchemaSet;
 use crate::types::value::{XmlAtomicValue, XmlValue, XmlValueKind};
 use crate::types::XmlTypeCode;
 use crate::validation::info::ContentType;
+use crate::xml::reader::{AttrKind, WfError, WfReader};
 use crate::xml_entity::resolve_general_ref;
 
 use super::buffer::{
@@ -31,6 +30,7 @@ use super::buffer::{
     IdSlot,
 };
 use super::error::BufferDocumentError;
+use super::namespace::{prefix_bit, NamespaceScopes};
 use super::{
     BindingRemapTable, BufferDocumentOptions, DocumentKind, ElementIndex, NamespaceNode,
     NamespacePageFactory, Node, NodePages, NodeSchemaBinding, NodeSourceSpans, NodeType, NsRef,
@@ -42,7 +42,6 @@ use super::{
 /// Tracks per-element state during document construction.
 #[derive(Clone, Copy, Debug)]
 struct ElementBuildState {
-    #[allow(dead_code)] // used by navigator in Step 7
     node_ref: u32,
     #[allow(dead_code)] // used by navigator in Step 7
     has_attrs: bool,
@@ -107,9 +106,14 @@ pub struct BufferDocumentBuilder<'a> {
     /// [`IdClass`]. Nearly every annotation an attribute carries is
     /// [`IdClass::Never`], and this makes that answer one vector read.
     id_classes: Vec<IdClass>,
+    /// The is-idrefs class of each binding index, filled on first use — see
+    /// [`IdrefsClass`].
+    idrefs_classes: Vec<IdrefsClass>,
     /// How many element and attribute nodes carry a binding, so that
     /// `has_type_annotations` stays exact when a binding is taken away again.
     annotated_nodes: usize,
+    /// Limits on the text [`build`](Self::build) reads.
+    parse_limits: crate::xml::ParseLimits,
 }
 
 impl<'a> BufferDocumentBuilder<'a> {
@@ -149,6 +153,9 @@ impl<'a> BufferDocumentBuilder<'a> {
         root_node.next_sibling = NULL;
         nodes.set(root_ref, root_node);
 
+        let mut ns_scopes = NamespaceScopes::default();
+        ns_scopes.allocated(xml_ns_ref, NsRef::NULL);
+
         let doc = BufferDocument {
             arena,
             serial: next_document_serial(),
@@ -164,11 +171,14 @@ impl<'a> BufferDocumentBuilder<'a> {
             namespace_pages,
             xml_namespace: xml_ns_ref,
             element_namespaces: HashMap::new(),
+            ns_scopes,
             element_index: ElementIndex::new(),
             source_spans: NodeSourceSpans::new(),
             id_elements: HashMap::new(),
+            idrefs: HashMap::new(),
             schema_set,
             fragment_base_uri: None,
+            xml_declaration: None,
         };
 
         Ok(Self {
@@ -187,8 +197,25 @@ impl<'a> BufferDocumentBuilder<'a> {
             xml_id_name: (effective_names.add("id"), xml_uri_id),
             dropped_duplicate_id: None,
             id_classes: Vec::new(),
+            idrefs_classes: Vec::new(),
             annotated_nodes: 0,
+            parse_limits: crate::xml::ParseLimits::none(),
         })
+    }
+
+    /// This builder with limits on the XML text [`build`](Self::build)
+    /// reads (see [`ParseLimits`](crate::xml::ParseLimits)): each is checked
+    /// on the raw markup before anything of it is interned or built, and a
+    /// document that breaks one is refused with
+    /// [`BufferDocumentError::LimitExceeded`]. The default is no limits. The
+    /// push API is not limited.
+    ///
+    /// A typed build reads through the validation driver, which takes its
+    /// limits from the validation runtime instead
+    /// ([`ValidationRuntime::set_parse_limits`](crate::validation::ValidationRuntime::set_parse_limits)).
+    pub fn with_parse_limits(mut self, limits: crate::xml::ParseLimits) -> Self {
+        self.parse_limits = limits;
+        self
     }
 
     // ── Core push API ─────────────────────────────────────────────────
@@ -209,10 +236,15 @@ impl<'a> BufferDocumentBuilder<'a> {
 
         // Save previous namespace head
         let prev_namespace = self.current_namespace;
+        // The namespace node this element's first declaration gets, if any,
+        // and a filter of the prefixes it declares.
+        let first_declaration = NsRef(self.doc.namespace_pages.len());
+        let mut own_prefixes = 0u64;
 
         // Process namespace declarations
         for &(ns_prefix, ns_uri_decl) in ns_declarations {
-            self.handle_namespace_decl(ns_prefix, ns_uri_decl)?;
+            let prefix = self.handle_namespace_decl(ns_prefix, ns_uri_decl)?;
+            own_prefixes |= prefix_bit(prefix);
         }
 
         // Intern names
@@ -283,6 +315,13 @@ impl<'a> BufferDocumentBuilder<'a> {
             self.doc
                 .element_namespaces
                 .insert(elem_ref, self.current_namespace);
+            self.doc.ns_scopes.declared(
+                &self.doc.namespace_pages,
+                elem_ref,
+                prev_namespace,
+                self.current_namespace,
+                Some((first_declaration, own_prefixes)),
+            );
         }
 
         // Push element state, descend
@@ -421,6 +460,120 @@ impl<'a> BufferDocumentBuilder<'a> {
         self.note_child_appended();
     }
 
+    /// Whether the open element has no content node yet, so that all its
+    /// content so far is the text still pending (not yet a node).
+    pub(crate) fn has_only_pending_text(&self) -> bool {
+        self.last_sibling == NULL
+    }
+
+    /// The text accumulated since the last structural event, not yet a node.
+    pub(crate) fn pending_text(&self) -> &str {
+        if self.text_type.is_some() {
+            &self.text_buffer
+        } else {
+            ""
+        }
+    }
+
+    /// Replaces the pending text; an empty `text` leaves no text node.
+    pub(crate) fn replace_pending_text(&mut self, text: &str) {
+        self.text_buffer.clear();
+        if text.is_empty() {
+            self.text_type = None;
+        } else {
+            self.text_buffer.push_str(text);
+            self.text_type.get_or_insert(NodeType::Text);
+        }
+    }
+
+    /// Discards the pending text (it becomes no node), keeping the buffer.
+    pub(crate) fn discard_pending_text(&mut self) {
+        self.text_type = None;
+        self.text_buffer.clear();
+    }
+
+    /// Takes the pending text away (it becomes no node).
+    pub(crate) fn take_pending_text(&mut self) -> String {
+        self.text_type = None;
+        std::mem::take(&mut self.text_buffer)
+    }
+
+    /// A prefix bound to the namespace `uri` in the scope of the open element
+    /// — `xml` for the XML namespace, otherwise the nearest declaration of a
+    /// non-empty prefix to `uri` that no nearer declaration of the same prefix
+    /// hides — or `None` when there is none.
+    pub(crate) fn prefix_in_scope(&self, uri: &str) -> Option<&'a str> {
+        if uri == XML_NAMESPACE {
+            return Some("xml");
+        }
+        let names = self.doc.names;
+        let uri_id = names.get(uri)?;
+        let mut seen: Vec<NameId> = Vec::new();
+        for (_, ns) in self.doc.scope_walk(self.current_namespace) {
+            let prefix = names.resolve_ref(ns.prefix);
+            if !prefix.is_empty() && !seen.contains(&ns.prefix) {
+                if ns.namespace_uri == uri_id {
+                    return Some(prefix);
+                }
+                seen.push(ns.prefix);
+            }
+        }
+        None
+    }
+
+    /// The namespace the non-empty `prefix` is bound to in the scope of the
+    /// open element (`xml` to the XML namespace), or `None` when it is bound
+    /// nowhere (or undeclared).
+    pub(crate) fn namespace_of_prefix(&self, prefix: &str) -> Option<&'a str> {
+        if prefix == "xml" {
+            return Some(XML_NAMESPACE);
+        }
+        let names = self.doc.names;
+        for (_, ns) in self.doc.scope_walk(self.current_namespace) {
+            if names.resolve_ref(ns.prefix) == prefix {
+                let uri = names.resolve_ref(ns.namespace_uri);
+                return (!uri.is_empty()).then_some(uri);
+            }
+        }
+        None
+    }
+
+    /// The default namespace in the scope of the open element, or `None`
+    /// when there is none (or it is undeclared).
+    pub(crate) fn default_namespace_in_scope(&self) -> Option<&'a str> {
+        let names = self.doc.names;
+        for (_, ns) in self.doc.scope_walk(self.current_namespace) {
+            if names.resolve_ref(ns.prefix).is_empty() {
+                let uri = names.resolve_ref(ns.namespace_uri);
+                return (!uri.is_empty()).then_some(uri);
+            }
+        }
+        None
+    }
+
+    /// Whether `prefix` is bound (to anything, an undeclaration included) in
+    /// the scope of the open element.
+    pub(crate) fn prefix_is_declared(&self, prefix: &str) -> bool {
+        if prefix == "xml" || prefix == "xmlns" {
+            return true;
+        }
+        let Some(prefix_id) = self.doc.names.get(prefix) else {
+            return false;
+        };
+        self.doc
+            .scope_walk(self.current_namespace)
+            .any(|(_, ns)| ns.prefix == prefix_id)
+    }
+
+    /// The value of the attribute node `attr_ref`.
+    pub(crate) fn attribute_value(&self, attr_ref: u32) -> &str {
+        debug_assert_eq!(
+            self.doc.nodes.get(attr_ref).node_type(),
+            NodeType::Attribute
+        );
+        self.doc.strings.get(self.doc.nodes.get(attr_ref + 1).value)
+    }
+
     /// Adds a comment node.
     pub fn comment(&mut self, value: &str) -> Result<(), BufferDocumentError> {
         self.flush_text()?;
@@ -473,8 +626,19 @@ impl<'a> BufferDocumentBuilder<'a> {
     }
 
     /// Closes the current element.
+    ///
+    /// This is where an element that is an id or has the is-idrefs property
+    /// by its annotation is filed (its typed value depends on its content,
+    /// complete only now) — see
+    /// [`set_node_binding`](Self::set_node_binding) — and where an element a
+    /// host marked with [`register_idrefs`](Self::register_idrefs) while it
+    /// was open is filed in the idrefs index.
     pub fn end_element(&mut self) -> Result<(), BufferDocumentError> {
         self.flush_text()?;
+        if let Some(state) = self.element_stack.last() {
+            let elem = state.node_ref;
+            self.file_element(elem);
+        }
 
         let _state = self
             .element_stack
@@ -491,6 +655,8 @@ impl<'a> BufferDocumentBuilder<'a> {
         if elem_node.has_flag(Node::HAS_NMSP_DECLS) {
             if let Some((_elem_ref, prev_ns)) = self.namespace_stack.pop() {
                 self.current_namespace = prev_ns;
+                // Whatever comes next is in the parent's scope again.
+                self.doc.ns_scopes.set_scope(self.doc.nodes.len(), prev_ns);
             }
         }
 
@@ -537,6 +703,24 @@ impl<'a> BufferDocumentBuilder<'a> {
     /// withdraws what the previous binding filed. An `xml:id` is an id by its
     /// name whatever its type, and is filed by [`attribute`](Self::attribute).
     ///
+    /// An *element* is an id by the same rule (XDM 1.0 §6.2.4: unless its
+    /// content is element-only, "if the typed-value of the element consists of
+    /// exactly one atomic value and that value is of type xs:ID, or a type
+    /// derived from xs:ID, the is-id property is true") — a simple type or a
+    /// complex type with simple content; a nilled element has no typed value.
+    /// Its typed value depends on its content, so it is filed when the element
+    /// ends ([`end_element`](Self::end_element)), or at once when a closed
+    /// element is bound. `fn:id` then selects the element itself (F&O 1.0
+    /// §15.5.2).
+    ///
+    /// The is-idrefs property (XDM 1.0 §6.2.4, §6.3.4: "if any of the atomic
+    /// values in the typed-value … is of type xs:IDREF or xs:IDREFS, or a type
+    /// derived from one of those types") is set here for an attribute and at
+    /// the end for an element, from the same typed value, and its string
+    /// value's tokens are filed for `fn:idref` (F&O 1.0 §15.5.3); see
+    /// [`register_idrefs`](Self::register_idrefs) for a node that keeps the
+    /// property without an annotation.
+    ///
     /// Returns [`BufferDocumentError::Overflow`] if the binding table is full.
     pub fn set_node_binding(
         &mut self,
@@ -550,6 +734,11 @@ impl<'a> BufferDocumentBuilder<'a> {
         let previous = node.binding_index();
         if kind == NodeType::Attribute && previous != 0 {
             self.withdraw_typed_id(node_ref, previous);
+            self.withdraw_idrefs(node_ref);
+        }
+        let closed_element = kind == NodeType::Element && !self.is_open(node_ref);
+        if closed_element {
+            self.withdraw_element(node_ref, previous);
         }
         if matches!(kind, NodeType::Element | NodeType::Attribute) && previous == 0 {
             self.annotated_nodes += 1;
@@ -565,6 +754,10 @@ impl<'a> BufferDocumentBuilder<'a> {
         });
         if kind == NodeType::Attribute {
             self.file_typed_id(node_ref, idx);
+            self.file_typed_idrefs(node_ref, idx);
+        }
+        if closed_element {
+            self.file_element(node_ref);
         }
         Ok(is_complex)
     }
@@ -584,6 +777,10 @@ impl<'a> BufferDocumentBuilder<'a> {
         let kind = node.node_type();
         if kind == NodeType::Attribute {
             self.withdraw_typed_id(node_ref, previous);
+            self.withdraw_idrefs(node_ref);
+        }
+        if kind == NodeType::Element && !self.is_open(node_ref) {
+            self.withdraw_element(node_ref, previous);
         }
         if matches!(kind, NodeType::Element | NodeType::Attribute) {
             self.annotated_nodes -= 1;
@@ -605,9 +802,10 @@ impl<'a> BufferDocumentBuilder<'a> {
     /// Registers an id value for the given element.
     ///
     /// [`attribute`](Self::attribute) already does this for an `xml:id`, and
-    /// [`set_node_binding`](Self::set_node_binding) for an attribute whose
-    /// typed value is an `xs:ID`, so this is for an id that comes from
-    /// somewhere else. It is **not** restricted to `Full` documents: the scope
+    /// [`set_node_binding`](Self::set_node_binding) for an attribute or
+    /// element whose typed value is an `xs:ID`, so this is for an id that
+    /// comes from somewhere else — an untyped copy that keeps its source's
+    /// ids, for example. It is **not** restricted to `Full` documents: the scope
     /// of an id is one tree, and the index is keyed by tree, so a `Fragment`
     /// buffer holding several top-level trees is served correctly. A value
     /// registered here stays registered: no attribute stands behind it, so
@@ -668,6 +866,44 @@ impl<'a> BufferDocumentBuilder<'a> {
                 self.doc.id_elements.insert(key.into(), IdSlot::One(claim));
                 Ok(())
             }
+        }
+    }
+
+    /// Gives the element or attribute node `node_ref` the is-idrefs property
+    /// (XDM 1.0 §5.6), so that `fn:idref` finds it by the tokens of its
+    /// string value (F&O 1.0 §15.5.3).
+    ///
+    /// A node whose annotation has an `xs:IDREF` / `xs:IDREFS` typed value
+    /// gets the property from its binding
+    /// ([`set_node_binding`](Self::set_node_binding)); this is for a node that
+    /// keeps it without one — an untyped copy of such a node, as
+    /// [`register_xml_id`](Self::register_xml_id) is for an id. An attribute is
+    /// filed under its value as it stands (refiled when the builder replaces
+    /// the value); an element when it ends, or at once if it has ended
+    /// already. A node of another kind is ignored, and marking a node twice
+    /// changes nothing.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `node_ref` is not a node of the document being built.
+    pub fn register_idrefs(&mut self, node_ref: u32) {
+        assert!(
+            self.doc.has_node(node_ref),
+            "register_idrefs: {node_ref} is not a node of this document"
+        );
+        let node = self.doc.nodes.get(node_ref);
+        if node.has_flag(Node::IS_IDREFS) {
+            return;
+        }
+        match node.node_type() {
+            NodeType::Attribute => self.mark_and_file_idrefs(node_ref),
+            NodeType::Element if self.is_open(node_ref) => {
+                self.doc
+                    .nodes
+                    .update(node_ref, |n| n.set_flag(Node::IS_IDREFS));
+            }
+            NodeType::Element => self.mark_and_file_idrefs(node_ref),
+            _ => {}
         }
     }
 
@@ -751,9 +987,7 @@ impl<'a> BufferDocumentBuilder<'a> {
     /// implicit `xml` binding is not included: it needs no declaration.
     pub(crate) fn in_scope_bindings(&self) -> Vec<(String, String)> {
         let mut bindings: Vec<(String, String)> = Vec::new();
-        let mut ns_ref = self.current_namespace;
-        while !ns_ref.is_null() {
-            let ns_node = self.doc.namespace_pages.get(ns_ref);
+        for (_, ns_node) in self.doc.scope_walk(self.current_namespace) {
             let prefix = self.doc.names.resolve_ref(ns_node.prefix);
             if !bindings.iter().any(|(p, _)| p == prefix) {
                 bindings.push((
@@ -764,7 +998,6 @@ impl<'a> BufferDocumentBuilder<'a> {
                         .to_string(),
                 ));
             }
-            ns_ref = ns_node.next;
         }
         bindings
     }
@@ -791,7 +1024,7 @@ impl<'a> BufferDocumentBuilder<'a> {
         let elem_ref = self.parent;
         let previously_declared = self.doc.nodes.get(elem_ref).has_flag(Node::HAS_NMSP_DECLS);
         let prev_namespace = self.current_namespace;
-        self.handle_namespace_decl(prefix, uri)?;
+        let _ = self.handle_namespace_decl(prefix, uri)?;
         if !previously_declared {
             // First declaration on this element: it now owns a scope, which
             // `end_element` has to restore.
@@ -803,6 +1036,19 @@ impl<'a> BufferDocumentBuilder<'a> {
         self.doc
             .element_namespaces
             .insert(elem_ref, self.current_namespace);
+        // The chain in scope at the parent, which the element's own
+        // declarations run into.
+        let outer = match self.namespace_stack.last() {
+            Some(&(owner, outer)) if owner == elem_ref => outer,
+            _ => prev_namespace,
+        };
+        self.doc.ns_scopes.declared(
+            &self.doc.namespace_pages,
+            elem_ref,
+            outer,
+            self.current_namespace,
+            None,
+        );
         Ok(())
     }
 
@@ -882,6 +1128,7 @@ impl<'a> BufferDocumentBuilder<'a> {
         );
         let binding = self.doc.nodes.get(attr_ref).binding_index();
         let is_xml_id = self.is_xml_id_attribute(attr_ref);
+        let was_idrefs = self.withdraw_idrefs(attr_ref);
         if is_xml_id {
             let doc = &mut self.doc;
             let old = doc.strings.get(doc.nodes.get(attr_ref + 1).value);
@@ -908,6 +1155,11 @@ impl<'a> BufferDocumentBuilder<'a> {
             }
         } else if binding != 0 {
             self.file_typed_id(attr_ref, binding);
+        }
+        if binding != 0 {
+            self.file_typed_idrefs(attr_ref, binding);
+        } else if was_idrefs {
+            self.mark_and_file_idrefs(attr_ref);
         }
     }
 
@@ -1000,7 +1252,9 @@ impl<'a> BufferDocumentBuilder<'a> {
         };
         let doc = &mut self.doc;
         let value = doc.strings.get(doc.nodes.get(attr_ref + 1).value);
-        if let Some(key) = typed_id_key(class, value, type_key, schema_set) {
+        let scope = InScope::at(doc, attr_ref);
+        let key = typed_id_key(class, value, type_key, schema_set, &scope);
+        if let Some(key) = key {
             file_id_claim(&mut doc.id_elements, &key, claim);
         }
     }
@@ -1016,9 +1270,213 @@ impl<'a> BufferDocumentBuilder<'a> {
         };
         let doc = &mut self.doc;
         let value = doc.strings.get(doc.nodes.get(attr_ref + 1).value);
-        if let Some(key) = typed_id_key(class, value, type_key, schema_set) {
+        let scope = InScope::at(doc, attr_ref);
+        let key = typed_id_key(class, value, type_key, schema_set, &scope);
+        if let Some(key) = key {
             withdraw_id_claim(&mut doc.id_elements, &key, attr_ref);
         }
+    }
+
+    // ── The is-id rule for annotated elements; is-idrefs ──────────────
+
+    /// Whether `elem` is an element still open (being built).
+    fn is_open(&self, elem: u32) -> bool {
+        self.element_stack.iter().rev().any(|s| s.node_ref == elem)
+    }
+
+    /// The string value of the element `elem` as it stands — its text
+    /// descendants, concatenated — and whether it has element children.
+    fn element_content(&self, elem: u32) -> (Cow<'_, str>, bool) {
+        let end = self.doc.subtree_end(elem);
+        let mut text: Option<Cow<'_, str>> = None;
+        let mut has_elements = false;
+        for i in elem + 1..end {
+            let node = self.doc.nodes.get(i);
+            match node.node_type() {
+                NodeType::Text | NodeType::Whitespace | NodeType::SignificantWhitespace => {
+                    let s = self.doc.strings.get(node.value);
+                    text = Some(match text {
+                        None => Cow::Borrowed(s),
+                        Some(t) => Cow::Owned(t.into_owned() + s),
+                    });
+                }
+                NodeType::Element => has_elements = true,
+                _ => {}
+            }
+        }
+        (text.unwrap_or(Cow::Borrowed("")), has_elements)
+    }
+
+    /// The value the typed value of the bound element `elem` is computed
+    /// from, exactly as `BufferDocNavigator::typed_value` takes it: its string
+    /// value, or its declaration's default when it is empty and has no element
+    /// children. `None` for a nilled element (no typed value) or a binding
+    /// that is gone.
+    fn element_typed_lexical(
+        &self,
+        elem: u32,
+        binding_idx: u32,
+    ) -> Option<(String, NodeSchemaBinding, &'a SchemaSet)> {
+        if self.doc.nodes.get(elem).has_flag(Node::IS_NIL) {
+            return None;
+        }
+        let binding = *self.doc.binding_remap.get(binding_idx)?;
+        let schema_set = self.doc.schema_set?;
+        let (value, has_elements) = self.element_content(elem);
+        let value =
+            super::navigator::element_value_or_default(value, has_elements, &binding, schema_set);
+        Some((value.into_owned(), binding, schema_set))
+    }
+
+    /// The id index key the element `elem`, bound at `binding_idx`, answers
+    /// to — XDM 1.0 §6.2.4: "If the element has a complex type with
+    /// element-only content, the is-id property is false. Otherwise, if the
+    /// typed-value of the element consists of exactly one atomic value and
+    /// that value is of type xs:ID, or a type derived from xs:ID, the is-id
+    /// property is true".
+    fn element_id_key(&mut self, elem: u32, binding_idx: u32) -> Option<String> {
+        let class = self.id_class(binding_idx);
+        if class == IdClass::Never {
+            return None;
+        }
+        let (value, binding, schema_set) = self.element_typed_lexical(elem, binding_idx)?;
+        let scope = InScope::at(&self.doc, elem);
+        typed_id_key(class, &value, binding.type_key, schema_set, &scope).map(Cow::into_owned)
+    }
+
+    /// Files the element `elem` as it stands: in the id index when its typed
+    /// value is a single `xs:ID`, and in the idrefs index when it has the
+    /// is-idrefs property — by its annotation, or because a host marked it.
+    /// Called when the element ends, and when a closed element is bound
+    /// again.
+    fn file_element(&mut self, elem: u32) {
+        let node = self.doc.nodes.get(elem);
+        let binding_idx = node.binding_index();
+        let marked = node.has_flag(Node::IS_IDREFS);
+        if binding_idx == 0 && !marked {
+            return;
+        }
+        if binding_idx != 0 {
+            if let Some(key) = self.element_id_key(elem, binding_idx) {
+                let claim = IdClaim {
+                    tree: self.tree_of(elem),
+                    elem,
+                    attr: elem,
+                };
+                file_id_claim(&mut self.doc.id_elements, &key, claim);
+            }
+        }
+        let idrefs = marked
+            || (self.idrefs_class(binding_idx) == IdrefsClass::ByValue
+                && self.element_typed_lexical(elem, binding_idx).is_some_and(
+                    |(value, binding, schema_set)| {
+                        let scope = InScope::at(&self.doc, elem);
+                        typed_is_idrefs(&value, binding.type_key, schema_set, &scope)
+                    },
+                ));
+        if idrefs {
+            self.doc.nodes.update(elem, |n| n.set_flag(Node::IS_IDREFS));
+            let (value, _) = self.element_content(elem);
+            let value = value.into_owned();
+            file_idrefs(&mut self.doc.idrefs, elem, &value);
+        }
+    }
+
+    /// Withdraws what [`file_element`](Self::file_element) filed for the
+    /// closed element `elem` while it was bound at `binding_idx`. Called
+    /// before its binding changes. An unbound element filed nothing by an
+    /// annotation (its is-idrefs flag, if any, a host's mark, stays).
+    fn withdraw_element(&mut self, elem: u32, binding_idx: u32) {
+        if binding_idx == 0 {
+            return;
+        }
+        if let Some(key) = self.element_id_key(elem, binding_idx) {
+            withdraw_id_claim(&mut self.doc.id_elements, &key, elem);
+        }
+        self.withdraw_idrefs(elem);
+    }
+
+    /// The is-idrefs class of the binding at `binding_idx`, computed once per
+    /// binding and remembered.
+    fn idrefs_class(&mut self, binding_idx: u32) -> IdrefsClass {
+        if binding_idx == 0 {
+            return IdrefsClass::Never;
+        }
+        let slot = binding_idx as usize;
+        if let Some(&class) = self.idrefs_classes.get(slot) {
+            if class != IdrefsClass::Unknown {
+                return class;
+            }
+        }
+        let class = match (self.doc.schema_set, self.doc.binding_remap.get(binding_idx)) {
+            (Some(schema_set), Some(binding)) => IdrefsClass::of(binding, schema_set),
+            _ => IdrefsClass::Never,
+        };
+        if self.idrefs_classes.len() <= slot {
+            self.idrefs_classes.resize(slot + 1, IdrefsClass::Unknown);
+        }
+        self.idrefs_classes[slot] = class;
+        class
+    }
+
+    /// Files the attribute `attr_ref`, bound at `binding_idx`, in the idrefs
+    /// index when its typed value makes it is-idrefs — XDM 1.0 §6.3.4: "If any
+    /// of the atomic values in the typed-value of the attribute is of type
+    /// xs:IDREF or xs:IDREFS, or a type derived from one of those types, the
+    /// is-idrefs property is true". The typed value is the one
+    /// `BufferDocNavigator::typed_value` computes.
+    fn file_typed_idrefs(&mut self, attr_ref: u32, binding_idx: u32) {
+        if self.idrefs_class(binding_idx) == IdrefsClass::Never || self.id_owner(attr_ref).is_none()
+        {
+            return;
+        }
+        let (Some(schema_set), Some(binding)) = (
+            self.doc.schema_set,
+            self.doc.binding_remap.get(binding_idx).copied(),
+        ) else {
+            return;
+        };
+        let value = self.attribute_value(attr_ref);
+        let scope = InScope::at(&self.doc, attr_ref);
+        if typed_is_idrefs(value, binding.type_key, schema_set, &scope) {
+            self.mark_and_file_idrefs(attr_ref);
+        }
+    }
+
+    /// Gives `node` the is-idrefs flag and files the tokens of its string
+    /// value as it stands.
+    fn mark_and_file_idrefs(&mut self, node: u32) {
+        self.doc.nodes.update(node, |n| n.set_flag(Node::IS_IDREFS));
+        let value = match self.doc.nodes.get(node).node_type() {
+            NodeType::Attribute => self.attribute_value(node).to_string(),
+            _ => self.element_content(node).0.into_owned(),
+        };
+        file_idrefs(&mut self.doc.idrefs, node, &value);
+    }
+
+    /// Takes the is-idrefs flag of `node` away again and withdraws the
+    /// entries it made, recomputed from its string value as it stands (it is
+    /// called before that changes). Answers whether the node had the flag.
+    fn withdraw_idrefs(&mut self, node: u32) -> bool {
+        if !self.doc.nodes.get(node).has_flag(Node::IS_IDREFS) {
+            return false;
+        }
+        let value = match self.doc.nodes.get(node).node_type() {
+            NodeType::Attribute => self.attribute_value(node).to_string(),
+            _ => self.element_content(node).0.into_owned(),
+        };
+        for token in idref_tokens(&value) {
+            if let Some(nodes) = self.doc.idrefs.get_mut(token) {
+                nodes.retain(|&n| n != node);
+                if nodes.is_empty() {
+                    self.doc.idrefs.remove(token);
+                }
+            }
+        }
+        self.doc
+            .nodes
+            .update(node, |n| n.clear_flag(Node::IS_IDREFS));
+        true
     }
 
     // ── Internal helpers ──────────────────────────────────────────────
@@ -1063,12 +1521,13 @@ impl<'a> BufferDocumentBuilder<'a> {
         Ok(node_ref)
     }
 
-    /// Allocates a namespace node and chains it to `current_namespace`.
+    /// Allocates a namespace node and chains it to `current_namespace`;
+    /// returns the declared prefix.
     fn handle_namespace_decl(
         &mut self,
         prefix: &str,
         uri: &str,
-    ) -> Result<(), BufferDocumentError> {
+    ) -> Result<NameId, BufferDocumentError> {
         let prefix_id = self.doc.names.add(prefix);
         let uri_id = self.doc.names.add(uri);
 
@@ -1081,20 +1540,31 @@ impl<'a> BufferDocumentBuilder<'a> {
             ns_ref,
             NamespaceNode::new(prefix_id, uri_id, self.current_namespace),
         );
+        self.doc.ns_scopes.allocated(ns_ref, self.current_namespace);
         self.current_namespace = ns_ref;
 
-        Ok(())
+        Ok(prefix_id)
     }
 
     // ── quick-xml adapter ─────────────────────────────────────────────
 
-    /// Builds the document from a quick-xml event stream.
+    /// Builds the document from XML text.
+    ///
+    /// The text is read through the crate's well-formedness layer
+    /// ([`crate::xml`]), with the rules of the version its XML declaration
+    /// names: a document that is not well-formed is refused with
+    /// [`BufferDocumentError::NotWellFormed`] (input that ends inside an
+    /// element included), and the limits set with
+    /// [`with_parse_limits`](Self::with_parse_limits) are checked before
+    /// anything of the markup that breaks one is interned
+    /// ([`BufferDocumentError::LimitExceeded`]). The XML declaration is kept
+    /// ([`BufferDocument::xml_declaration`]); a document type declaration in
+    /// the prolog is checked and not kept.
     pub fn build<R: BufRead>(
         mut self,
         reader: R,
     ) -> Result<BufferDocument<'a>, BufferDocumentError> {
-        let mut xml_reader = Reader::from_reader(reader);
-        xml_reader.config_mut().trim_text(false);
+        let mut xml_reader = WfReader::new(reader, &self.parse_limits, false);
 
         // Transient prefix → URI mapping for namespace resolution
         let mut prefix_map: HashMap<Box<[u8]>, Vec<String>> = HashMap::new();
@@ -1114,23 +1584,34 @@ impl<'a> BufferDocumentBuilder<'a> {
         let mut buf = Vec::with_capacity(1024);
 
         loop {
+            let event = xml_reader.read_event_into(&mut buf);
             let event_start = if track {
-                xml_reader.buffer_position() as usize
+                xml_reader.event_start() as usize
             } else {
                 0
             };
 
-            match xml_reader.read_event_into(&mut buf) {
+            match event {
                 Ok(Event::Start(ref e)) => {
-                    let elem_ref =
-                        self.handle_start_or_empty(e, false, &mut prefix_map, &mut scope_decls)?;
+                    let elem_ref = self.handle_start_or_empty(
+                        e,
+                        &xml_reader,
+                        false,
+                        &mut prefix_map,
+                        &mut scope_decls,
+                    )?;
                     if track {
                         self.pending_spans.push((elem_ref, event_start));
                     }
                 }
                 Ok(Event::Empty(ref e)) => {
-                    let elem_ref =
-                        self.handle_start_or_empty(e, true, &mut prefix_map, &mut scope_decls)?;
+                    let elem_ref = self.handle_start_or_empty(
+                        e,
+                        &xml_reader,
+                        true,
+                        &mut prefix_map,
+                        &mut scope_decls,
+                    )?;
                     if track {
                         self.doc.source_spans.set(
                             elem_ref,
@@ -1157,86 +1638,99 @@ impl<'a> BufferDocumentBuilder<'a> {
                     }
                     self.end_element()?;
                 }
+                // Outside the root element only white space reaches here
+                // (the reader refuses other character data there).
                 Ok(Event::Text(ref e)) => {
                     if !self.element_stack.is_empty() {
-                        let text = e.xml10_content().map_err(quick_xml::Error::from)?;
+                        // XML 1.0 / 1.1 line-end normalization (§2.11).
+                        let text = e
+                            .xml_content(xml_reader.quick_xml_version())
+                            .map_err(|_| document_error(xml_reader.recheck().utf8()))?;
                         self.text(&text);
                     }
                 }
                 // References are reported apart from the surrounding text; the
                 // builder merges consecutive text anyway, so the run is rejoined.
                 Ok(Event::GeneralRef(ref e)) => {
-                    if !self.element_stack.is_empty() {
-                        let text = resolve_general_ref(e)?;
-                        self.text(&text);
-                    }
+                    let text = resolve_general_ref(e)
+                        .map_err(|e| document_error(xml_reader.recheck().decoding(e)))?;
+                    self.text(&text);
                 }
                 Ok(Event::CData(ref e)) => {
-                    if !self.element_stack.is_empty() {
-                        let text = std::str::from_utf8(e)?;
-                        self.text(text);
-                    }
+                    let text = std::str::from_utf8(e)
+                        .map_err(|_| document_error(xml_reader.recheck().utf8()))?;
+                    self.text(text);
                 }
                 Ok(Event::Comment(ref e)) => {
-                    let text = std::str::from_utf8(e)?;
+                    let text = std::str::from_utf8(e)
+                        .map_err(|_| document_error(xml_reader.recheck().utf8()))?;
                     self.comment(text)?;
                 }
                 Ok(Event::PI(ref e)) => {
-                    let raw = std::str::from_utf8(e)?;
+                    let raw = std::str::from_utf8(e)
+                        .map_err(|_| document_error(xml_reader.recheck().utf8()))?;
                     let (target, data) = parse_pi_content(raw);
                     self.processing_instruction(target, data)?;
                 }
-                Ok(Event::Decl(_) | Event::DocType(_)) => {}
+                Ok(Event::Decl(_)) => {
+                    if let Some(declaration) = xml_reader.declaration() {
+                        self.set_xml_declaration(declaration.clone());
+                    }
+                }
+                // Not kept; its keyword is checked at the next read.
+                Ok(Event::DocType(_)) => {}
                 Ok(Event::Eof) => break,
-                Err(e) => return Err(e.into()),
+                Err(e) => return Err(document_error(e)),
             }
-            buf.clear();
         }
 
         self.finalize()
     }
 
-    /// Handles `Event::Start` and `Event::Empty` elements.
-    fn handle_start_or_empty(
+    /// Records the XML declaration of the document being read.
+    pub(crate) fn set_xml_declaration(&mut self, declaration: crate::xml::XmlDeclaration) {
+        self.doc.xml_declaration = Some(declaration);
+    }
+
+    /// Handles `Event::Start` and `Event::Empty` elements; `spans` are the
+    /// tag's attributes, as the reader found them while checking it.
+    fn handle_start_or_empty<R: BufRead>(
         &mut self,
         e: &quick_xml::events::BytesStart<'_>,
+        xml_reader: &WfReader<R>,
         is_empty: bool,
         prefix_map: &mut HashMap<Box<[u8]>, Vec<String>>,
         scope_decls: &mut Vec<Vec<Box<[u8]>>>,
     ) -> Result<u32, BufferDocumentError> {
+        // The tag's attributes, as the reader found them while checking it.
+        let spans = xml_reader.attributes();
+        let version = xml_reader.quick_xml_version();
+        // The reader checked the tag (UTF-8, bound prefixes, references):
+        // `at` reports what still fails as the refusal it is (see `Recheck`).
+        let at = xml_reader.recheck();
+        let utf8 = |_| document_error(at.utf8());
+        let tag: &[u8] = e;
         let mut local_decls: Vec<Box<[u8]>> = Vec::new();
         let mut ns_decls_str: Vec<(String, String)> = Vec::new();
 
         // First pass: collect xmlns declarations
-        for attr_result in e.attributes() {
-            let attr = attr_result?;
-            let key = attr.key.as_ref();
-
-            if key == b"xmlns" {
-                // Default namespace declaration
-                let value = attr.normalized_value(XmlVersion::Implicit1_0)?;
-                let uri = value.to_string();
-                let prefix_key: Box<[u8]> = b"".to_vec().into_boxed_slice();
-                prefix_map
-                    .entry(prefix_key.clone())
-                    .or_default()
-                    .push(uri.clone());
-                local_decls.push(prefix_key);
-                ns_decls_str.push((String::new(), uri));
-            } else if key.starts_with(b"xmlns:") {
-                let prefix_bytes = &key[6..];
-                let value = attr.normalized_value(XmlVersion::Implicit1_0)?;
-                let uri = value.to_string();
-                let prefix_key: Box<[u8]> = prefix_bytes.to_vec().into_boxed_slice();
-                prefix_map
-                    .entry(prefix_key.clone())
-                    .or_default()
-                    .push(uri.clone());
-                local_decls.push(prefix_key);
-                let prefix_str =
-                    std::str::from_utf8(prefix_bytes).map_err(BufferDocumentError::Utf8)?;
-                ns_decls_str.push((prefix_str.to_string(), uri));
+        for span in spans {
+            if span.kind == AttrKind::Attribute {
+                continue;
             }
+            let prefix_bytes = span.prefix(tag);
+            let uri = span
+                .value(tag, version)
+                .map_err(|e| document_error(at.decoding(e)))?
+                .into_owned();
+            let prefix_key: Box<[u8]> = prefix_bytes.to_vec().into_boxed_slice();
+            prefix_map
+                .entry(prefix_key.clone())
+                .or_default()
+                .push(uri.clone());
+            local_decls.push(prefix_key);
+            let prefix_str = std::str::from_utf8(prefix_bytes).map_err(utf8)?;
+            ns_decls_str.push((prefix_str.to_string(), uri));
         }
 
         scope_decls.push(local_decls);
@@ -1252,56 +1746,50 @@ impl<'a> BufferDocumentBuilder<'a> {
         let full_name_bytes = full_name.as_ref();
         let (elem_prefix_bytes, elem_local_bytes) = split_prefix_local(full_name_bytes);
 
-        let elem_local =
-            std::str::from_utf8(elem_local_bytes).map_err(BufferDocumentError::Utf8)?;
-        let elem_prefix_str =
-            std::str::from_utf8(elem_prefix_bytes).map_err(BufferDocumentError::Utf8)?;
+        let elem_local = std::str::from_utf8(elem_local_bytes).map_err(utf8)?;
+        let elem_prefix_str = std::str::from_utf8(elem_prefix_bytes).map_err(utf8)?;
 
         // Resolve element namespace
         let elem_ns_uri = match prefix_map.get(elem_prefix_bytes) {
-            Some(stack) if !stack.is_empty() => stack.last().unwrap().as_str().to_string(),
-            _ if elem_prefix_bytes.is_empty() => String::new(),
-            _ => {
-                return Err(BufferDocumentError::UnboundPrefix(
-                    elem_prefix_str.to_string(),
-                ))
+            // An empty binding of a prefix is an XML 1.1 undeclaration: not
+            // bound (the reader refuses that before; this is a safeguard).
+            Some(stack)
+                if !stack.is_empty()
+                    && (elem_prefix_bytes.is_empty() || !stack.last().unwrap().is_empty()) =>
+            {
+                stack.last().unwrap().as_str().to_string()
             }
+            _ if elem_prefix_bytes.is_empty() => String::new(),
+            _ => return Err(document_error(at.unbound(elem_prefix_bytes))),
         };
 
         let elem_ref =
             self.start_element(elem_local, &elem_ns_uri, elem_prefix_str, &ns_decl_refs)?;
 
         // Second pass: non-xmlns attributes
-        for attr_result in e.attributes() {
-            let attr = attr_result?;
-            let key = attr.key.as_ref();
-
-            // Skip xmlns declarations
-            if key == b"xmlns" || key.starts_with(b"xmlns:") {
+        for span in spans {
+            if span.kind != AttrKind::Attribute {
                 continue;
             }
-
-            let (attr_prefix_bytes, attr_local_bytes) = split_prefix_local(key);
-            let attr_local =
-                std::str::from_utf8(attr_local_bytes).map_err(BufferDocumentError::Utf8)?;
-            let attr_prefix_str =
-                std::str::from_utf8(attr_prefix_bytes).map_err(BufferDocumentError::Utf8)?;
+            let attr_prefix_bytes = span.prefix(tag);
+            let attr_local = std::str::from_utf8(span.local(tag)).map_err(utf8)?;
+            let attr_prefix_str = std::str::from_utf8(attr_prefix_bytes).map_err(utf8)?;
 
             // Resolve attr namespace: unprefixed → empty, prefixed → lookup
             let attr_ns_uri = if attr_prefix_bytes.is_empty() {
                 String::new()
             } else {
                 match prefix_map.get(attr_prefix_bytes) {
-                    Some(stack) if !stack.is_empty() => stack.last().unwrap().as_str().to_string(),
-                    _ => {
-                        return Err(BufferDocumentError::UnboundPrefix(
-                            attr_prefix_str.to_string(),
-                        ))
+                    Some(stack) if !stack.is_empty() && !stack.last().unwrap().is_empty() => {
+                        stack.last().unwrap().as_str().to_string()
                     }
+                    _ => return Err(document_error(at.unbound(attr_prefix_bytes))),
                 }
             };
 
-            let unescaped = attr.normalized_value(XmlVersion::Implicit1_0)?;
+            let unescaped = span
+                .value(tag, version)
+                .map_err(|e| document_error(at.decoding(e)))?;
             self.attribute(attr_local, &attr_ns_uri, attr_prefix_str, &unescaped)?;
 
             // A duplicate `xml:id` is a defect of the *document*, and a driver
@@ -1425,15 +1913,21 @@ fn typed_id_key<'v>(
     value: &'v str,
     type_key: TypeKey,
     schema_set: &SchemaSet,
+    scope: &InScope<'_, '_>,
 ) -> Option<Cow<'v, str>> {
     match class {
         IdClass::Never | IdClass::Unknown => None,
         IdClass::PlainId => id_index_key(value),
         IdClass::ByValue => {
-            let typed =
-                crate::validation::simple::validate_simple_type(value, type_key, schema_set)
-                    .ok()?
-                    .typed_value;
+            let resolver = |prefix: Option<&str>| scope.binding(prefix);
+            let typed = crate::validation::simple::validate_simple_type_in(
+                value,
+                type_key,
+                schema_set,
+                Some(&resolver),
+            )
+            .ok()?
+            .typed_value;
             let id = single_id(&typed)?;
             id_index_key(id).map(|key| Cow::Owned(key.into_owned()))
         }
@@ -1453,13 +1947,180 @@ fn single_id(value: &XmlValue) -> Option<&str> {
             Some(id)
         }
         XmlValueKind::Union(member) => single_id(member),
-        XmlValueKind::List { item_type, items } if *item_type == XmlTypeCode::Id => {
-            match items.as_slice() {
-                [XmlAtomicValue::String(id)] => Some(id),
-                _ => None,
+        XmlValueKind::List { items, .. } => match items.as_slice() {
+            [member] => single_id(member),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Whether the values of an annotation can have the is-idrefs property — the
+/// one test most annotations need, kept per binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdrefsClass {
+    /// Not classified yet.
+    Unknown,
+    /// No value of this type holds an `xs:IDREF`: none is reachable through
+    /// its derivation, its list item type or its union member types.
+    Never,
+    /// It depends on the value (and on its validity): the typed value is
+    /// computed.
+    ByValue,
+}
+
+impl IdrefsClass {
+    fn of(binding: &NodeSchemaBinding, schema_set: &SchemaSet) -> Self {
+        let builtins = schema_set.builtin_types();
+        let targets = [
+            builtins.get_by_type_code(XmlTypeCode::IdRef),
+            builtins.get_by_type_code(XmlTypeCode::IdRefs),
+        ];
+        let reaches = match binding.type_key {
+            TypeKey::Simple(sk) => Self::reaches(sk, &targets, schema_set, 0),
+            // The navigator gives a complex annotation a typed value only for
+            // text-only content.
+            TypeKey::Complex(_) => binding.content_type == Some(ContentType::TextOnly),
+        };
+        if reaches {
+            IdrefsClass::ByValue
+        } else {
+            IdrefsClass::Never
+        }
+    }
+
+    fn reaches(
+        sk: SimpleTypeKey,
+        targets: &[Option<SimpleTypeKey>; 2],
+        schema_set: &SchemaSet,
+        depth: u32,
+    ) -> bool {
+        if depth > 32 {
+            return false;
+        }
+        if targets
+            .iter()
+            .flatten()
+            .any(|&target| schema_set.derives_from(sk, target))
+        {
+            return true;
+        }
+        let Some(data) = schema_set.arenas.simple_types.get(sk) else {
+            return false;
+        };
+        let reaches = |member: &TypeKey| match member {
+            TypeKey::Simple(member) => Self::reaches(*member, targets, schema_set, depth + 1),
+            TypeKey::Complex(_) => false,
+        };
+        match data.variety {
+            SimpleTypeVariety::List => data.resolved_item_type.as_ref().is_some_and(reaches),
+            SimpleTypeVariety::Union => data.resolved_member_types.iter().any(reaches),
+            SimpleTypeVariety::Atomic => false,
+        }
+    }
+}
+
+/// Whether the typed value of `value` under `type_key` holds an atomic value
+/// of type `xs:IDREF` or a type derived from it (the members of an
+/// `xs:IDREFS` value are) — the same `validate_simple_type` call
+/// [`typed_id_key`] makes, so that a value the type rejects has none.
+fn typed_is_idrefs(
+    value: &str,
+    type_key: TypeKey,
+    schema_set: &SchemaSet,
+    scope: &InScope<'_, '_>,
+) -> bool {
+    fn holds(value: &XmlValue) -> bool {
+        match &value.value {
+            XmlValueKind::Atomic(_) => value.type_code == XmlTypeCode::IdRef,
+            XmlValueKind::Union(member) => holds(member),
+            XmlValueKind::List { items, .. } => items.iter().any(holds),
+            XmlValueKind::UntypedAtomic(_) => false,
+        }
+    }
+    let resolver = |prefix: Option<&str>| scope.binding(prefix);
+    crate::validation::simple::validate_simple_type_in(value, type_key, schema_set, Some(&resolver))
+        .is_ok_and(|result| holds(&result.typed_value))
+}
+
+/// The namespace bindings in scope at a node of the document being built, as
+/// simple-type validation asks them (`validation::simple::PrefixResolver`):
+/// the answers `BufferDocNavigator` gives for the same node, so that the id
+/// and idrefs indexes classify a value by the union member its typed value
+/// has. Datatypes §3.3.18: the lexical mapping of a QName "depends on the
+/// namespace bindings in scope where the literal occurs" — read without them,
+/// a QName member whose facets need the expanded name (an `enumeration` of
+/// QNames) can fail where validation accepted it, and a later `xs:ID` /
+/// `xs:IDREF` member win.
+struct InScope<'d, 'a> {
+    doc: &'d BufferDocument<'a>,
+    /// The chain of the nearest element at or above the node that declares
+    /// namespaces.
+    head: NsRef,
+}
+
+impl<'d, 'a> InScope<'d, 'a> {
+    /// The bindings in scope at `node` (an attribute's are its element's).
+    fn at(doc: &'d BufferDocument<'a>, node: u32) -> Self {
+        Self {
+            doc,
+            head: doc.namespace_scope(node),
+        }
+    }
+
+    /// For a prefix, the namespace it is bound to (`None` when it is bound
+    /// nowhere); for no prefix, the default namespace (`Some(None)` without
+    /// one). The `xml` prefix is always bound.
+    fn binding(&self, prefix: Option<&str>) -> Option<Option<NameId>> {
+        let target = prefix.unwrap_or("");
+        let names = self.doc.names;
+        if target == "xml" {
+            return Some(Some(names.add(XML_NAMESPACE)));
+        }
+        for (_, ns) in self.doc.scope_walk(self.head) {
+            if names.resolve_ref(ns.prefix) == target {
+                let bound = !names.resolve_ref(ns.namespace_uri).is_empty();
+                return if target.is_empty() {
+                    Some(bound.then_some(ns.namespace_uri))
+                } else {
+                    bound.then_some(Some(ns.namespace_uri))
+                };
             }
         }
-        _ => None,
+        target.is_empty().then_some(None)
+    }
+}
+
+/// The distinct tokens of `value` that are NCNames, the IDREF values an
+/// is-idrefs node answers to: F&O 1.0 §15.5.3 matches the candidate against
+/// "fn:tokenize(fn:normalize-space(fn:string($N)), ' ')", and "ill-formed
+/// IDREF values are ignored".
+fn idref_tokens(value: &str) -> Vec<&str> {
+    let mut tokens: Vec<&str> = Vec::new();
+    for token in value
+        .split([' ', '\t', '\n', '\r'])
+        .filter(|t| crate::namespace::is_ncname(t))
+    {
+        if !tokens.contains(&token) {
+            tokens.push(token);
+        }
+    }
+    tokens
+}
+
+/// Files `node` under each of the IDREF tokens of `value`.
+fn file_idrefs(index: &mut HashMap<Box<str>, Vec<u32>>, node: u32, value: &str) {
+    for token in idref_tokens(value) {
+        match index.get_mut(token) {
+            Some(nodes) => {
+                if !nodes.contains(&node) {
+                    nodes.push(node);
+                }
+            }
+            None => {
+                index.insert(token.into(), vec![node]);
+            }
+        }
     }
 }
 
@@ -1486,10 +2147,12 @@ pub(crate) fn parse_pi_content(raw: &str) -> (&str, &str) {
     }
 }
 
-// Convert AttrError → quick_xml::Error (already has From impl in quick-xml 0.31)
-impl From<quick_xml::events::attributes::AttrError> for BufferDocumentError {
-    fn from(e: quick_xml::events::attributes::AttrError) -> Self {
-        BufferDocumentError::Parse(quick_xml::Error::from(e))
+/// The document error for an error of the well-formedness layer.
+fn document_error(e: WfError) -> BufferDocumentError {
+    match e {
+        WfError::Io(e) => BufferDocumentError::Io(e),
+        WfError::NotWellFormed(e) => BufferDocumentError::NotWellFormed(e),
+        WfError::Limit(e) => BufferDocumentError::LimitExceeded(e),
     }
 }
 
@@ -1785,6 +2448,85 @@ mod tests {
         assert!(doc.nodes.get(2).has_flag(Node::HAS_NMSP_DECLS));
     }
 
+    /// The scope table records where the chain in scope changes: at an
+    /// element that declares, and right after it ends; nothing for a
+    /// document that declares nothing.
+    #[test]
+    fn namespace_scope_changes_at_declaring_elements() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let plain = BufferDocument::from_reader_default(
+            b"<a><b><c/></b><d/></a>".as_slice(),
+            &arena,
+            &names,
+        )
+        .unwrap();
+        assert!(plain.ns_scopes.changes_for_test().is_empty());
+        for node in 0..plain.nodes.len() {
+            assert!(plain.namespace_scope(node).is_null());
+        }
+
+        // a=1, b=2, c=3 (declares), x=4 (attribute pair 4, 5), e=6, d=7.
+        let doc = BufferDocument::from_reader_default(
+            br#"<a><b><c xmlns:p="urn:p" x="1"><e/></c></b><d/></a>"#.as_slice(),
+            &arena,
+            &names,
+        )
+        .unwrap();
+        let c_head = doc.element_namespaces[&3];
+        assert_eq!(
+            doc.ns_scopes.changes_for_test(),
+            &[(3, c_head), (7, NsRef::NULL)],
+            "the scope of c from c on, nothing again from d on"
+        );
+        let scopes: Vec<bool> = (0..8).map(|n| doc.namespace_scope(n) == c_head).collect();
+        assert_eq!(
+            scopes,
+            [false, false, false, true, true, true, true, false],
+            "c, its attribute (name and value node) and its child e are in c's scope"
+        );
+    }
+
+    /// An element that declares again a prefix its ancestors declared makes
+    /// the walk of its scope skip their declarations of it: the walk from the
+    /// innermost element visits three nodes however deep the chain — its own
+    /// default namespace, then the outermost element's two declarations (the
+    /// skip passes over leading runs only; a reader drops the hidden default
+    /// namespace, whose prefix it has met).
+    #[test]
+    fn scope_walk_skips_hidden_redeclarations() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let mut text = String::from(r#"<e xmlns="urn:d" xmlns:p="urn:p">"#);
+        for _ in 0..100 {
+            text.push_str(r#"<e xmlns="urn:d">"#);
+        }
+        for _ in 0..101 {
+            text.push_str("</e>");
+        }
+        let doc = BufferDocument::from_reader_default(text.as_bytes(), &arena, &names).unwrap();
+        let innermost = doc.element_namespaces[&101];
+        let walked: Vec<(String, String)> = doc
+            .scope_walk(innermost)
+            .map(|(_, ns)| {
+                (
+                    names.resolve_ref(ns.prefix).to_string(),
+                    names.resolve_ref(ns.namespace_uri).to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            walked,
+            [
+                (String::new(), "urn:d".to_string()),
+                ("p".to_string(), "urn:p".to_string()),
+                (String::new(), "urn:d".to_string()),
+            ]
+        );
+        // The chain itself still holds every declaration, for the local axis.
+        assert_eq!(doc.namespace_pages.iter_chain(innermost).count(), 102);
+    }
+
     #[test]
     fn test_element_index_full_mode() {
         let arena = Bump::new();
@@ -1914,7 +2656,8 @@ mod tests {
             BufferDocumentBuilder::new(arena, names, None, BufferDocumentOptions::default())
                 .unwrap();
         let result = builder.build("<a>&nope;</a>".as_bytes());
-        assert!(matches!(result, Err(BufferDocumentError::Parse(_))));
+        assert!(matches!(result, Err(BufferDocumentError::NotWellFormed(e))
+            if e.rule() == crate::xml::WellFormednessRule::EntityDeclared));
     }
 
     #[test]
@@ -2051,7 +2794,8 @@ mod tests {
             BufferDocumentBuilder::new(arena, names, None, BufferDocumentOptions::default())
                 .unwrap();
         let result = builder.build(r#"<ns:root/>"#.as_bytes());
-        assert!(matches!(result, Err(BufferDocumentError::UnboundPrefix(_))));
+        assert!(matches!(result, Err(BufferDocumentError::NotWellFormed(e))
+            if e.rule() == crate::xml::WellFormednessRule::PrefixDeclared));
     }
 
     #[test]
@@ -2312,7 +3056,7 @@ mod tests {
             .evaluator(&ctx)
             .run_with_node(doc.create_navigator())
             .unwrap();
-        assert_eq!(result.as_str().as_deref(), Some("a|b"));
+        assert_eq!(result.to_owned_string().as_deref(), Some("a|b"));
     }
 
     // ── xml:id registration ───────────────────────────────────────────

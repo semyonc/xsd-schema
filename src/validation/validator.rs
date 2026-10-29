@@ -11,7 +11,7 @@ use crate::compiler::{build_substitution_group_map, SubstitutionGroupMap};
 use crate::ids::ComplexTypeKey;
 use crate::schema::SchemaSet;
 
-use super::errors::ValidationError;
+use super::errors::{DiagnosticItem, InstancePath, ValidationError, ValidationSubject};
 use super::info::ValidationFlags;
 use super::runtime::{build_content_models, PreparedContentModels, ValidationRuntime};
 
@@ -30,7 +30,17 @@ pub trait ValidationSink {
 }
 
 /// A validation warning (non-fatal)
+///
+/// Like [`ValidationError`], a warning the runtime reports about an instance
+/// item names its [`subject`](Self::subject) and the
+/// [`instance_path`](Self::instance_path) to it; both are `None` for a
+/// warning about the schema rather than the instance.
+///
+/// The struct is `#[non_exhaustive]`: build one with
+/// [`ValidationWarning::new`], then set the public fields or use the
+/// `with_*` builders.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ValidationWarning {
     /// Warning code
     pub code: &'static str,
@@ -38,9 +48,51 @@ pub struct ValidationWarning {
     pub message: String,
     /// Source location in the instance document
     pub location: Option<crate::parser::location::SourceLocation>,
+    /// Subject and positional path; see [`subject`](Self::subject).
+    item: Option<Box<DiagnosticItem>>,
+}
+
+impl ValidationWarning {
+    /// A warning with no subject and no path.
+    pub fn new(
+        code: &'static str,
+        message: impl Into<String>,
+        location: Option<crate::parser::location::SourceLocation>,
+    ) -> Self {
+        ValidationWarning {
+            code,
+            message: message.into(),
+            location,
+            item: None,
+        }
+    }
+
+    /// Set the [`subject`](Self::subject).
+    pub fn with_subject(mut self, subject: ValidationSubject) -> Self {
+        DiagnosticItem::set_subject(&mut self.item, subject);
+        self
+    }
+
+    /// Set the [`instance_path`](Self::instance_path).
+    pub fn with_instance_path(mut self, path: InstancePath) -> Self {
+        DiagnosticItem::set_instance_path(&mut self.item, path);
+        self
+    }
+
+    /// The element or attribute the warning is about, when there is one.
+    pub fn subject(&self) -> Option<&ValidationSubject> {
+        DiagnosticItem::subject(&self.item)
+    }
+
+    /// The namespace-aware positional path to the [`subject`](Self::subject).
+    pub fn instance_path(&self) -> Option<&InstancePath> {
+        DiagnosticItem::instance_path(&self.item)
+    }
 }
 
 impl std::fmt::Display for ValidationWarning {
+    /// `[code] message`, then ` at location` when it is known (the subject
+    /// and the path are not written).
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "[{}] {}", self.code, self.message)?;
         if let Some(loc) = &self.location {
@@ -89,9 +141,11 @@ impl<'a> ValidationSink for ErrorOnlySink<'a> {
 
 /// Selects which assertion evaluation path is active.
 ///
-/// XSD 1.1 assertions can be evaluated via two mutually exclusive paths:
-/// - `FragmentBuffer` — inline fragment buffering during streaming validation
-/// - `MainDocument` — external `BufferDocument`, assertions deferred to Phase 2
+/// - `FragmentBuffer` — XSD 1.1 assertions evaluated by inline fragment
+///   buffering during streaming validation
+/// - `MainDocument` — a placeholder for evaluating them against an external
+///   `BufferDocument`; not implemented: nothing evaluates assertions in this
+///   mode
 ///
 /// The `Disabled` default means no assertion evaluation occurs.
 #[cfg(feature = "xsd11")]
@@ -102,7 +156,8 @@ pub enum AssertionSource {
     Disabled,
     /// Inline fragment buffering. `PROCESS_ASSERTIONS` MUST be set.
     FragmentBuffer,
-    /// External `BufferDocument`. `PROCESS_ASSERTIONS` must NOT be set.
+    /// Placeholder for an external `BufferDocument` (no assertion is
+    /// evaluated). `PROCESS_ASSERTIONS` must NOT be set.
     MainDocument,
 }
 
@@ -131,15 +186,22 @@ pub struct SchemaValidator<'a> {
 }
 
 impl<'a> SchemaValidator<'a> {
-    /// Create a new `SchemaValidator` with default assertion mode (`Disabled`).
+    /// Create a new `SchemaValidator` for `schema_set` with `flags`.
     ///
-    /// `PROCESS_ASSERTIONS` is silently stripped from `flags` because the
-    /// default mode is `Disabled`, and the two must agree. Use
-    /// `new_fragment_buffer()` or `new_main_document()` (XSD 1.1) to
-    /// enable assertion processing.
+    /// Under the `xsd11` feature the assertion mode follows `flags`:
+    ///
+    /// - with `ValidationFlags::PROCESS_ASSERTIONS` set, the XSD 1.1
+    ///   assertions of complex types (`xs:assert`) are evaluated inline while
+    ///   streaming, by buffering each asserted element's subtree — the mode
+    ///   `new_fragment_buffer` selects;
+    /// - without it, they are not evaluated: an asserted element's
+    ///   `SchemaInfo::assertion_outcome` is `AssertionOutcome::NotEvaluated`.
+    ///
+    /// The `assertion` facet of simple types is part of simple-type
+    /// validation and is evaluated either way. The flag is never dropped;
+    /// only `new_main_document`, which selects a different assertion mode,
+    /// removes it.
     pub fn new(schema_set: &'a SchemaSet, flags: ValidationFlags) -> Self {
-        #[cfg(feature = "xsd11")]
-        let flags = flags & !ValidationFlags::PROCESS_ASSERTIONS;
         let subst_groups = build_substitution_group_map(schema_set);
         let content_models = build_content_models(schema_set);
         SchemaValidator {
@@ -152,8 +214,14 @@ impl<'a> SchemaValidator<'a> {
             subst_groups: (!subst_groups.is_empty()).then_some(subst_groups),
             content_models,
             flags,
+            // The flag and the mode always agree (the runtime asserts it at
+            // the first element): the flag selects inline evaluation.
             #[cfg(feature = "xsd11")]
-            assertion_source: AssertionSource::default(),
+            assertion_source: if flags.contains(ValidationFlags::PROCESS_ASSERTIONS) {
+                AssertionSource::FragmentBuffer
+            } else {
+                AssertionSource::Disabled
+            },
         }
     }
 
@@ -206,6 +274,9 @@ impl<'a> SchemaValidator<'a> {
     }
 
     /// Create a new `SchemaValidator` with pre-built substitution groups.
+    ///
+    /// `flags` are handled as by [`new`](Self::new), `PROCESS_ASSERTIONS`
+    /// included.
     pub fn with_substitution_groups(
         schema_set: &'a SchemaSet,
         flags: ValidationFlags,
@@ -217,16 +288,29 @@ impl<'a> SchemaValidator<'a> {
         }
     }
 
-    /// XSD 1.1: forces `PROCESS_ASSERTIONS` flag, sets `FragmentBuffer` mode.
+    /// XSD 1.1: a validator that evaluates assertions inline while streaming
+    /// (the `FragmentBuffer` mode), whether or not `flags` contains
+    /// `PROCESS_ASSERTIONS` — the flag is added.
+    ///
+    /// Equivalent to [`new`](Self::new) with
+    /// `flags | ValidationFlags::PROCESS_ASSERTIONS`.
     #[cfg(feature = "xsd11")]
     pub fn new_fragment_buffer(schema_set: &'a SchemaSet, flags: ValidationFlags) -> Self {
-        let mut v = Self::new(schema_set, flags);
-        v.flags |= ValidationFlags::PROCESS_ASSERTIONS;
-        v.assertion_source = AssertionSource::FragmentBuffer;
-        v
+        Self::new(schema_set, flags | ValidationFlags::PROCESS_ASSERTIONS)
     }
 
-    /// XSD 1.1: clears `PROCESS_ASSERTIONS` flag, sets `MainDocument` mode.
+    /// XSD 1.1: a validator in the `MainDocument` assertion mode, in which
+    /// **no assertion is evaluated**: neither the runtime nor any other entry
+    /// point of this crate evaluates `xs:assert` for it, so an instance that
+    /// violates an assertion validates, and an asserted element reports
+    /// [`AssertionOutcome::NotEvaluated`](super::AssertionOutcome::NotEvaluated).
+    /// (The mode is a placeholder for evaluating assertions against an
+    /// external [`BufferDocument`](crate::document::BufferDocument), which is
+    /// not implemented.)
+    ///
+    /// `PROCESS_ASSERTIONS` is removed from `flags`. To evaluate assertions,
+    /// use [`new`](Self::new) with the flag, or
+    /// [`new_fragment_buffer`](Self::new_fragment_buffer).
     #[cfg(feature = "xsd11")]
     pub fn new_main_document(schema_set: &'a SchemaSet, flags: ValidationFlags) -> Self {
         let flags = flags & !ValidationFlags::PROCESS_ASSERTIONS;
@@ -322,17 +406,30 @@ mod assertion_source_tests {
     }
 
     #[test]
-    fn test_new_strips_process_assertions_flag() {
+    fn test_new_honours_process_assertions_flag() {
         let schema_set = load_schema(
             r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
                 <xs:element name="root" type="xs:string"/>
             </xs:schema>"#,
         );
-        // Passing PROCESS_ASSERTIONS to new() is silently stripped
+        // PROCESS_ASSERTIONS passed to new() selects the inline
+        // (fragment-buffer) assertion mode, as new_fragment_buffer() does.
         let flags = ValidationFlags::default() | ValidationFlags::PROCESS_ASSERTIONS;
         let v = SchemaValidator::new(&schema_set, flags);
+        assert!(v.flags.contains(ValidationFlags::PROCESS_ASSERTIONS));
+        assert_eq!(v.assertion_source, AssertionSource::FragmentBuffer);
+
+        // with_substitution_groups is built on new() and agrees with it.
+        let groups = build_substitution_group_map(&schema_set);
+        let v = SchemaValidator::with_substitution_groups(&schema_set, flags, groups);
+        assert!(v.flags.contains(ValidationFlags::PROCESS_ASSERTIONS));
+        assert_eq!(v.assertion_source, AssertionSource::FragmentBuffer);
+
+        // new_main_document() still clears the flag: that mode evaluates
+        // assertions against an external document, never inline.
+        let v = SchemaValidator::new_main_document(&schema_set, flags);
         assert!(!v.flags.contains(ValidationFlags::PROCESS_ASSERTIONS));
-        assert_eq!(v.assertion_source, AssertionSource::Disabled);
+        assert_eq!(v.assertion_source, AssertionSource::MainDocument);
     }
 
     #[test]

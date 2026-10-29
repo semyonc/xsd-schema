@@ -100,8 +100,8 @@ fn node_test_kind(node_test: &Option<NodeTest>) -> DomNodeType {
         Some(NodeTest::Type(seq)) => match &seq.item_type {
             ItemType::AnyItem | ItemType::AnyNode => DomNodeType::All,
             ItemType::Document(_) => DomNodeType::Root,
-            ItemType::Element(_, _) | ItemType::SchemaElement(_) => DomNodeType::Element,
-            ItemType::Attribute(_, _) | ItemType::SchemaAttribute(_) => DomNodeType::Attribute,
+            ItemType::Element { .. } | ItemType::SchemaElement(_) => DomNodeType::Element,
+            ItemType::Attribute { .. } | ItemType::SchemaAttribute(_) => DomNodeType::Attribute,
             ItemType::NamespaceNode => DomNodeType::Namespace,
             ItemType::Text => DomNodeType::Text,
             ItemType::Comment => DomNodeType::Comment,
@@ -115,7 +115,7 @@ fn descendant_element_kind(node_test: &Option<NodeTest>) -> DomNodeType {
     match node_test {
         Some(NodeTest::Name(_)) => DomNodeType::Element,
         Some(NodeTest::Type(seq)) => match &seq.item_type {
-            ItemType::Element(_, _) | ItemType::SchemaElement(_) => DomNodeType::Element,
+            ItemType::Element { .. } | ItemType::SchemaElement(_) => DomNodeType::Element,
             _ => DomNodeType::All,
         },
         None => DomNodeType::All,

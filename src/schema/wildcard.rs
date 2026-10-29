@@ -4,7 +4,6 @@
 
 use crate::ids::NameId;
 use crate::parser::location::SourceRef;
-use crate::schema::model::XsdVersion;
 
 /// Namespace constraint for wildcards
 ///
@@ -53,17 +52,14 @@ impl NamespaceConstraint {
         NamespaceConstraint::Enumeration(namespaces)
     }
 
-    /// Check if this constraint allows a given namespace
-    pub fn allows(
-        &self,
-        ns: Option<NameId>,
-        target_ns: Option<NameId>,
-        xsd_version: XsdVersion,
-    ) -> bool {
+    /// Check if this constraint allows a given namespace. No constraint kind
+    /// depends on the XSD version (`##other` is the same in both,
+    /// [`other_matches_namespace`](crate::types::complex::other_matches_namespace)).
+    pub fn allows(&self, ns: Option<NameId>, target_ns: Option<NameId>) -> bool {
         match self {
             NamespaceConstraint::Any => true,
             NamespaceConstraint::Other => {
-                crate::types::complex::other_matches_namespace(ns, target_ns, xsd_version)
+                crate::types::complex::other_matches_namespace(ns, target_ns)
             }
             NamespaceConstraint::Enumeration(allowed) => allowed.contains(&ns),
             NamespaceConstraint::Not(disallowed) => !disallowed.contains(&ns),
@@ -258,8 +254,8 @@ mod tests {
     #[test]
     fn test_namespace_constraint_any() {
         let constraint = NamespaceConstraint::any();
-        assert!(constraint.allows(Some(NameId(1)), None, XsdVersion::V1_0));
-        assert!(constraint.allows(None, None, XsdVersion::V1_0));
+        assert!(constraint.allows(Some(NameId(1)), None));
+        assert!(constraint.allows(None, None));
     }
 
     #[test]
@@ -267,22 +263,22 @@ mod tests {
         let constraint = NamespaceConstraint::other();
         let target = Some(NameId(1));
 
-        assert!(!constraint.allows(target, target, XsdVersion::V1_0)); // Same as target - not allowed
-        assert!(constraint.allows(Some(NameId(2)), target, XsdVersion::V1_0)); // Different - allowed
-                                                                               // XSD 1.0 and 1.1: absent namespace is NOT allowed by ##other
-                                                                               // (§3.10.4: when the schema has a target namespace, ##other excludes
-                                                                               // both the target ns and the absent ns).
-        assert!(!constraint.allows(None, target, XsdVersion::V1_0));
-        assert!(!constraint.allows(None, target, XsdVersion::V1_1));
+        assert!(!constraint.allows(target, target)); // Same as target - not allowed
+        assert!(constraint.allows(Some(NameId(2)), target)); // Different - allowed
+                                                             // XSD 1.0 and 1.1: absent namespace is NOT allowed by ##other
+                                                             // (§3.10.4: when the schema has a target namespace, ##other excludes
+                                                             // both the target ns and the absent ns).
+        assert!(!constraint.allows(None, target));
+        assert!(!constraint.allows(None, target));
     }
 
     #[test]
     fn test_namespace_constraint_enumeration() {
         let constraint = NamespaceConstraint::list(vec![Some(NameId(1)), Some(NameId(2))]);
 
-        assert!(constraint.allows(Some(NameId(1)), None, XsdVersion::V1_0));
-        assert!(constraint.allows(Some(NameId(2)), None, XsdVersion::V1_0));
-        assert!(!constraint.allows(Some(NameId(3)), None, XsdVersion::V1_0));
+        assert!(constraint.allows(Some(NameId(1)), None));
+        assert!(constraint.allows(Some(NameId(2)), None));
+        assert!(!constraint.allows(Some(NameId(3)), None));
     }
 
     #[test]

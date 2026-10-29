@@ -27,6 +27,7 @@ pub mod sequence;
 pub mod simple;
 pub mod validators;
 pub mod value;
+pub(crate) mod value_order;
 
 // Re-exports
 pub use builtin::BuiltinTypes;
@@ -45,7 +46,7 @@ pub use facets::{
 };
 #[cfg(feature = "xsd11")]
 pub use sequence::{
-    resolve_list_item_schema_type, ItemType, NameTest, SequenceType, XmlTypeCardinality,
+    resolve_list_item_schema_type, ItemType, NameTest, SequenceType, TypeTest, XmlTypeCardinality,
 };
 pub use simple::{
     BuiltInType, SimpleTypeDef, SimpleTypeDerivationMethod, SimpleTypeRef, SimpleTypeVariety,
@@ -55,8 +56,8 @@ pub use validators::{
 };
 pub use value::{
     DateTimeValue, DateValue, DayTimeDurationValue, DurationValue, GDayValue, GMonthDayValue,
-    GMonthValue, GYearMonthValue, GYearValue, TimeValue, TimezoneOffset, XmlAtomicValue, XmlValue,
-    XmlValueKind, YearMonthDurationValue,
+    GMonthValue, GYearMonthValue, GYearValue, QNameValue, TimeValue, TimezoneOffset,
+    XmlAtomicValue, XmlValue, XmlValueKind, YearMonthDurationValue,
 };
 
 // ============================================================================

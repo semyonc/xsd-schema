@@ -359,7 +359,7 @@ pub mod types {
 
     /// element()
     pub fn element() -> SequenceType {
-        SequenceType::one(ItemType::Element(None, None))
+        SequenceType::one(ItemType::element(None, None, false))
     }
 
     /// numeric (xs:double | xs:decimal | xs:float)

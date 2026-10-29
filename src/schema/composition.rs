@@ -13,7 +13,7 @@ use crate::ids::*;
 use crate::parser::location::SourceRef;
 
 /// The kind of composition relationship between two schema documents.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CompositionEdgeKind {
     Include,
     Import,

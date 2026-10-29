@@ -4,6 +4,15 @@
 //! `SimpleTypeKey` references for all 50 built-in XSD simple types, plus
 //! the built-in complex `xs:anyType`.
 //!
+//! Every set also has the types the XPath 2.0 data model adds to the XML
+//! Schema namespace (XDM 1.0 §2.6.2) — `xs:anyAtomicType`,
+//! `xs:untypedAtomic`, `xs:dayTimeDuration`, `xs:yearMonthDuration` — as
+//! components, for a host that validates nodes of the data model against a
+//! type it names ([`BuiltinTypes::xpath_type`]). A schema document reaches
+//! only the ones its XSD version defines: none of them in XSD 1.0, the first,
+//! third and fourth in XSD 1.1 (Datatypes 1.1 §3.2.2, §3.4.26, §3.4.27) —
+//! never `xs:untypedAtomic`, which no XSD version defines.
+//!
 //! ## Usage
 //!
 //! Built-in types are initialized when a `SchemaSet` is created and can be
@@ -53,7 +62,9 @@ pub struct BuiltinTypes {
     // Abstract types
     /// xs:anySimpleType - base of all simple types
     pub any_simple_type: SimpleTypeKey,
-    /// xs:anyAtomicType - base of all atomic types (XSD 1.1)
+    /// xs:anyAtomicType - base of all atomic types (XSD 1.1). `None` in an
+    /// XSD 1.0 set, whose schema documents cannot name it; a host finds the
+    /// set's component with [`xpath_type`](Self::xpath_type).
     pub any_atomic_type: Option<SimpleTypeKey>,
 
     // String types
@@ -135,13 +146,19 @@ pub struct BuiltinTypes {
     pub g_month: SimpleTypeKey,
 
     // XSD 1.1 date/time additions
-    /// xs:yearMonthDuration (XSD 1.1)
+    /// xs:yearMonthDuration (XSD 1.1). `None` in an XSD 1.0 set; a host finds
+    /// the set's component with [`xpath_type`](Self::xpath_type).
     pub year_month_duration: Option<SimpleTypeKey>,
-    /// xs:dayTimeDuration (XSD 1.1)
+    /// xs:dayTimeDuration (XSD 1.1). `None` in an XSD 1.0 set; a host finds
+    /// the set's component with [`xpath_type`](Self::xpath_type).
     pub day_time_duration: Option<SimpleTypeKey>,
     /// xs:dateTimeStamp (XSD 1.1)
     pub datetime_stamp: Option<SimpleTypeKey>,
-    /// xs:untypedAtomic (XSD 1.1)
+    /// xs:untypedAtomic, the XPath 2.0 data model's type (XDM 1.0 §2.6.2),
+    /// which no XML Schema version defines: schema documents cannot name it
+    /// (`src-resolve`) in either version. `Some` in an XSD 1.1 set and `None`
+    /// in an XSD 1.0 set, as before; a host finds the set's component in both
+    /// with [`xpath_type`](Self::xpath_type).
     pub untyped_atomic: Option<SimpleTypeKey>,
 
     // XSD 1.1 bottom type
@@ -185,6 +202,10 @@ pub struct BuiltinTypes {
     by_key: SecondaryMap<SimpleTypeKey, XmlTypeCode>,
     /// Map from local name NameId to SimpleTypeKey (for XS namespace)
     by_local_name: HashMap<NameId, SimpleTypeKey, RandomState>,
+    /// The XPath 2.0 data model's types (XDM 1.0 §2.6.2), present in every
+    /// set: in an XSD 1.1 set the same keys as the public fields; in an XSD
+    /// 1.0 set components that only a host reaches ([`Self::xpath_type`]).
+    xpath: XPathTypeKeys,
 
     // Built-in XSI attribute declarations (§3.2.7)
     /// `xsi:type` built-in attribute declaration
@@ -197,12 +218,35 @@ pub struct BuiltinTypes {
     pub xsi_no_namespace_schema_location_attr: AttributeKey,
 }
 
+/// The keys of the four types XPath 2.0's data model adds to the XML Schema
+/// namespace (`xs:untyped` is no simple type: a host's untyped element).
+#[derive(Debug, Clone, Copy)]
+struct XPathTypeKeys {
+    any_atomic_type: SimpleTypeKey,
+    untyped_atomic: SimpleTypeKey,
+    day_time_duration: SimpleTypeKey,
+    year_month_duration: SimpleTypeKey,
+}
+
+impl XPathTypeKeys {
+    fn get(&self, code: XmlTypeCode) -> Option<SimpleTypeKey> {
+        match code {
+            XmlTypeCode::AnyAtomicType => Some(self.any_atomic_type),
+            XmlTypeCode::UntypedAtomic => Some(self.untyped_atomic),
+            XmlTypeCode::DayTimeDuration => Some(self.day_time_duration),
+            XmlTypeCode::YearMonthDuration => Some(self.year_month_duration),
+            _ => None,
+        }
+    }
+}
+
 impl BuiltinTypes {
     /// Initialize all built-in types and register them in the schema set.
     ///
-    /// This creates `SimpleTypeDefData` entries in the arenas for all
-    /// 47 XSD 1.0 built-in types (plus 3 additional XSD 1.1 types if
-    /// the version is XSD 1.1).
+    /// This creates `SimpleTypeDefData` entries in the arenas for the 45
+    /// XSD 1.0 built-in simple types and the four types of the XPath 2.0 data
+    /// model ([`xpath_type`](Self::xpath_type)), plus `xs:dateTimeStamp` and
+    /// `xs:error` if the version is XSD 1.1.
     pub fn new(schema_set: &mut SchemaSet) -> Self {
         let xsd_version = schema_set.xsd_version;
         let xs_ns = Some(well_known::XS_NAMESPACE);
@@ -363,7 +407,19 @@ impl BuiltinTypes {
         let idrefs = create_type(BuiltInType::IDREFS);
         let entities = create_type(BuiltInType::ENTITIES);
 
-        // XSD 1.1 types (only if XSD 1.1 mode)
+        // The XPath 2.0 data model's types (XDM 1.0 §2.6.2), in every set.
+        let xpath = XPathTypeKeys {
+            any_atomic_type: create_type(BuiltInType::AnyAtomicType),
+            untyped_atomic: create_type(BuiltInType::UntypedAtomic),
+            year_month_duration: create_type(BuiltInType::YearMonthDuration),
+            day_time_duration: create_type(BuiltInType::DayTimeDuration),
+        };
+
+        // The XSD 1.1 built-ins: three of the data model's types (Datatypes
+        // 1.1 §3.2.2, §3.4.26, §3.4.27), `xs:dateTimeStamp`, `xs:error`. The
+        // field `untyped_atomic` is filled in 1.1 too, but XSD 1.1 does not
+        // define that type (below: no entry by name).
+        let v11 = xsd_version == XsdVersion::V1_1;
         let (
             any_atomic_type,
             untyped_atomic,
@@ -371,12 +427,12 @@ impl BuiltinTypes {
             day_time_duration,
             datetime_stamp,
             error,
-        ) = if xsd_version == XsdVersion::V1_1 {
+        ) = if v11 {
             (
-                Some(create_type(BuiltInType::AnyAtomicType)),
-                Some(create_type(BuiltInType::UntypedAtomic)),
-                Some(create_type(BuiltInType::YearMonthDuration)),
-                Some(create_type(BuiltInType::DayTimeDuration)),
+                Some(xpath.any_atomic_type),
+                Some(xpath.untyped_atomic),
+                Some(xpath.year_month_duration),
+                Some(xpath.day_time_duration),
                 Some(create_type(BuiltInType::DateTimeStamp)),
                 Some(create_type(BuiltInType::XsError)),
             )
@@ -477,9 +533,6 @@ impl BuiltinTypes {
         if let Some(key) = any_atomic_type {
             add_to_maps(BuiltInType::AnyAtomicType, key);
         }
-        if let Some(key) = untyped_atomic {
-            add_to_maps(BuiltInType::UntypedAtomic, key);
-        }
         if let Some(key) = year_month_duration {
             add_to_maps(BuiltInType::YearMonthDuration, key);
         }
@@ -491,6 +544,32 @@ impl BuiltinTypes {
         }
         if let Some(key) = error {
             add_to_maps(BuiltInType::XsError, key);
+        }
+        // `xs:untypedAtomic` has no entry by name in either version, so that a
+        // schema document's QName naming it does not resolve — Structures 1.1
+        // §1.3.1.1: the data model "makes use of type labels in the XSD
+        // namespace (untyped, untypedAtomic) which are not defined in this
+        // specification"; §3.17.6.2 QName resolution (Schema Document), clause
+        // 1.1: a QName resolves to a type definition only if "That component
+        // is a member of the value of the appropriate property of the schema
+        // … {type definitions}", and the type definitions present in every
+        // schema by definition (§3.16.7) do not include it — `src-resolve`.
+        // An XSD 1.1 set keeps it by code (its field and
+        // `get_by_type_code`, as before); a host reaches it in both versions
+        // through `xpath_type`.
+        if let Some(key) = untyped_atomic {
+            by_type_code.insert(XmlTypeCode::UntypedAtomic, key);
+            by_key.insert(key, XmlTypeCode::UntypedAtomic);
+        }
+        // In an XSD 1.0 set the data model's types have a type code (so an
+        // annotation names its datatype) but no entry by code or by name: a
+        // schema document, an `xsi:type` and the code lookups of schema
+        // processing do not find them.
+        if !v11 {
+            by_key.insert(xpath.any_atomic_type, XmlTypeCode::AnyAtomicType);
+            by_key.insert(xpath.untyped_atomic, XmlTypeCode::UntypedAtomic);
+            by_key.insert(xpath.year_month_duration, XmlTypeCode::YearMonthDuration);
+            by_key.insert(xpath.day_time_duration, XmlTypeCode::DayTimeDuration);
         }
 
         // Resolve item types for built-in list types so that
@@ -667,6 +746,7 @@ impl BuiltinTypes {
             by_type_code,
             by_key,
             by_local_name,
+            xpath,
             xsi_type_attr,
             xsi_nil_attr,
             xsi_schema_location_attr,
@@ -676,9 +756,52 @@ impl BuiltinTypes {
 
     /// Get a built-in type by its XmlTypeCode.
     ///
-    /// Returns `None` for node types, AnyType, and other non-simple type codes.
+    /// Returns `None` for node types, AnyType, and other non-simple type codes,
+    /// and for a type the set's XSD version does not define: in an XSD 1.0 set
+    /// the four types of the XPath 2.0 data model, which
+    /// [`xpath_type`](Self::xpath_type) finds. (An XSD 1.1 set answers for
+    /// `xs:untypedAtomic` too, which its schema documents cannot name.)
     pub fn get_by_type_code(&self, code: XmlTypeCode) -> Option<SimpleTypeKey> {
         self.by_type_code.get(&code).copied()
+    }
+
+    /// The simple type with this code as a host of the XPath 2.0 data model
+    /// sees the set: every built-in simple type [`get_by_type_code`](Self::get_by_type_code)
+    /// finds, and the four types the data model adds to the XML Schema
+    /// namespace (XDM 1.0 §2.6.2: "the data model defines five additional
+    /// types: xs:anyAtomicType, xs:untyped, xs:untypedAtomic,
+    /// xs:dayTimeDuration, and xs:yearMonthDuration"; `xs:untyped` is no
+    /// simple type) in both XSD versions.
+    ///
+    /// In an XSD 1.1 set those are the set's own components (the fields
+    /// [`any_atomic_type`](Self::any_atomic_type) …), of which its schema
+    /// documents name all but `xs:untypedAtomic`. In an XSD 1.0 set,
+    /// whose schema documents cannot name them (XML Schema 1.0 has none of
+    /// them), they are components only a host reaches: validation against
+    /// them, annotations, typed values and the type hierarchy work as in a
+    /// 1.1 set; their places in it are XDM's — `xs:dayTimeDuration` and
+    /// `xs:yearMonthDuration` restrict `xs:duration`, `xs:untypedAtomic`
+    /// restricts `xs:anyAtomicType`, and every atomic type derives from
+    /// `xs:anyAtomicType`, which restricts `xs:anySimpleType`.
+    pub fn xpath_type(&self, code: XmlTypeCode) -> Option<SimpleTypeKey> {
+        self.get_by_type_code(code).or_else(|| self.xpath.get(code))
+    }
+
+    /// Whether `key` is one of the four types of the XPath 2.0 data model.
+    pub(crate) fn is_xpath_type(&self, key: SimpleTypeKey) -> bool {
+        key == self.xpath.any_atomic_type
+            || key == self.xpath.untyped_atomic
+            || key == self.xpath.day_time_duration
+            || key == self.xpath.year_month_duration
+    }
+
+    /// In an XSD 1.0 set, whether `key` is the data model's
+    /// `xs:anyAtomicType`, which the {base type definition} chains of XSD 1.0
+    /// do not pass through (a 1.0 primitive's base is `xs:anySimpleType`):
+    /// derivation from it is decided by variety instead
+    /// ([`xpath_type`](Self::xpath_type)).
+    pub(crate) fn is_detached_any_atomic_type(&self, key: SimpleTypeKey) -> bool {
+        self.any_atomic_type.is_none() && key == self.xpath.any_atomic_type
     }
 
     /// Get a built-in type by its local name (within the XS namespace).
@@ -700,6 +823,20 @@ impl BuiltinTypes {
         self.get_type_code(key).is_some()
     }
 
+    /// True when `key` is one of the four attribute declarations present in
+    /// every schema by definition (Structures 1.1 §3.2.7): `xsi:type`,
+    /// `xsi:nil`, `xsi:schemaLocation`, `xsi:noNamespaceSchemaLocation`.
+    #[cfg(feature = "xsd11")]
+    pub(crate) fn is_builtin_attribute(&self, key: AttributeKey) -> bool {
+        [
+            self.xsi_type_attr,
+            self.xsi_nil_attr,
+            self.xsi_schema_location_attr,
+            self.xsi_no_namespace_schema_location_attr,
+        ]
+        .contains(&key)
+    }
+
     /// True when `key` is the `xs:anyAtomicType` built-in (XSD 1.1 only).
     #[inline]
     pub fn is_any_atomic_type(&self, key: SimpleTypeKey) -> bool {
@@ -713,6 +850,10 @@ impl BuiltinTypes {
     ///
     /// In XSD 1.1 mode, primitive atomic types derive from `xs:anyAtomicType`
     /// per §3.16.7.3; in XSD 1.0 they derive from `xs:anySimpleType`.
+    ///
+    /// The data model's types of an XSD 1.0 set ([`xpath_type`](Self::xpath_type))
+    /// have their XDM bases: `xs:untypedAtomic` → `xs:anyAtomicType` →
+    /// `xs:anySimpleType`, the durations → `xs:duration`.
     pub fn get_base_type(&self, key: SimpleTypeKey) -> Option<SimpleTypeKey> {
         let code = self.get_type_code(key)?;
         let base_code = get_builtin_base_type(code)?;
@@ -722,7 +863,7 @@ impl BuiltinTypes {
         {
             return self.any_atomic_type;
         }
-        self.get_by_type_code(base_code)
+        self.xpath_type(base_code)
     }
 
     /// Check if `derived` derives from `base` (transitively).
@@ -730,9 +871,19 @@ impl BuiltinTypes {
     /// Returns `true` if:
     /// - `derived == base`, or
     /// - `derived` has `base` somewhere in its derivation chain
+    ///
+    /// In an XSD 1.0 set every atomic built-in type derives from the data
+    /// model's `xs:anyAtomicType` (XDM 1.0 §2.6.2: "All primitive atomic
+    /// types … have xs:anyAtomicType as their base type"), although its
+    /// {base type definition} chain ends at `xs:anySimpleType`.
     pub fn derives_from(&self, derived: SimpleTypeKey, base: SimpleTypeKey) -> bool {
         if derived == base {
             return true;
+        }
+        if self.is_detached_any_atomic_type(base) {
+            return self
+                .get_type_code(derived)
+                .is_some_and(|code| code.is_atomic());
         }
 
         // Walk up the derivation chain
@@ -747,9 +898,10 @@ impl BuiltinTypes {
         false
     }
 
-    /// Returns the number of registered built-in types.
-    ///
-    /// This is 47 for XSD 1.0, or 50+ for XSD 1.1.
+    /// Returns the number of built-in simple types the set has by code
+    /// ([`get_by_type_code`](Self::get_by_type_code)): 45 for XSD 1.0, 51 for
+    /// XSD 1.1 (its 50 and `xs:untypedAtomic`; without `xs:anyType`, and
+    /// without the data model's types an XSD 1.0 set has for a host).
     pub fn count(&self) -> usize {
         self.by_type_code.len()
     }

@@ -36,6 +36,8 @@
 //! assert_eq!(sum, 42.0);
 //! ```
 
+use std::cell::RefCell;
+
 use num_bigint::BigInt;
 
 use crate::namespace::qname::QualifiedName;
@@ -44,7 +46,7 @@ use super::arena::{AstArena, AstNodeId, SourceSpan};
 use super::bind::bind_node;
 use super::context::{DynamicContext, NameBinder, VarSlotId, XPathContext};
 use super::deps::{analyze, ExprDependencies, FunctionCallRef};
-use super::error::XPathError;
+use super::error::{XPathError, XPathWarning};
 use super::eval::eval_node;
 use super::functions::{effective_boolean_value, XPathValue};
 use super::iterator::XmlItem;
@@ -453,6 +455,12 @@ impl XPathExpr {
     /// The evaluator uses a builder pattern to set variables and other options
     /// before running the expression.
     ///
+    /// `ctx` should be the static context the expression was compiled with, or
+    /// one with the same name table and schema set: binding resolved the
+    /// expression's names and schema types against those (a cast target or an
+    /// `instance of` type is kept as a key of that schema set), and evaluation
+    /// reads them against the schema set of `ctx`.
+    ///
     /// # Example
     ///
     /// ```no_run
@@ -632,6 +640,8 @@ pub struct XPathEvaluator<'expr, 'ctx> {
     pending_vars: Vec<(VarSlotId, PendingValue)>,
     /// The host's cache of compiled regular expressions, lent to the run.
     regex_cache: Option<&'ctx RegexCache>,
+    /// Where the run's warnings go; see [`with_warnings`](Self::with_warnings).
+    warnings: Option<&'ctx RefCell<Vec<XPathWarning>>>,
 }
 
 impl<'expr, 'ctx> XPathEvaluator<'expr, 'ctx> {
@@ -642,6 +652,7 @@ impl<'expr, 'ctx> XPathEvaluator<'expr, 'ctx> {
             static_ctx,
             pending_vars: Vec::new(),
             regex_cache: None,
+            warnings: None,
         }
     }
 
@@ -691,6 +702,41 @@ impl<'expr, 'ctx> XPathEvaluator<'expr, 'ctx> {
     /// later, wins).
     pub fn with_regex_cache(mut self, cache: &'ctx RegexCache) -> Self {
         self.regex_cache = Some(cache);
+        self
+    }
+
+    /// Collect the run's warnings ([`XPathWarning`]) into `warnings`, after
+    /// the run, whether it succeeded or failed; without a collector they are
+    /// dropped. Each site of the expression warns once per run.
+    ///
+    /// ```
+    /// use std::cell::RefCell;
+    /// use xsd_schema::namespace::context::NamespaceContextSnapshot;
+    /// use xsd_schema::namespace::table::NameTable;
+    /// use xsd_schema::xpath::{RoXmlNavigator, XPathContext, XPathExpr};
+    ///
+    /// let names = NameTable::new();
+    /// let mut namespaces = NamespaceContextSnapshot::default();
+    /// namespaces.bindings.push((names.add("xs"), names.add("http://www.w3.org/2001/XMLSchema")));
+    /// let ctx = XPathContext::new(&names).with_namespaces(namespaces);
+    /// // 59 seconds and a fraction of 28 digits: 30 digits, more than the
+    /// // seconds field holds; the fraction keeps 27 digits.
+    /// let expr = XPathExpr::compile(
+    ///     "xs:dayTimeDuration('PT0.1234567890123456789012345678S') + xs:dayTimeDuration('PT59S')",
+    ///     &ctx,
+    /// )
+    /// .unwrap();
+    /// let warnings = RefCell::new(Vec::new());
+    /// let value = expr
+    ///     .evaluator(&ctx)
+    ///     .with_warnings(&warnings)
+    ///     .run_string::<RoXmlNavigator<'static>>()
+    ///     .unwrap();
+    /// assert_eq!(value, "PT59.123456789012345678901234567S");
+    /// assert_eq!(warnings.borrow()[0].code(), "xs-seconds-capacity");
+    /// ```
+    pub fn with_warnings(mut self, warnings: &'ctx RefCell<Vec<XPathWarning>>) -> Self {
+        self.warnings = Some(warnings);
         self
     }
 
@@ -758,7 +804,11 @@ impl<'expr, 'ctx> XPathEvaluator<'expr, 'ctx> {
         }
 
         // Evaluate the expression
-        eval_node(&self.expr.arena, self.expr.root, &mut dyn_ctx)
+        let result = eval_node(&self.expr.arena, self.expr.root, &mut dyn_ctx);
+        if let Some(warnings) = self.warnings {
+            warnings.borrow_mut().extend(dyn_ctx.take_warnings());
+        }
+        result
     }
 
     /// Evaluate and return the result as a boolean.
@@ -916,7 +966,11 @@ impl<'expr, 'ctx> XPathEvaluator<'expr, 'ctx> {
         } // typed_eval dropped here, releasing the borrow
 
         // Evaluate the expression
-        eval_node(&self.expr.arena, self.expr.root, &mut dyn_ctx)
+        let result = eval_node(&self.expr.arena, self.expr.root, &mut dyn_ctx);
+        if let Some(warnings) = self.warnings {
+            warnings.borrow_mut().extend(dyn_ctx.take_warnings());
+        }
+        result
     }
 }
 

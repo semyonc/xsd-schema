@@ -94,9 +94,9 @@ Annotations are stored on schema components in the `arenas` module
 |-----------|-------------|
 | `SimpleTypeDefData` | `arenas.simple_types[key].annotation` |
 | `ComplexTypeDefData` | `arenas.complex_types[key].annotation` |
-| `ElementData` | `arenas.elements[key].annotation` |
-| `AttributeData` | `arenas.attributes[key].annotation` |
-| `ModelGroupDefData` | `arenas.model_groups[key].annotation` |
+| `ElementDeclData` | `arenas.elements[key].annotation` |
+| `AttributeDeclData` | `arenas.attributes[key].annotation` |
+| `ModelGroupData` | `arenas.model_groups[key].annotation` |
 | `AttributeGroupData` | `arenas.attribute_groups[key].annotation` |
 | `NotationData` | `arenas.notations[key].annotation` |
 | `IdentityConstraintData` | `arenas.identity_constraints[key].annotation` |
@@ -180,6 +180,8 @@ resolve any QNames found within the fragment.
 **Custom AppInfo Processor** -- filter by a known namespace or `source` URI:
 
 ```rust
+use xsd_schema::schema::annotation::Annotation;
+
 fn extract_jaxb_bindings(ann: &Annotation) -> Vec<String> {
     ann.appinfos()
         .filter(|a| a.source.as_deref() == Some("urn:jaxb:bindings"))
@@ -195,6 +197,8 @@ fn extract_jaxb_bindings(ann: &Annotation) -> Vec<String> {
 **Documentation Extraction** -- for code-generation tools:
 
 ```rust
+use xsd_schema::schema::annotation::Annotation;
+
 fn get_best_documentation(ann: &Annotation, preferred_lang: &str) -> Option<String> {
     if let Some(doc) = ann.documentation_for_lang(preferred_lang) {
         return Some(format!("{:?}", doc.content.byte_range()));
@@ -257,12 +261,15 @@ Key types in `src/parser/resolver.rs`:
 | `LoaderChain` | Composite: chains loaders by priority |
 | `SchemaResolver` | Orchestrator: URI resolution, cycle detection, catalog lookup |
 | `SchemaCatalog` | Namespace-to-URI mapping (XML catalog) |
-| `ResolverConfig` | Configuration: base dir, network access, max depth |
+| `ResolverConfig` | Configuration: base dir, network access, directive nesting limit (`max_depth`), parser configuration |
+| `LocationRewriter` / `LocationRequest` | Hook: maps a location before it is identified and loaded (§2.8) |
+| `DirectiveFailure` | Record of a directive whose document could not be read (§2.11) |
 | `LoadOutcome` | Result: `Loaded(id)`, `AlreadyLoaded(id)`, or `Cycle(uri)` |
 
 ### 2.3 The `SchemaLoader` Trait
 
-```rust
+```rust,ignore
+// Not compiled: the trait as declared in src/parser/resolver.rs.
 pub trait SchemaLoader: Send + Sync + Debug {
     /// Load schema content from the given location.
     /// Returns the schema XML as a string.
@@ -288,7 +295,8 @@ The three required decisions when implementing a loader:
 
 #### Example: HTTP Loader
 
-```rust
+```rust,ignore
+// Not compiled: needs the `ureq` crate, which is not a dependency of this one.
 use std::fmt::Debug;
 use xsd_schema::error::{SchemaError, SchemaResult};
 use xsd_schema::parser::resolver::SchemaLoader;
@@ -331,6 +339,14 @@ impl SchemaLoader for HttpLoader {
 #### Example: Database Loader
 
 ```rust
+use xsd_schema::error::{SchemaError, SchemaResult};
+use xsd_schema::parser::resolver::SchemaLoader;
+
+// Stands in for a database client.
+fn fetch_schema_from_db(_connection: &str, id: &str) -> Result<String, String> {
+    Err(format!("no schema {id}"))
+}
+
 #[derive(Debug)]
 pub struct DatabaseLoader {
     connection_string: String,
@@ -362,19 +378,19 @@ impl SchemaLoader for DatabaseLoader {
 automatically sorted on `add()`.
 
 ```rust
-use xsd_schema::{
-    FileSystemLoader, EmbeddedLoader, LoaderChain, SchemaSetBuilder,
-};
+use xsd_schema::{EmbeddedLoader, FileSystemLoader, LoaderChain, SchemaSetBuilder};
 
 let mut loaders = LoaderChain::new();
 loaders.add(Box::new(EmbeddedLoader::new()));           // priority 100
-loaders.add(Box::new(HttpLoader::new(timeout)));         // priority 50
+// loaders.add(Box::new(HttpLoader::new(timeout)));     // priority 50, §2.4
 loaders.add(Box::new(FileSystemLoader::new()));          // priority 0
 
 let compiled = SchemaSetBuilder::with_loader(Box::new(loaders))
-    .add("urn:books", "schemas/books.xsd")?             // -> FileSystemLoader
-    .add("urn:remote", "https://example.com/types.xsd")? // -> HttpLoader
+    .add("urn:books", "examples/books.xsd")?            // -> FileSystemLoader
+    // .add("urn:remote", "https://example.com/types.xsd")? // -> HttpLoader
     .compile()?;
+# let _ = compiled;
+# Ok::<(), xsd_schema::SchemaError>(())
 ```
 
 `LoaderChain::with_defaults()` creates a chain with `EmbeddedLoader` + `FileSystemLoader`.
@@ -383,20 +399,31 @@ let compiled = SchemaSetBuilder::with_loader(Box::new(loaders))
 
 `SchemaResolver` orchestrates the full resolution pipeline:
 
-1. **URI resolution** -- resolves relative URIs against base URI
-2. **Catalog lookup** -- maps namespace URIs to schema locations via `SchemaCatalog`
-3. **Duplicate detection** -- skips already-loaded locations (chameleon-aware)
-4. **Cycle detection** -- detects circular `xs:include` chains (allowed, just skipped)
-5. **Content loading** -- delegates to the loader chain
-6. **Parsing** -- parses loaded content into the `SchemaSet`
+1. **URI resolution** -- resolves a relative location against the base URI as an
+   RFC 3986 reference (§5.2), and normalizes it (§6.2.2, §6.2.3) when the location
+   or its base has a scheme: dot segments removed, scheme and host in lower case,
+   `file:` URIs read as files
+2. **Rewriting** -- asks the location rewriter, if one is set (§2.8)
+3. **Catalog lookup** -- maps namespace URIs to schema locations via `SchemaCatalog`
+4. **Duplicate detection** -- skips already-loaded locations (chameleon-aware); one
+   document is loaded once however its location is spelled (`file:///s/a.xsd` and
+   `/s/a.xsd` are one document)
+5. **Cycle detection** -- detects circular `xs:include` chains (allowed, just skipped)
+6. **Nesting limit** -- refuses a document read through more than
+   `ResolverConfig::max_depth` nested directives (`SchemaError::LimitExceeded`)
+7. **Content loading** -- delegates to the loader chain
+8. **Parsing** -- parses loaded content into the `SchemaSet`
+
+Directives are resolved in one walk that does not recurse, the same for the
+synchronous and the asynchronous loaders.
 
 #### Using SchemaResolver Directly
 
 ```rust
-use xsd_schema::{SchemaResolver, SchemaSet, LoaderChain};
+use xsd_schema::{LoaderChain, SchemaResolver, SchemaSet};
 
 let mut loaders = LoaderChain::new();
-loaders.add(Box::new(HttpLoader::new(timeout)));
+// loaders.add(Box::new(HttpLoader::new(timeout)));
 loaders.add(Box::new(xsd_schema::FileSystemLoader::new()));
 loaders.add(Box::new(xsd_schema::EmbeddedLoader::new()));
 
@@ -407,30 +434,49 @@ resolver.catalog_mut().add_xml_catalog();  // Add standard XML namespace mapping
 resolver.catalog_mut().add("urn:my-types", "schemas/my-types.xsd");
 
 let mut schema_set = SchemaSet::new();
-let outcome = resolver.load_schema("schemas/main.xsd", ".", &mut schema_set, None)?;
+let outcome = resolver.load_schema("examples/books.xsd", ".", &mut schema_set, None)?;
+# let _ = outcome;
+# Ok::<(), xsd_schema::SchemaError>(())
 ```
 
 #### ResolverConfig
 
 ```rust
+use std::path::PathBuf;
+use xsd_schema::parser::ParserConfig;
+use xsd_schema::{ResolverConfig, SchemaResolver};
+
 let config = ResolverConfig {
     base_dir: Some(PathBuf::from("/schemas")),
     allow_network: true,          // Required for http:// URLs
-    max_depth: 100,               // Maximum include nesting
-    parser_config: ParserConfig::default(),
+    max_depth: 100,               // Longest chain of nested directives (0 = no limit)
+    parser_config: ParserConfig::default(), // incl. max_depth: element nesting, 128
 };
 let resolver = SchemaResolver::with_config(config);
+# let _ = resolver;
 ```
 
 **Important**: `allow_network` defaults to `false`. HTTP/HTTPS URLs are rejected
 unless this is explicitly enabled.
+
+`max_depth` counts the directives along the shortest chain that reaches a
+document (the documents given to the builder are at depth 0); a deeper
+document is refused at the directive that reads it, with
+`SchemaError::LimitExceeded` naming `SchemaLimit::DirectiveDepth`. The walk
+does not recurse, so the limit bounds the work, not the stack.
+`ParserConfig::max_depth` bounds the element nesting of each schema document
+and the nesting of components through references (`SchemaSet::max_depth`); see
+[Implementation Limits](IMPLEMENTATION_LIMITS.md#6-nesting).
 
 ### 2.7 SchemaCatalog
 
 The catalog provides namespace-to-location mapping, similar to XML Catalogs:
 
 ```rust
-let mut catalog = resolver.catalog_mut();
+use xsd_schema::SchemaResolver;
+
+let mut resolver = SchemaResolver::new();
+let catalog = resolver.catalog_mut();
 
 // Standard XML namespaces (xml:lang, etc.) -> embedded schemas
 catalog.add_xml_catalog();
@@ -441,14 +487,60 @@ catalog.add("urn:company:types", "https://schemas.company.com/types.xsd");
 ```
 
 Catalog lookup happens in `process_import()` when `xs:import` has no
-`schemaLocation` attribute -- the resolver looks up the namespace in the
-catalog to find a location.
+`schemaLocation` attribute, or when its location hint fails -- the resolver
+looks up the namespace in the catalog to find a location.
 
-### 2.8 Async Loading (feature `async`)
+### 2.8 Location Rewriting
+
+A `LocationRewriter` maps the location of a document before the resolver
+identifies and loads it, in the style of an XML Catalog's `rewriteSystem` /
+`uri` entries: a remote prefix to a local mirror, one version of a schema to
+another, a location to a database key a loader understands. Any
+`Fn(&LocationRequest, &SchemaResolver) -> Option<String> + Send + Sync` is one;
+install it with `SchemaSetBuilder::set_location_rewriter` or
+`SchemaResolver::set_location_rewriter`.
+
+- **What it is asked.** `LocationRequest` (`#[non_exhaustive]`) carries the
+  location as written, the base URI of the document that names it, the
+  namespace (of an `xs:import`), and the directive kind — `None` for a location
+  given to the builder, which is rewritten too, so a document added under one
+  spelling and named by a directive under another is one document.
+- **The answer is final.** `None` keeps the location. `Some(location)` is
+  loaded as it is: an absolute URI or path whatever the base of the document
+  that named the location, a relative path against the working directory, as a
+  location given to `SchemaSetBuilder::add` is. A directive's answer is read
+  without its `#fragment`.
+- **Once per location.** The rewriter is asked once per request (location,
+  base URI, namespace, directive) however many times the resolver needs the
+  answer — to check whether the document is loaded, to load it, to try the
+  catalog, to report a failure, to prefetch it asynchronously. The answers are
+  kept until the rewriter is replaced.
+- Locations recorded by a set already loaded (`SchemaSetBuilder::add_from`)
+  are final and not rewritten.
+
+```rust
+use xsd_schema::{LocationRequest, SchemaResolver, SchemaSetBuilder};
+
+// rewriteSystem: one prefix to a local mirror, under both schemes. The answer
+// is an absolute path: it is loaded as it is, whatever the base of the
+// document that names the location.
+let mirror = |request: &LocationRequest<'_>, _: &SchemaResolver| -> Option<String> {
+    let rest = request
+        .location
+        .strip_prefix("http://www.w3.org/2003/05/")
+        .or_else(|| request.location.strip_prefix("https://www.w3.org/2003/05/"))?;
+    Some(format!("/opt/schemas/w3c/{rest}.xsd"))
+};
+let mut builder = SchemaSetBuilder::new();
+builder.set_location_rewriter(mirror);
+```
+
+### 2.9 Async Loading (feature `async`)
 
 The `AsyncSchemaLoader` trait enables truly non-blocking I/O:
 
-```rust
+```rust,ignore
+// Not compiled: the trait as declared in src/parser/resolver.rs.
 #[cfg(feature = "async")]
 pub trait AsyncSchemaLoader: Send + Sync + Debug {
     fn load_async(
@@ -460,40 +552,51 @@ pub trait AsyncSchemaLoader: Send + Sync + Debug {
 }
 ```
 
-#### Example: Async HTTP Loader
+#### Example: An Async Loader
+
+A loader that reads files; an HTTP loader returns its client's future the
+same way (`reqwest::get(&url).await`, …):
 
 ```rust
+use std::future::Future;
+use std::pin::Pin;
+use xsd_schema::error::{SchemaError, SchemaResult};
 #[cfg(feature = "async")]
 use xsd_schema::parser::resolver::AsyncSchemaLoader;
 
 #[derive(Debug)]
-struct AsyncHttpLoader;
+struct AsyncFileLoader;
 
 #[cfg(feature = "async")]
-impl AsyncSchemaLoader for AsyncHttpLoader {
+impl AsyncSchemaLoader for AsyncFileLoader {
     fn load_async(
         &self,
         location: &str,
     ) -> Pin<Box<dyn Future<Output = SchemaResult<String>> + Send + '_>> {
-        let url = location.to_string();
+        let path = location.trim_start_matches("file://").to_string();
         Box::pin(async move {
-            let response = reqwest::get(&url).await
-                .map_err(|e| SchemaError::resolution(format!("HTTP error: {}", e)))?;
-            response.text().await
-                .map_err(|e| SchemaError::resolution(format!("Body error: {}", e)))
+            std::fs::read_to_string(&path)
+                .map_err(|e| SchemaError::resolution(format!("cannot read {path}: {e}")))
         })
     }
 
     fn can_load(&self, location: &str) -> bool {
-        location.starts_with("http://") || location.starts_with("https://")
+        !location.starts_with("http://") && !location.starts_with("https://")
     }
 }
 ```
 
 Wire it up via `SchemaResolver::with_async_loader()` or
-`SchemaSetBuilder::with_async_loader()`.
+`SchemaSetBuilder::with_async_loader()`. The asynchronous path applies the
+synchronous rules — the same directive walk, catalog, location rewriter,
+nesting limits and schema checks — and only prefetches the documents: every
+location the walk may read is computed before the first `.await`, so the
+futures of the public async functions (`SchemaSetBuilder::add_async` /
+`compile_async`, `load_and_process_schema_async`, `load_schema_async`,
+`SchemaResolver::load_schema_async` / `load_content_async`,
+`resolve_all_directives_async`) are `Send`.
 
-### 2.9 Directive Processing
+### 2.10 Directive Processing
 
 | Directive | Method | Chameleon? | Notes |
 |-----------|--------|------------|-------|
@@ -505,20 +608,34 @@ Wire it up via `SchemaResolver::with_async_loader()` or
 Chameleon namespace adoption: when an included schema has no `targetNamespace`,
 it adopts the includer's namespace per XSD spec section 4.2.3.
 
-### 2.10 Error Handling
+### 2.11 Error Handling
 
 All loader methods return `SchemaResult<String>`, using `SchemaError::resolution()`
-for resolution-specific errors.
+for resolution-specific errors. `SchemaError` is `#[non_exhaustive]`: match it
+with a wildcard arm; `SchemaError::location()` gives any variant's location.
 
 Non-fatal conditions:
 - Already-loaded schemas: `LoadOutcome::AlreadyLoaded`
 - Circular includes: `LoadOutcome::Cycle` (logged, not an error)
 - Missing catalog entries with no `schemaLocation`: `Ok(None)` from `process_import`
+- **A directive whose document cannot be read** — the loader's error (file not
+  found, HTTP failure, network access refused) for an `xs:include`,
+  `xs:import`, `xs:redefine` or `xs:override`: a schema location is a hint
+  (Structures §4.2.3, §4.2.6.2), so the set compiles without the document. The
+  failure is recorded as a `DirectiveFailure` — the location as written
+  (`schema_location`), the namespace, the location read (`resolved_location`,
+  after the rewriter and the catalog), the directive's position and the error —
+  in `SchemaSet::directive_failures` / `CompiledSchemaSet::directive_failures`,
+  and a reference that then fails to resolve names those documents. For an
+  `xs:import`, `namespace_supplied()` says whether another document supplies the
+  namespace.
 
 Fatal conditions:
-- Loader returns an error (file not found, HTTP failure, etc.)
-- Parse error in loaded content
-- Network access attempted when `allow_network` is false
+- A document given to the builder (or the pipeline) that cannot be read
+- A failed `xs:redefine` that redefines components (`src-redefine`)
+- Parse error in loaded content, or a document that is not a schema document
+  (not well-formed, no `xs:schema` root, the wrong target namespace)
+- A document deeper than `ResolverConfig::max_depth` (`SchemaError::LimitExceeded`)
 
 ---
 
@@ -541,7 +658,8 @@ Two implementations ship with the crate:
 
 Defined in `src/navigator/mod.rs`:
 
-```rust
+```rust,ignore
+// Not compiled: an abridged listing of the trait in src/navigator/mod.rs.
 pub trait DomNavigator: Clone {
     // --- Node identity and order ---
     fn is_same_position(&self, other: &Self) -> bool;
@@ -550,6 +668,7 @@ pub trait DomNavigator: Clone {
 
     // --- Navigation ---
     fn move_to_root(&mut self);
+    fn move_to_visible_root(&mut self);  // default: move_to_root
     fn move_to_parent(&mut self) -> bool;
     fn move_to_first_child(&mut self) -> bool;
     fn move_to_next_sibling(&mut self) -> bool;
@@ -567,11 +686,14 @@ pub trait DomNavigator: Clone {
     fn namespace_uri(&self) -> &str;
     fn prefix(&self) -> &str;
     fn value(&self) -> String;
-    fn base_uri(&self) -> &str;
+    fn value_ref(&self) -> Cow<'_, str>;  // default: value()
+    fn base_uri(&self) -> &str;           // unresolved, see 3.5
 
     // --- Typed value hooks ---
     fn schema_type(&self) -> Option<SimpleTypeKey>;
+    fn type_annotation(&self) -> Option<TypeKey>;  // default: None
     fn typed_value(&self) -> TypedValue;
+    fn is_idrefs(&self) -> bool;                   // default: false
 
     // --- Default helper methods (override-optional) ---
     fn has_attributes(&mut self) -> bool;
@@ -579,6 +701,7 @@ pub trait DomNavigator: Clone {
     fn move_to_child_kind(&mut self, kind: DomNodeType) -> bool;
     fn move_to_child_name(&mut self, local: &str, ns: &str) -> bool;
     fn find_element_by_id(&self, id: &str) -> Result<Option<Self>, NavigatorError>;
+    fn find_nodes_by_idref(&self, id: &str) -> Result<Vec<Self>, NavigatorError>;
 }
 ```
 
@@ -588,7 +711,8 @@ Clone should be cheap -- typically copying a cursor index or pointer.
 
 ### 3.3 Supporting Types
 
-```rust
+```rust,ignore
+// Not compiled: the supporting types, abridged (src/navigator/mod.rs).
 pub enum DomNodeType {
     Root, Element, Attribute, Namespace,
     Text, Whitespace, SignificantWhitespace,
@@ -619,7 +743,8 @@ pub enum TypedValue {
 
 #### Example: Navigator over a Custom DOM
 
-```rust
+```rust,ignore
+// Not compiled: the remaining required methods are elided.
 use xsd_schema::navigator::{
     DomNavigator, DomNodeType, NamespaceAxisScope,
     NavigatorError, TypedValue, XmlNodeOrder,
@@ -679,12 +804,16 @@ impl<'a> DomNavigator for MyNavigator<'a> {
 
 #### Using the Custom Navigator
 
-```rust
-use xsd_schema::xpath::{XPathContext, XPathExpr};
-use xsd_schema::namespace::table::NameTable;
+Any navigator is used the same way; here the crate's own `RoXmlNavigator`
+stands in for `MyNavigator::new(&doc)`:
 
-let doc = MyDocument::parse("<root><item>hello</item></root>");
-let nav = MyNavigator::new(&doc);
+```rust
+# #[cfg(feature = "xsd11")] {
+use xsd_schema::namespace::table::NameTable;
+use xsd_schema::xpath::{RoXmlNavigator, XPathContext, XPathExpr};
+
+let doc = roxmltree::Document::parse("<root><item>hello</item></root>")?;
+let nav = RoXmlNavigator::new(&doc); // or MyNavigator::new(&my_doc)
 
 let names = NameTable::new();
 let ctx = XPathContext::new(&names);
@@ -692,6 +821,9 @@ let expr = XPathExpr::compile("//item/text()", &ctx)?;
 
 let result = expr.evaluator(&ctx)
     .run_with_node(nav)?;
+assert_eq!(result.len(), 1);
+# }
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 ### 3.5 Implementation Contracts
@@ -726,6 +858,39 @@ let result = expr.evaluator(&ctx)
 - **Comment**: comment text (without `<!--` and `-->`)
 - **PI**: PI content (without `<?target` and `?>`)
 
+#### Base URI
+
+`base_uri()` is the base URI the navigator knows for the current node,
+**unresolved**:
+
+- at the document node: the base URI of the document entity — the URI the
+  document was retrieved from, or was given when it was built — or `""`; an
+  `xml:base` never changes it;
+- at any other node: either that same document base URI (`RoXmlNavigator`
+  reports it for every node), or the value of the `xml:base` attribute in scope
+  at the node, exactly as written (`BufferDocNavigator` reports it where there
+  is one) — never a value resolved from the two;
+- at the topmost node of a tree without a document node (a fragment): the
+  document's base URI when the node carries no `xml:base` of its own.
+
+The consumer resolves: `fn:base-uri` takes the value at the document node (or
+the topmost node of a fragment), resolves every `xml:base` from the outermost
+ancestor-or-self inward against it (XML Base; RFC 3986 §5.2, dot segments
+removed), and finally against the static base URI when the result is still
+relative. A navigator that resolved the chain itself would have it applied
+twice; a host that needs the base URI of a node resolves it the same way.
+
+#### IDs and IDREFs
+
+`find_element_by_id` (for `fn:id`) and `find_nodes_by_idref` (for `fn:idref`)
+default to "none", and `is_idrefs` to `false` — correct for any schema-unaware
+backend, since a node built from an infoset without types is never an ID or
+IDREF. A schema-aware navigator overrides the three together: `is_idrefs` is
+the XDM is-idrefs property (XDM 1.0 §5.6: an element or attribute whose typed
+value holds an `xs:IDREF` value), and `find_nodes_by_idref(id)` returns the
+nodes with the property whose string value has `id` as a token, in document
+order, within the tree the cursor is in.
+
 #### Document Order
 
 `compare_position()` must implement XPath document order:
@@ -755,7 +920,8 @@ All `&str` returns borrow directly from the roxmltree document (zero-copy).
 **BufferDocNavigator** (`src/document/navigator.rs`) -- the schema-aware
 implementation. Uses a flat node-array cursor (`current: u32`) with virtual
 attribute/namespace states. Typed values come from schema validation results.
-`find_element_by_id()` uses the element ID index built during validation.
+`find_element_by_id()` and `find_nodes_by_idref()` use the id and idrefs
+indexes built with the document (`BUFFER_DOCUMENT_OVERVIEW.md`, *Side Tables*).
 
 Use `RoXmlNavigator` as a starting template for untyped DOMs, and
 `BufferDocNavigator` as reference for schema-aware implementations.
@@ -808,7 +974,8 @@ Key types in `src/xpath/functions/extensible.rs`:
 
 ### 4.3 FunctionHandle
 
-```rust
+```rust,ignore
+// Not compiled: an outline of the type in src/xpath/functions/extensible.rs.
 pub struct FunctionHandle(pub(crate) u32);
 
 impl FunctionHandle {
@@ -826,10 +993,10 @@ are offset by `CUSTOM_HANDLE_BASE` (0x1000_0000) plus their index in `FunctionSe
 `FunctionEvaluator<N>`, so a single object provides both bind-time and eval-time support.
 
 ```rust
-use xsd_schema::xpath::functions::{
-    FunctionSet, DynamicFunctionSignature, XPathValue,
-};
+# #[cfg(feature = "xsd11")] {
 use xsd_schema::types::sequence::SequenceType;
+use xsd_schema::xpath::functions::{DynamicFunctionSignature, FunctionSet, XPathValue};
+use xsd_schema::xpath::RoXmlNavigator;
 
 let mut functions: FunctionSet<RoXmlNavigator<'_>> = FunctionSet::with_builtins();
 
@@ -845,6 +1012,7 @@ functions.register(sig, |_ctx, mut args| {
     let d = val.as_f64().unwrap_or(0.0);
     Ok(XPathValue::double(d * 2.0))
 });
+# }
 ```
 
 #### DynamicFunctionSignature
@@ -852,7 +1020,8 @@ functions.register(sig, |_ctx, mut args| {
 Unlike built-in `FunctionSignature` (which uses `&'static str`),
 `DynamicFunctionSignature` owns its strings via `Arc<str>`:
 
-```rust
+```rust,ignore
+// Not compiled: the fields of the struct in src/xpath/functions/extensible.rs.
 pub struct DynamicFunctionSignature {
     pub namespace: Arc<str>,
     pub local_name: Arc<str>,
@@ -864,7 +1033,8 @@ pub struct DynamicFunctionSignature {
 
 Constructors:
 
-```rust
+```rust,ignore
+// Not compiled: the three constructors, by shape.
 DynamicFunctionSignature::new(ns, name, params, return_type)       // exact arity
 DynamicFunctionSignature::range(ns, name, min, max, params, ret)   // range arity
 DynamicFunctionSignature::variadic(ns, name, min_args, params, ret) // variadic
@@ -872,7 +1042,8 @@ DynamicFunctionSignature::variadic(ns, name, min_args, params, ret) // variadic
 
 #### FunctionArity
 
-```rust
+```rust,ignore
+// Not compiled: an outline of `xpath::functions::FunctionArity`.
 pub enum FunctionArity {
     Exact(usize),            // Fixed arg count
     Range(usize, usize),     // Min..=Max
@@ -893,9 +1064,16 @@ Custom functions need to be connected at two points:
 Since `FunctionSet` implements both traits, a single object serves both:
 
 ```rust
-use xsd_schema::xpath::{XPathContext, XPathExpr, RoXmlNavigator};
-use xsd_schema::namespace::table::NameTable;
+# #[cfg(feature = "xsd11")] {
 use xsd_schema::namespace::context::NamespaceContextSnapshot;
+use xsd_schema::namespace::table::NameTable;
+use xsd_schema::types::sequence::SequenceType;
+use xsd_schema::xpath::functions::{DynamicFunctionSignature, FunctionSet, XPathValue};
+use xsd_schema::xpath::{RoXmlNavigator, XPathContext, XPathExpr};
+
+// The document is created first: the function set holds functions over its
+// navigator type, so the document must outlive it.
+let doc = roxmltree::Document::parse("<root/>")?;
 
 // 1. Create and populate function set
 let mut functions: FunctionSet<RoXmlNavigator<'_>> = FunctionSet::with_builtins();
@@ -906,7 +1084,7 @@ let sig = DynamicFunctionSignature::new(
     SequenceType::string(),
 );
 functions.register(sig, |_ctx, mut args| {
-    let name = args.remove(0).as_string().unwrap_or_default();
+    let name = args.remove(0).to_owned_string().unwrap_or_default();
     Ok(XPathValue::string(format!("Hello, {}!", name)))
 });
 
@@ -928,14 +1106,15 @@ let ctx = XPathContext::new(&names)
 let expr = XPathExpr::compile("ext:greet('World')", &ctx)?;
 
 // 4. Evaluate with the function evaluator
-let doc = roxmltree::Document::parse("<root/>")?;
 let nav = RoXmlNavigator::new(&doc);
 
 let result = expr.evaluator(&ctx)
     .run_with_node_and_setup(Some(nav), |te| {
         te.context().set_function_evaluator(Some(&functions));  // eval-time dispatch
     })?;
-// result contains XPathValue::string("Hello, World!")
+assert_eq!(result.to_owned_string().as_deref(), Some("Hello, World!"));
+# }
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 The setup callback borrows the evaluator's own lifetimes, so the function set
@@ -950,8 +1129,19 @@ the function; one `DynamicContext` serves the whole expression, so the slot is
 visible from predicates, path steps, `for` bodies and nested calls alike:
 
 ```rust
+# #[cfg(feature = "xsd11")] {
+use xsd_schema::namespace::context::NamespaceContextSnapshot;
+use xsd_schema::namespace::table::NameTable;
+use xsd_schema::types::sequence::SequenceType;
+use xsd_schema::xpath::functions::{DynamicFunctionSignature, FunctionSet, XPathValue};
+use xsd_schema::xpath::{RoXmlNavigator, XPathContext, XPathExpr};
+
 struct CallCounter { calls: std::cell::Cell<u32> }
 
+let mut functions: FunctionSet<RoXmlNavigator<'_>> = FunctionSet::with_builtins();
+let sig = DynamicFunctionSignature::new(
+    "http://example.com/ext", "tick", vec![], SequenceType::integer(),
+);
 functions.register(sig, |ctx, _args| {
     if let Some(counter) = ctx.extension::<CallCounter>() {
         counter.calls.set(counter.calls.get() + 1);
@@ -959,12 +1149,26 @@ functions.register(sig, |ctx, _args| {
     Ok(XPathValue::integer(1))
 });
 
+let names = NameTable::new();
+let ns_bindings = NamespaceContextSnapshot {
+    default_ns: None,
+    bindings: vec![(names.add("ext"), names.add("http://example.com/ext"))],
+};
+let ctx = XPathContext::new(&names)
+    .with_namespaces(ns_bindings)
+    .with_function_catalog(&functions);
+let expr = XPathExpr::compile("ext:tick() + ext:tick()", &ctx)?;
+
 let counter = CallCounter { calls: std::cell::Cell::new(0) };
 let result = expr.evaluator(&ctx)
-    .run_with(|te| {
+    .run_with::<RoXmlNavigator<'_>, _>(|te| {
         te.context().set_function_evaluator(Some(&functions));
         te.context().set_extension(Some(&counter));
     })?;
+assert_eq!(counter.calls.get(), 2);
+# let _ = result;
+# }
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 `extension::<T>()` returns `None` when nothing is installed or the type does
@@ -972,7 +1176,8 @@ not match, so a function can degrade gracefully outside its host.
 
 ### 4.6 The CustomFn Type
 
-```rust
+```rust,ignore
+// Not compiled: the type alias in src/xpath/functions/extensible.rs.
 pub type CustomFn<N> = Arc<
     dyn Fn(
         &mut DynamicContext<'_, N>,
@@ -989,7 +1194,8 @@ The closure receives:
 
 #### Working with XPathValue
 
-```rust
+```rust,ignore
+// Not compiled: a list of the constructors and accessors, by shape.
 // Constructors
 XPathValue::string("hello")
 XPathValue::double(3.14)
@@ -997,8 +1203,8 @@ XPathValue::integer(42)
 XPathValue::boolean(true)
 XPathValue::empty()  // empty sequence
 
-// Extractors
-value.as_string() -> Option<String>
+// Extractors (a single atomic item of the type, else None)
+value.to_owned_string() -> Option<String>   // xs:string, derived, xs:untypedAtomic; copied
 value.as_f64() -> Option<f64>
 value.as_integer() -> Option<BigInt>
 value.as_bool() -> Option<bool>
@@ -1009,18 +1215,28 @@ value.is_empty() -> bool
 #### Accessing Context in Custom Functions
 
 ```rust
-functions.register(sig, |ctx, args| {
-    let item = ctx.require_context_item()?;       // Current context item
-    let pos = ctx.context_position;                // Position (1-based)
-    let size = ctx.context_size;                   // Context size
+# #[cfg(feature = "xsd11")] {
+use xsd_schema::types::sequence::SequenceType;
+use xsd_schema::xpath::functions::{DynamicFunctionSignature, FunctionSet, XPathValue};
+use xsd_schema::xpath::RoXmlNavigator;
+
+let mut functions: FunctionSet<RoXmlNavigator<'_>> = FunctionSet::with_builtins();
+let sig = DynamicFunctionSignature::new(
+    "http://example.com/ext", "where-am-i", vec![], SequenceType::string(),
+);
+functions.register(sig, |ctx, _args| {
+    let _item = ctx.require_context_item()?;      // Current context item
+    let _pos = ctx.context_position;               // Position (1-based)
+    let _size = ctx.context_size;                  // Context size
     let base = ctx.base_uri.as_deref().unwrap_or(""); // Base URI
 
-    if let Some(schema_set) = ctx.static_context.schema_set {
+    if let Some(_schema_set) = ctx.static_context.schema_set {
         // Access schema information
     }
 
-    Ok(XPathValue::string("result"))
+    Ok(XPathValue::string(base))
 });
+# }
 ```
 
 #### Error Handling
@@ -1028,8 +1244,16 @@ functions.register(sig, |ctx, args| {
 Custom functions return `Result<XPathValue<N>, XPathError>`. Use XPath error codes:
 
 ```rust
+# #[cfg(feature = "xsd11")] {
+use xsd_schema::types::sequence::SequenceType;
 use xsd_schema::xpath::error::XPathError;
+use xsd_schema::xpath::functions::{DynamicFunctionSignature, FunctionSet, XPathValue};
+use xsd_schema::xpath::RoXmlNavigator;
 
+let mut functions: FunctionSet<RoXmlNavigator<'_>> = FunctionSet::with_builtins();
+let sig = DynamicFunctionSignature::new(
+    "http://example.com/ext", "sqrt", vec![SequenceType::double()], SequenceType::double(),
+);
 functions.register(sig, |_ctx, args| {
     let val = args[0].as_f64().ok_or_else(|| {
         XPathError::XPTY0004 {
@@ -1039,14 +1263,86 @@ functions.register(sig, |_ctx, args| {
     })?;
 
     if val < 0.0 {
-        return Err(XPathError::FOAR0002 {
-            message: "Value must be non-negative".to_string(),
-        });
+        return Err(XPathError::FOAR0002);
     }
 
     Ok(XPathValue::double(val.sqrt()))
 });
+# }
 ```
+
+An error with a code of the host's own — or one that must carry more than a
+code and a message — is an `XPathError::Raised`, identified by an error QName.
+`XPathError::raised(namespace, local, description)` builds one;
+`XPathError::host(namespace, local, description, payload)` also attaches a value
+of the host's own error type, which the engine propagates untouched and the host
+gets back with `downcast_host_payload` once the evaluation has failed:
+
+```rust
+# #[cfg(feature = "xsd11")] {
+use xsd_schema::namespace::context::NamespaceContextSnapshot;
+use xsd_schema::namespace::table::NameTable;
+use xsd_schema::types::sequence::SequenceType;
+use xsd_schema::xpath::error::{XPathError, XQT_ERRORS_NAMESPACE};
+use xsd_schema::xpath::functions::{DynamicFunctionSignature, FunctionSet};
+use xsd_schema::xpath::{RoXmlNavigator, XPathContext, XPathExpr};
+
+#[derive(Debug, Clone)]
+struct HostError { code: String, line: u32 }
+impl std::fmt::Display for HostError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} at line {}", self.code, self.line)
+    }
+}
+impl std::error::Error for HostError {}
+
+let mut functions: FunctionSet<RoXmlNavigator<'_>> = FunctionSet::with_builtins();
+let sig = DynamicFunctionSignature::new(
+    "http://example.com/ext", "fail", vec![], SequenceType::string(),
+);
+functions.register(sig, |_ctx, _args| {
+    let mine = HostError { code: "HOST0001".into(), line: 7 };
+    Err(XPathError::host(XQT_ERRORS_NAMESPACE, "HOST0001", Some("not found"), mine))
+});
+
+let names = NameTable::new();
+let ns_bindings = NamespaceContextSnapshot {
+    default_ns: None,
+    bindings: vec![(names.add("ext"), names.add("http://example.com/ext"))],
+};
+let ctx = XPathContext::new(&names)
+    .with_namespaces(ns_bindings)
+    .with_function_catalog(&functions);
+let expr = XPathExpr::compile("ext:fail()", &ctx)?;
+let err = expr
+    .evaluator(&ctx)
+    .run_with::<RoXmlNavigator<'_>, _>(|te| {
+        te.context().set_function_evaluator(Some(&functions));
+    })
+    .err()
+    .expect("ext:fail() fails");
+
+if let Some(mine) = err.downcast_host_payload::<HostError>() {
+    // the host's own error, with everything it carried
+    assert_eq!(mine.line, 7);
+}
+// Any raised error also reads back as a QName:
+assert!(err.raised_error().is_some());
+assert_eq!(err.error_code(), None); // not a code of the specifications
+# }
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+`XPathError` is `#[non_exhaustive]`: match it with a wildcard arm, and prefer
+`error_code()` / `raised_error()` to matching variants when only the code
+matters. `FunctionId` and `ItemType` are `#[non_exhaustive]` too.
+
+Every expression the engine parses — a host's, and the tests of a schema's
+assertions and type alternatives — nests at most
+`xpath::MAX_EXPRESSION_DEPTH` (256) levels; a deeper one is
+`XPathError::LimitExceeded` (`ParseError::LimitExceeded` from the parser),
+before any recursive walk over it. A tree a host builds into an `AstArena`
+itself is not checked; `xpath::expression_depth` measures one.
 
 ### 4.7 Overriding Built-in Functions
 
@@ -1054,6 +1350,12 @@ Custom functions registered in `FunctionSet` take precedence over built-in
 functions with the same namespace/name/arity:
 
 ```rust
+# #[cfg(feature = "xsd11")] {
+use xsd_schema::types::sequence::SequenceType;
+use xsd_schema::xpath::functions::{DynamicFunctionSignature, FunctionSet, XPathValue};
+use xsd_schema::xpath::RoXmlNavigator;
+
+let mut functions: FunctionSet<RoXmlNavigator<'_>> = FunctionSet::with_builtins();
 let sig = DynamicFunctionSignature::new(
     "http://www.w3.org/2005/xpath-functions",  // fn: namespace
     "string-length",
@@ -1061,9 +1363,10 @@ let sig = DynamicFunctionSignature::new(
     SequenceType::integer(),
 );
 functions.register(sig, |_ctx, mut args| {
-    let s = args.remove(0).as_string().unwrap_or_default();
+    let s = args.remove(0).to_owned_string().unwrap_or_default();
     Ok(XPathValue::integer(s.len() as i64))
 });
+# }
 ```
 
 ### 4.8 Function Registration Summary
@@ -1086,12 +1389,12 @@ The global `FUNCTION_REGISTRY` (`src/xpath/functions/registry.rs`) contains all
 - Aggregate (sum, avg, min, max)
 - String (concat, substring, contains, starts-with, etc.)
 - Numeric (abs, ceiling, floor, round, round-half-to-even)
-- Node (name, local-name, namespace-uri, nilled, root, id, lang, etc.)
+- Node (name, local-name, namespace-uri, nilled, root, id, idref, lang, etc.)
 - DateTime (current-dateTime, year-from-dateTime, etc.)
 - QName (resolve-QName, QName, prefix-from-QName, etc.)
 - URI (resolve-uri, static-base-uri)
 - Regex (matches, replace, tokenize)
-- Special (trace, data, default-collation)
+- Special (trace, data, default-collation, error)
 - Conversion (string, number)
 
 The registry supports lookup by namespace alias (`FN_2010_NAMESPACE` falls back

@@ -143,7 +143,7 @@ fn walk_particle(
     out: &mut HashMap<(Option<NameId>, NameId), DefaultBinding>,
     depth: usize,
 ) {
-    if depth > 64 {
+    if depth > schema_set.recursion_bound(64) {
         return;
     }
     match &particle.term {

@@ -2,6 +2,26 @@
 //!
 //! This module provides the full XPath 2.0 parser, binder, and evaluator.
 //!
+//! An expression is compiled once against a static context ([`XPathContext`]:
+//! names, namespaces, the schema set, the function catalog, the language
+//! [`XPathMode`]) and evaluated by an [`XPathEvaluator`], which builds the
+//! dynamic context ([`DynamicContext`]) of each run. The dynamic context holds
+//! the focus, the variables, the current dateTime and the **implicit
+//! timezone** — [`XPathContext::with_implicit_timezone`] or
+//! [`DynamicContext::with_implicit_timezone`]; without one, the host's local
+//! offset, read once per evaluation
+//! ([`DynamicContext::implicit_timezone_or_host`]). Date/time and duration
+//! comparison and arithmetic are exact and raise the F&O errors at the limits
+//! of the value types.
+//!
+//! A host can lend a run a [`RegexCache`] it keeps across runs
+//! ([`XPathEvaluator::with_regex_cache`]) and collect the run's
+//! [`XPathWarning`]s ([`XPathEvaluator::with_warnings`]). Every expression the
+//! parser reads nests at most [`MAX_EXPRESSION_DEPTH`] levels
+//! ([`XPathError::LimitExceeded`] beyond). [`XPathError`] is
+//! `#[non_exhaustive]`; errors identified by an error QName are
+//! [`XPathError::Raised`].
+//!
 //! ## Core Types (re-exported from `navigator`)
 //!
 //! - [`DomNavigator`] - Trait for cursor-based XML navigation
@@ -34,6 +54,7 @@ pub(crate) mod general_compare;
 // node, for the duration of one evaluation run. Internal, and likewise
 // answer-preserving.
 pub(crate) mod compare_cache;
+pub mod depth;
 pub mod lexer;
 pub mod node_test;
 pub mod operators;
@@ -52,6 +73,8 @@ pub mod cast;
 pub mod iter_adapters;
 pub mod node_ops;
 pub mod quantified;
+// Casts and constructor functions for the atomic types of a schema set.
+pub(crate) mod schema_cast;
 pub mod sequence_ops;
 pub mod string_ops;
 pub mod type_info;
@@ -75,6 +98,9 @@ pub mod api;
 #[cfg(test)]
 mod decimal_capacity_tests;
 
+#[cfg(test)]
+mod schema_cast_tests;
+
 // Re-export navigator types for backward compatibility
 pub use crate::navigator::{
     DomNavigator, DomNodeType, NamespaceAxisScope, NavigatorError, RoXmlNavigator, TypedValue,
@@ -97,7 +123,8 @@ pub use self::bind::bind_node;
 pub use self::collation::{Collation, CollationResolver, CODEPOINT_COLLATION_URI};
 pub use self::context::{DynamicContext, NameBinder, VarRef, VarSlotId, VarStore, XPathContext};
 pub use self::deps::FunctionCallRef;
-pub use self::error::XPathError;
+pub use self::depth::{expression_depth, MAX_EXPRESSION_DEPTH};
+pub use self::error::{XPathError, XPathWarning};
 pub use self::eval::eval_node;
 pub use self::functions::{
     FunctionArity, FunctionId, FunctionSignature, XPathValue, FUNCTION_REGISTRY,

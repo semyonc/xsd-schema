@@ -2,15 +2,12 @@ use thiserror::Error;
 
 /// Errors that can occur during `BufferDocument` construction or navigation.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum BufferDocumentError {
-    #[error("XML parsing error: {0}")]
-    Parse(#[from] quick_xml::Error),
-
-    #[error("Invalid UTF-8 in XML: {0}")]
-    Utf8(#[from] std::str::Utf8Error),
-
-    #[error("Namespace resolution error: prefix '{0}' not bound")]
-    UnboundPrefix(String),
+    /// An I/O error of the source the text was read from (its own
+    /// `std::io::Error`, also as [`source`](std::error::Error::source)).
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
 
     /// Two elements of one tree answer to the same id value.
     ///
@@ -34,20 +31,24 @@ pub enum BufferDocumentError {
 
     #[error("Internal error: {0}")]
     InternalError(String),
+
+    /// The XML text is not well-formed or not namespace-well-formed (XML
+    /// 1.0 / 1.1 and Namespaces in XML; see [`crate::xml`]): every refusal of
+    /// the text read — bytes that are not UTF-8, an unbound prefix, input
+    /// that ends inside an element (`Truncated`) included — with its rule and
+    /// byte position.
+    #[error("{0}")]
+    NotWellFormed(crate::xml::NotWellFormed),
+
+    /// The XML text broke one of the reader's
+    /// [`ParseLimits`](crate::xml::ParseLimits).
+    #[error("{0}")]
+    LimitExceeded(crate::xml::LimitExceeded),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn display_unbound_prefix() {
-        let err = BufferDocumentError::UnboundPrefix("ns1".into());
-        assert_eq!(
-            err.to_string(),
-            "Namespace resolution error: prefix 'ns1' not bound"
-        );
-    }
 
     #[test]
     fn display_duplicate_id() {
@@ -65,21 +66,11 @@ mod tests {
     }
 
     #[test]
-    fn from_quick_xml_error() {
-        let qx_err = quick_xml::Error::Syntax(quick_xml::errors::SyntaxError::UnclosedTag);
-        let err: BufferDocumentError = qx_err.into();
-        assert!(matches!(err, BufferDocumentError::Parse(_)));
-        assert!(err.to_string().contains("XML parsing error"));
-    }
-
-    #[test]
-    fn from_utf8_error() {
-        // Create a real Utf8Error by decoding invalid bytes at runtime
-        let bad: &[u8] = &[0xFF, 0xFE];
-        #[allow(invalid_from_utf8)]
-        let utf8_err = std::str::from_utf8(bad).unwrap_err();
-        let err: BufferDocumentError = utf8_err.into();
-        assert!(matches!(err, BufferDocumentError::Utf8(_)));
-        assert!(err.to_string().contains("Invalid UTF-8"));
+    fn from_io_error() {
+        let err: BufferDocumentError = std::io::Error::other("the disk is on fire").into();
+        assert!(matches!(err, BufferDocumentError::Io(_)));
+        assert_eq!(err.to_string(), "I/O error: the disk is on fire");
+        let source = std::error::Error::source(&err).expect("the I/O error");
+        assert_eq!(source.to_string(), "the disk is on fire");
     }
 }

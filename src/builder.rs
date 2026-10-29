@@ -26,11 +26,11 @@ use crate::error::{SchemaError, SchemaResult};
 use crate::ids::DocumentId;
 use crate::parser::parse::parse_schema_with_config;
 use crate::parser::resolver::{
-    fixup_composition_edges, normalize_path, resolve_all_directives, ResolverConfig, SchemaLoader,
-    SchemaResolver,
+    fixup_composition_edges, normalize_path, resolve_directive_closure, DirectiveClosure,
+    ResolverConfig, SchemaLoader, SchemaResolver,
 };
 #[cfg(feature = "async")]
-use crate::parser::resolver::{resolve_all_directives_async, AsyncSchemaLoader};
+use crate::parser::resolver::{resolve_directive_closure_async, AsyncSchemaLoader};
 use crate::pipeline::process_loaded_schemas;
 use crate::schema::model::{RegexCompat, XsdVersion};
 use crate::schema::SchemaSet;
@@ -112,6 +112,31 @@ impl SchemaSetBuilder {
         }
     }
 
+    /// Create a builder for XSD `version` over a resolver set up by the
+    /// caller: its configuration, loaders, catalog and location rewriter are
+    /// used as they are (no catalog entry is added).
+    ///
+    /// ```
+    /// use xsd_schema::{LoaderChain, ResolverConfig, SchemaResolver, SchemaSetBuilder, XsdVersion};
+    ///
+    /// let mut config = ResolverConfig::default();
+    /// config.max_depth = 16;
+    /// let mut resolver =
+    ///     SchemaResolver::with_config_and_loader(config, Box::new(LoaderChain::with_defaults()));
+    /// resolver.catalog_mut().add_xml_catalog();
+    /// let builder = SchemaSetBuilder::with_resolver(resolver, XsdVersion::V1_1);
+    /// assert_eq!(builder.schema_count(), 0);
+    /// ```
+    pub fn with_resolver(resolver: SchemaResolver, version: XsdVersion) -> Self {
+        Self {
+            schema_set: SchemaSet::with_version(version),
+            resolver,
+            pending_docs: Vec::new(),
+            errors: Vec::new(),
+            import_errors: Vec::new(),
+        }
+    }
+
     /// Create a builder configured for a specific XSD version.
     pub fn with_version(version: XsdVersion) -> Self {
         let mut resolver = SchemaResolver::new();
@@ -139,6 +164,35 @@ impl SchemaSetBuilder {
     /// `RegexCompat::Strict`.
     pub fn set_regex_compatibility(&mut self, compat: RegexCompat) -> &mut Self {
         self.schema_set.set_regex_compatibility(compat);
+        self
+    }
+
+    /// Map every location — each directive's, and each one given to this
+    /// builder — through `rewriter` before it is resolved and identified:
+    /// the place for catalog rules that a loader cannot apply (one document
+    /// under two spellings, namespace-keyed mappings, a remote location to a
+    /// local mirror). Its answer is final (an absolute URI or path is loaded
+    /// as it is, never resolved against the including document's base; a
+    /// relative path against the working directory), and it is asked once
+    /// per location; see [`LocationRewriter`](crate::LocationRewriter).
+    ///
+    /// ```
+    /// use xsd_schema::{LocationRequest, SchemaResolver, SchemaSetBuilder};
+    ///
+    /// // A namespace-keyed rule: `?xsd=N` locations of a service, by namespace.
+    /// let mut builder = SchemaSetBuilder::new();
+    /// builder.set_location_rewriter(|r: &LocationRequest<'_>, _: &SchemaResolver| {
+    ///     match (r.namespace, r.location.contains("?xsd=")) {
+    ///         (Some("urn:orders"), true) => Some("/srv/schemas/orders.xsd".to_string()),
+    ///         _ => None,
+    ///     }
+    /// });
+    /// ```
+    pub fn set_location_rewriter(
+        &mut self,
+        rewriter: impl crate::LocationRewriter + 'static,
+    ) -> &mut Self {
+        self.resolver.set_location_rewriter(rewriter);
         self
     }
 
@@ -193,8 +247,10 @@ impl SchemaSetBuilder {
     /// let enriched = builder.compile()?;
     /// ```
     pub fn add_from(&mut self, schema_set: &SchemaSet) -> &mut Self {
+        // The locations the set was loaded from are final: a location
+        // rewriter mapped them already, and is not asked again.
         for location in schema_set.loaded_schema_locations() {
-            let _ = self.try_add(location);
+            let _ = self.add_normalized(absolute_location(location.to_string()));
         }
         self
     }
@@ -235,6 +291,12 @@ impl SchemaSetBuilder {
     /// and absolute forms of the same path are correctly deduplicated.
     pub fn try_add(&mut self, location: &str) -> SchemaResult<bool> {
         let normalized = normalize_loaded_location(&self.resolver, location, "");
+        self.add_normalized(normalized)
+    }
+
+    /// Load the document at `normalized` — a location already rewritten and
+    /// resolved ([`normalize_loaded_location`]), so neither again.
+    fn add_normalized(&mut self, normalized: String) -> SchemaResult<bool> {
         if self.schema_set.is_loaded(&normalized) {
             return Ok(false);
         }
@@ -259,7 +321,7 @@ impl SchemaSetBuilder {
     /// Returns `Ok(true)` if freshly loaded, `Ok(false)` if already present.
     pub fn try_add_relative(&mut self, location: &str, base_uri: &str) -> SchemaResult<bool> {
         let normalized = normalize_loaded_location(&self.resolver, location, base_uri);
-        self.try_add(&normalized)
+        self.add_normalized(normalized)
     }
 
     /// Add a schema from XML source string.
@@ -342,21 +404,27 @@ impl SchemaSetBuilder {
     ///
     /// Returns an error if any phase fails (invalid schema, missing references, etc.)
     pub fn compile(mut self) -> SchemaResult<CompiledSchemaSet> {
-        // Phase 1: Resolve directives for all pending documents
-        // Collect into a temp vec to avoid borrow issues
-        let pending: Vec<_> = self.pending_docs.drain(..).collect();
-        for doc_id in pending {
-            self.resolve_directives_recursive(doc_id)?;
-        }
+        // Phase 1: Resolve directives for all pending documents, and for
+        // every document they read
+        let pending = std::mem::take(&mut self.pending_docs);
+        let closure = resolve_directive_closure(&pending, &mut self.resolver, &mut self.schema_set);
+        self.finish(closure)
+    }
 
+    /// Phases 2–5 after directive resolution, shared by
+    /// [`compile`](Self::compile) and `compile_async`.
+    fn finish(mut self, closure: DirectiveClosure) -> SchemaResult<CompiledSchemaSet> {
         // Fixup cycle edges now that all documents have been loaded
         fixup_composition_edges(&mut self.schema_set);
 
         // Propagate schema-content errors from directive resolution.
         // Resolution/IO errors (file not found, network denied) are non-fatal
-        // for all directive types — the target may be unavailable.
+        // for all directive types — the target may be unavailable; they are
+        // kept on the set (`SchemaSet::directive_failures`).
         // Schema-content errors (structural, XML parse, namespace) mean the
         // target was found but is invalid — those are always fatal.
+        self.errors.extend(closure.errors);
+        self.import_errors.extend(closure.import_errors);
         if let Some(err) = self
             .errors
             .into_iter()
@@ -368,6 +436,8 @@ impl SchemaSetBuilder {
 
         // Phases 2-5: Delegate to the pipeline's shared processing function
         // (redefine/override, inline assembly, reference resolution, particle allocation)
+        self.schema_set
+            .set_max_depth(self.resolver.config.parser_config.max_depth);
         let (inline_stats, resolution_stats) = process_loaded_schemas(&mut self.schema_set)?;
 
         let documents_loaded = self.schema_set.documents.len();
@@ -385,104 +455,57 @@ impl SchemaSetBuilder {
         })
     }
 
-    /// Resolve directives recursively for a document and any loaded dependencies.
-    fn resolve_directives_recursive(&mut self, doc_id: DocumentId) -> SchemaResult<()> {
-        let result = resolve_all_directives(doc_id, &mut self.resolver, &mut self.schema_set);
-
-        // Recursively process newly loaded documents
-        for loaded_id in result.loaded {
-            self.resolve_directives_recursive(loaded_id)?;
-        }
-
-        // Collect errors (but don't fail immediately - continue processing)
-        self.errors.extend(result.errors);
-        self.import_errors.extend(result.import_errors);
-
-        Ok(())
-    }
-
-    /// Resolve directives recursively using async loading.
-    #[cfg(feature = "async")]
-    async fn resolve_directives_recursive_async(&mut self, doc_id: DocumentId) -> SchemaResult<()> {
-        let result =
-            resolve_all_directives_async(doc_id, &mut self.resolver, &mut self.schema_set).await;
-
-        // Recursively process newly loaded documents
-        for loaded_id in result.loaded {
-            Box::pin(self.resolve_directives_recursive_async(loaded_id)).await?;
-        }
-
-        self.errors.extend(result.errors);
-        self.import_errors.extend(result.import_errors);
-
-        Ok(())
-    }
-
     /// Add a schema by namespace and location, loading content asynchronously.
     ///
-    /// Async variant of [`add`](SchemaSetBuilder::add).
+    /// Async variant of [`add`](SchemaSetBuilder::add): the location is
+    /// normalized and deduplicated the same way.
     #[cfg(feature = "async")]
     pub async fn add_async(mut self, _namespace: &str, location: &str) -> SchemaResult<Self> {
-        let content = self.resolver.load_content_async(location).await?;
+        let normalized = normalize_loaded_location(&self.resolver, location, "");
+        if self.schema_set.is_loaded(&normalized) {
+            return Ok(self);
+        }
+        let content = self.resolver.load_content_async(&normalized).await?;
         let doc_id = parse_schema_with_config(
             content.as_bytes(),
-            location,
+            &normalized,
             &mut self.schema_set,
             &self.resolver.config.parser_config,
         )?;
         self.pending_docs.push(doc_id);
-        self.schema_set.mark_loaded(location.to_string(), doc_id);
+        self.schema_set.mark_loaded(normalized, doc_id);
         Ok(self)
     }
 
     /// Compile all added schemas using async directive resolution.
     ///
-    /// Async variant of [`compile`](SchemaSetBuilder::compile). Only directive
-    /// resolution (I/O) is async; all computation phases remain synchronous.
+    /// Async variant of [`compile`](SchemaSetBuilder::compile), with the same
+    /// rules and outcome. Only directive resolution (I/O) is async; all
+    /// computation phases remain synchronous.
     #[cfg(feature = "async")]
     pub async fn compile_async(mut self) -> SchemaResult<CompiledSchemaSet> {
-        // Phase 1: Resolve directives asynchronously for all pending documents
-        let pending: Vec<_> = self.pending_docs.drain(..).collect();
-        for doc_id in pending {
-            self.resolve_directives_recursive_async(doc_id).await?;
-        }
-
-        // Fixup cycle edges now that all documents have been loaded
-        fixup_composition_edges(&mut self.schema_set);
-
-        // Propagate schema-content errors from directive resolution
-        if let Some(err) = self
-            .errors
-            .into_iter()
-            .chain(self.import_errors)
-            .find(|e| e.is_schema_content_error())
-        {
-            return Err(err);
-        }
-
-        // Phases 2-5: Delegate to the pipeline's shared processing function (sync)
-        let (inline_stats, resolution_stats) = process_loaded_schemas(&mut self.schema_set)?;
-
-        let documents_loaded = self.schema_set.documents.len();
-        Ok(CompiledSchemaSet {
-            schema_set: self.schema_set,
-            stats: CompilationStats {
-                documents_loaded,
-                inline_types_assembled: inline_stats.total_inline_types,
-                types_resolved: resolution_stats.types_resolved,
-                elements_resolved: resolution_stats.elements_resolved,
-                attributes_resolved: resolution_stats.attributes_resolved,
-                groups_resolved: resolution_stats.groups_resolved,
-                attribute_groups_resolved: resolution_stats.attribute_groups_resolved,
-            },
-        })
+        let pending = std::mem::take(&mut self.pending_docs);
+        let closure =
+            resolve_directive_closure_async(&pending, &mut self.resolver, &mut self.schema_set)
+                .await;
+        self.finish(closure)
     }
 }
 
+/// The location a document given to the builder is read and identified
+/// under: the location rewriter's answer for it (decision 9: a document added
+/// under one spelling and named by a directive under another is one
+/// document), resolved, and made absolute against the working directory.
 fn normalize_loaded_location(resolver: &SchemaResolver, location: &str, base_uri: &str) -> String {
     let resolved = resolver
-        .resolve_location(location, base_uri)
+        .rewritten_location(location, base_uri, None, None)
         .unwrap_or_else(|_| location.to_string());
+    absolute_location(resolved)
+}
+
+/// `resolved`, made absolute against the working directory when it is a
+/// relative path.
+fn absolute_location(resolved: String) -> String {
     if is_absolute_location(&resolved) {
         return resolved;
     }
@@ -497,9 +520,7 @@ fn normalize_loaded_location(resolver: &SchemaResolver, location: &str, base_uri
 }
 
 fn is_absolute_location(location: &str) -> bool {
-    location.starts_with("http://")
-        || location.starts_with("https://")
-        || location.starts_with("file://")
+    crate::parser::uri::scheme(location).is_some()
         || Path::new(location).is_absolute()
         || (location.len() >= 2 && location.as_bytes().get(1) == Some(&b':'))
 }
@@ -530,6 +551,12 @@ impl CompiledSchemaSet {
     /// Consume self and return the underlying schema set.
     pub fn into_schema_set(self) -> SchemaSet {
         self.schema_set
+    }
+
+    /// The directives whose schema document could not be read; see
+    /// [`SchemaSet::directive_failures`].
+    pub fn directive_failures(&self) -> &[crate::parser::resolver::DirectiveFailure] {
+        self.schema_set.directive_failures()
     }
 }
 

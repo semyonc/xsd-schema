@@ -1,16 +1,37 @@
 //! XSD value types for typed atomic values
 //!
 //! This module provides the `XmlValue` type for representing typed XSD values,
-//! integrating with the `xsd-types` crate for atomic value parsing and formatting.
+//! parsed and formatted by the datatype layer of [`crate::types`].
 //!
 //! ## Design
 //!
 //! - `XmlValue` is a typed container for XSD values
 //! - `XmlAtomicValue` holds the actual parsed value
-//! - QName and NOTATION values use `QualifiedName` (namespace-resolved)
-//! - List values store sequences of atomic values with a known item type
+//! - QName and NOTATION values are a [`QNameValue`]: the namespace-resolved
+//!   [`QualifiedName`] together with its lexical form
+//! - List values hold one `XmlValue` per member, each with its own type
+//! - The `PartialEq` / `PartialOrd` of the date/time and duration structs are
+//!   the XSD equality and order, computed exactly: a date/time value without a
+//!   time zone offset is incomparable with one that has an offset unless 14
+//!   hours either way give the same order, and durations are ordered by the
+//!   four reference dateTimes (`P1M` and `P30D` are incomparable)
+//!
+//! ## Implementation limits (Datatypes 1.1 §5.4)
+//!
+//! The date/time and duration values hold a year in `i32` (dateTime, date,
+//! gYearMonth, gYear), each duration field but the seconds in `u32`, and the
+//! seconds in a `rust_decimal::Decimal` (a 96-bit mantissa, at most 28
+//! fraction digits). A literal whose year, duration field or whole seconds
+//! exceed these is refused as not valid. A seconds number with more fraction
+//! digits than the `Decimal` holds is valid: its typed value keeps the
+//! fraction truncated toward zero (never rounded up to the next second); the
+//! validator compares the literal as written for the facets, value
+//! constraints and identity constraints, and reports the warning
+//! `xs-seconds-capacity`. The order and equality of the values never overflow
+//! (whole seconds in `i128`, the fraction apart).
 
 use std::fmt;
+use std::sync::Arc;
 
 use num_bigint::BigInt;
 use rust_decimal::prelude::ToPrimitive;
@@ -19,6 +40,7 @@ use rust_decimal::Decimal;
 use super::{PrimitiveTypeCode, XmlTypeCode};
 use crate::ids::SimpleTypeKey;
 use crate::namespace::qname::QualifiedName;
+use crate::namespace::table::NameTable;
 
 /// A typed XSD value with type information.
 ///
@@ -154,7 +176,7 @@ impl XmlValue {
             XmlValueKind::Atomic(atom) => atom.to_string(),
             XmlValueKind::List { items, .. } => items
                 .iter()
-                .map(|v| v.to_string())
+                .map(XmlValue::to_string_value)
                 .collect::<Vec<_>>()
                 .join(" "),
             XmlValueKind::Union(inner) => inner.to_string_value(),
@@ -226,40 +248,25 @@ impl XmlValue {
         }
     }
 
-    /// Try to get as QName
+    /// Try to get as QName: the expanded name of an
+    /// [`XmlAtomicValue::QName`] (see [`QNameValue::name`]).
     pub fn as_qname(&self) -> Option<&QualifiedName> {
         match &self.value {
-            XmlValueKind::Atomic(XmlAtomicValue::QName(qn)) => Some(qn),
+            XmlValueKind::Atomic(XmlAtomicValue::QName(qn)) => Some(qn.name()),
             _ => None,
         }
     }
 
-    /// Convert this `XmlValue` to an `XPathValue` for use as `$value` in assertion evaluation.
+    /// Convert this `XmlValue` to an `XPathValue`, for instance as `$value`
+    /// in assertion evaluation.
     ///
     /// - **Atomic/UntypedAtomic** → single `XPathValue::Item`
-    /// - **List** → `XPathValue::Sequence` of atomic items, each with `item_schema_type`
-    /// - **Union** → recursively converts the inner value
-    ///
-    /// The `item_schema_type` parameter is needed because `XmlValueKind::List` stores bare
-    /// `XmlAtomicValue` items without per-item `schema_type`. Callers pass it from the
-    /// list type's `resolved_item_type`.
+    /// - **List** → `XPathValue::Sequence` of its members, each with the type
+    ///   and `schema_type` it was validated with
+    /// - **Union** → recursively converts the member value (so a union whose
+    ///   chosen member type is a list type gives that list's members)
     #[cfg(feature = "xsd11")]
-    pub fn to_xpath_value<N: crate::xpath::DomNavigator>(
-        &self,
-        item_schema_type: Option<SimpleTypeKey>,
-    ) -> crate::xpath::XPathValue<N> {
-        self.to_xpath_value_with(item_schema_type, None)
-    }
-
-    /// [`XmlValue::to_xpath_value`] for a caller that knows from the schema
-    /// whether a list's item type is a union (`Some`); see
-    /// [`list_strings_are_capacity_decimals`](crate::types::exact_decimal::list_strings_are_capacity_decimals).
-    #[cfg(feature = "xsd11")]
-    pub(crate) fn to_xpath_value_with<N: crate::xpath::DomNavigator>(
-        &self,
-        item_schema_type: Option<SimpleTypeKey>,
-        item_type_is_union: Option<bool>,
-    ) -> crate::xpath::XPathValue<N> {
+    pub fn to_xpath_value<N: crate::xpath::DomNavigator>(&self) -> crate::xpath::XPathValue<N> {
         use crate::xpath::iterator::XmlItem;
         use crate::xpath::XPathValue;
 
@@ -267,37 +274,10 @@ impl XmlValue {
             XmlValueKind::Atomic(_) | XmlValueKind::UntypedAtomic(_) => {
                 XPathValue::from_atomic(self.clone())
             }
-            XmlValueKind::List { item_type, items } => {
-                // A decimal member beyond `rust_decimal`'s capacity is stored
-                // as its canonical string; it is still an `xs:decimal`. Every
-                // other string member is an `xs:string`, as in 0.2.2 — in
-                // particular every member of a list of a union.
-                let capacity_strings =
-                    crate::types::exact_decimal::list_strings_are_capacity_decimals(
-                        *item_type,
-                        items,
-                        item_type_is_union,
-                    );
-                let xml_items: Vec<XmlItem<N>> = items
-                    .iter()
-                    .map(|atom| {
-                        let type_code = match atom {
-                            XmlAtomicValue::String(_) if capacity_strings => XmlTypeCode::Decimal,
-                            _ => atom.type_code(),
-                        };
-                        let val = XmlValue {
-                            type_code,
-                            schema_type: item_schema_type,
-                            value: XmlValueKind::Atomic(atom.clone()),
-                        };
-                        XmlItem::Atomic(val)
-                    })
-                    .collect();
-                XPathValue::from_sequence(xml_items)
+            XmlValueKind::List { items, .. } => {
+                XPathValue::from_sequence(items.iter().cloned().map(XmlItem::Atomic).collect())
             }
-            XmlValueKind::Union(inner) => {
-                inner.to_xpath_value_with(item_schema_type, item_type_is_union)
-            }
+            XmlValueKind::Union(inner) => inner.to_xpath_value(),
         }
     }
 }
@@ -307,12 +287,22 @@ impl XmlValue {
 pub enum XmlValueKind {
     /// A single atomic value
     Atomic(XmlAtomicValue),
-    /// A list of atomic values (e.g., NMTOKENS)
+    /// A list value (e.g., NMTOKENS): the typed value of a list type.
     List {
-        /// The type code of list items
+        /// The type code of the list's declared item type: the item type's
+        /// built-in type code, or that of the built-in type it is derived
+        /// from (`xs:integer` for a restriction of it). An item type that is
+        /// a union has no single one: its code is `xs:anySimpleType`, the
+        /// base type of every union. Each member carries its own type.
         item_type: XmlTypeCode,
-        /// The list items
-        items: Vec<XmlAtomicValue>,
+        /// The members, in order: one atomic value each
+        /// ([`XmlValueKind::Atomic`], or [`XmlValueKind::UntypedAtomic`]
+        /// for an item type of `xs:anySimpleType`), with the `type_code` and
+        /// `schema_type` of the type that validated it — the item type, or,
+        /// when the item type is a union, the member type of the union that
+        /// validated that member (XPath 2.0 §2.5.2). A member is never a
+        /// list, and never wrapped in [`XmlValueKind::Union`].
+        items: Vec<XmlValue>,
     },
     /// A union value (actual type determined at runtime)
     Union(Box<XmlValue>),
@@ -399,9 +389,128 @@ pub enum XmlAtomicValue {
 
     // QName types (namespace-resolved)
     /// xs:QName
-    QName(QualifiedName),
+    QName(QNameValue),
     /// xs:NOTATION
-    Notation(QualifiedName),
+    Notation(QNameValue),
+}
+
+/// The value of an `xs:QName` or `xs:NOTATION`
+/// ([`XmlAtomicValue::QName`], [`XmlAtomicValue::Notation`]): an expanded
+/// name — a [`QualifiedName`] of interned ids — together with the string form
+/// of the value, so that it converts to a string with no [`NameTable`] at
+/// hand.
+///
+/// The string form is the one F&O §17.1.2 gives for casting to `xs:string`:
+/// "if the qualified name has a prefix, then TV is the concatenation of the
+/// prefix of SV, a single colon (:), and the local name of SV. otherwise TV is
+/// the local-name." It is what `Display`, [`XmlValue::to_string_value`],
+/// `fn:string` and every cast to a string give.
+///
+/// Equality and hashing follow [`QualifiedName`]: namespace URI and local
+/// name, never the prefix (F&O §11.2.1 `op:QName-equal`: "The prefix parts of
+/// $arg1 and $arg2, if any, are ignored"). The ids are only comparable with
+/// ids of the same [`NameTable`].
+///
+/// Cloning is cheap (the value is shared).
+#[derive(Clone)]
+pub struct QNameValue(Arc<QNameParts>);
+
+struct QNameParts {
+    name: QualifiedName,
+    /// `prefix:local`, or `local` when there is no prefix.
+    lexical: Box<str>,
+    /// The length of the prefix in `lexical`; 0 when there is none.
+    prefix_len: usize,
+}
+
+impl QNameValue {
+    /// The value of `name`, whose prefix and local name are resolved in
+    /// `names` to build the string form. An empty prefix counts as no prefix.
+    ///
+    /// `names` must be the table `name`'s ids were interned in: with any other
+    /// table the string form is wrong — another name's text, or, for an id the
+    /// table does not hold, the empty string (a debug build asserts that both
+    /// ids are held).
+    pub fn new(name: QualifiedName, names: &NameTable) -> Self {
+        debug_assert!(
+            names.try_resolve_ref(name.local_name).is_some()
+                && name
+                    .prefix
+                    .is_none_or(|p| names.try_resolve_ref(p).is_some()),
+            "QNameValue::new: the name's ids are not in this name table"
+        );
+        let local = names.try_resolve_ref(name.local_name).unwrap_or("");
+        let prefix = name
+            .prefix
+            .and_then(|p| names.try_resolve_ref(p))
+            .unwrap_or("");
+        let lexical: Box<str> = if prefix.is_empty() {
+            local.into()
+        } else {
+            format!("{prefix}:{local}").into()
+        };
+        QNameValue(Arc::new(QNameParts {
+            name,
+            lexical,
+            prefix_len: prefix.len(),
+        }))
+    }
+
+    /// The expanded name: namespace URI, local name and prefix, as ids.
+    pub fn name(&self) -> &QualifiedName {
+        &self.0.name
+    }
+
+    /// The prefix, or `None` when the value has none.
+    pub fn prefix(&self) -> Option<&str> {
+        match self.0.prefix_len {
+            0 => None,
+            n => Some(&self.0.lexical[..n]),
+        }
+    }
+
+    /// The local name.
+    pub fn local_name(&self) -> &str {
+        match self.0.prefix_len {
+            0 => &self.0.lexical,
+            n => &self.0.lexical[n + 1..],
+        }
+    }
+
+    /// The string form: `prefix:local`, or `local` when there is no prefix
+    /// (F&O §17.1.2).
+    pub fn lexical(&self) -> &str {
+        &self.0.lexical
+    }
+}
+
+impl PartialEq for QNameValue {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.name == other.0.name
+    }
+}
+
+impl Eq for QNameValue {}
+
+impl std::hash::Hash for QNameValue {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.name.hash(state);
+    }
+}
+
+impl fmt::Display for QNameValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0.lexical)
+    }
+}
+
+impl fmt::Debug for QNameValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("QNameValue")
+            .field("lexical", &self.lexical())
+            .field("name", self.name())
+            .finish()
+    }
 }
 
 impl XmlAtomicValue {
@@ -504,13 +613,8 @@ impl fmt::Display for XmlAtomicValue {
                 )
             }
             Self::AnyUri(uri) => write!(f, "{}", uri),
-            Self::QName(qn) => {
-                // Display with prefix if available
-                write!(f, "QName({:?}:{})", qn.namespace_uri, qn.local_name.0)
-            }
-            Self::Notation(n) => {
-                write!(f, "NOTATION({:?}:{})", n.namespace_uri, n.local_name.0)
-            }
+            // F&O §17.1.2: `prefix:local`, or the local name.
+            Self::QName(qn) | Self::Notation(qn) => fmt::Display::fmt(qn, f),
         }
     }
 }
@@ -597,14 +701,15 @@ fn format_double(v: f64, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 /// Positive years use standard 4-digit zero-padded format.
 fn format_year(year: i32, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     if year < 0 {
-        write!(f, "-{:04}", -year)
+        // `unsigned_abs`: `-year` overflows for `i32::MIN`.
+        write!(f, "-{:04}", year.unsigned_abs())
     } else {
         write!(f, "{:04}", year)
     }
 }
 
 /// xs:dateTime value
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct DateTimeValue {
     pub year: i32,
     pub month: u8,
@@ -616,23 +721,35 @@ pub struct DateTimeValue {
 }
 
 impl DateTimeValue {
-    /// Convert to total seconds from a reference epoch for comparison.
-    /// Uses implicit UTC for timezone-unaware values (XSD 1.0 facet semantics).
-    fn to_comparable_instant(&self) -> Decimal {
-        let tz_minutes = self.timezone.map_or(0i64, |tz| tz.0 as i64);
-        let days = date_to_days(self.year, self.month as i32, self.day as i32);
-        Decimal::from(days) * Decimal::from(86400)
-            + Decimal::from(self.hour as i64) * Decimal::from(3600)
-            + Decimal::from(self.minute as i64) * Decimal::from(60)
-            + self.second
-            - Decimal::from(tz_minutes) * Decimal::from(60)
+    /// The order of the two values on the time line with a missing time
+    /// zone offset read as `Z` — the building block of the XSD order, which
+    /// [`PartialOrd`] gives.
+    pub(crate) fn timeline_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        let key = |v: &Self| {
+            time_line_seconds(
+                day_number(v.year, v.month, v.day),
+                v.hour,
+                v.minute,
+                v.second,
+                v.timezone,
+            )
+        };
+        Some(key(self).cmp(&key(other)))
     }
-}
 
-impl PartialOrd for DateTimeValue {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.to_comparable_instant()
-            .partial_cmp(&other.to_comparable_instant())
+    /// The whole seconds of the value's position on the time line (the
+    /// first part of the key [`timeline_cmp`](Self::timeline_cmp) orders),
+    /// with the time zone offset `impute` (in minutes) for a value without
+    /// one, else its own, else `Z`.
+    pub(crate) fn time_line_whole(&self, impute: Option<i16>) -> i128 {
+        time_line_seconds(
+            day_number(self.year, self.month, self.day),
+            self.hour,
+            self.minute,
+            self.second,
+            self.timezone.or(impute.map(TimezoneOffset)),
+        )
+        .0
     }
 }
 
@@ -653,7 +770,7 @@ impl fmt::Display for DateTimeValue {
 }
 
 /// xs:date value
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct DateValue {
     pub year: i32,
     pub month: u8,
@@ -662,17 +779,20 @@ pub struct DateValue {
 }
 
 impl DateValue {
-    fn to_comparable_instant(&self) -> Decimal {
-        let tz_minutes = self.timezone.map_or(0i64, |tz| tz.0 as i64);
-        let days = date_to_days(self.year, self.month as i32, self.day as i32);
-        Decimal::from(days) * Decimal::from(86400) - Decimal::from(tz_minutes) * Decimal::from(60)
-    }
-}
-
-impl PartialOrd for DateValue {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.to_comparable_instant()
-            .partial_cmp(&other.to_comparable_instant())
+    /// The order of the two values on the time line with a missing time
+    /// zone offset read as `Z` — the building block of the XSD order, which
+    /// [`PartialOrd`] gives.
+    pub(crate) fn timeline_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        let key = |v: &Self| {
+            time_line_seconds(
+                day_number(v.year, v.month, v.day),
+                0,
+                0,
+                Decimal::ZERO,
+                v.timezone,
+            )
+        };
+        Some(key(self).cmp(&key(other)))
     }
 }
 
@@ -688,7 +808,7 @@ impl fmt::Display for DateValue {
 }
 
 /// xs:time value
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct TimeValue {
     pub hour: u8,
     pub minute: u8,
@@ -697,19 +817,24 @@ pub struct TimeValue {
 }
 
 impl TimeValue {
-    fn to_comparable_seconds(&self) -> Decimal {
-        let tz_minutes = self.timezone.map_or(0i64, |tz| tz.0 as i64);
-        Decimal::from(self.hour as i64) * Decimal::from(3600)
-            + Decimal::from(self.minute as i64) * Decimal::from(60)
-            + self.second
-            - Decimal::from(tz_minutes) * Decimal::from(60)
+    /// The order of the two values on the time line with a missing time
+    /// zone offset read as `Z` — the building block of the XSD order, which
+    /// [`PartialOrd`] gives.
+    pub(crate) fn timeline_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        let key = |v: &Self| time_line_seconds(0, v.hour, v.minute, v.second, v.timezone);
+        Some(key(self).cmp(&key(other)))
     }
-}
 
-impl PartialOrd for TimeValue {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.to_comparable_seconds()
-            .partial_cmp(&other.to_comparable_seconds())
+    /// [`DateTimeValue::time_line_whole`] for a time of day.
+    pub(crate) fn time_line_whole(&self, impute: Option<i16>) -> i128 {
+        time_line_seconds(
+            0,
+            self.hour,
+            self.minute,
+            self.second,
+            self.timezone.or(impute.map(TimezoneOffset)),
+        )
+        .0
     }
 }
 
@@ -725,7 +850,7 @@ impl fmt::Display for TimeValue {
 }
 
 /// xs:duration value
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct DurationValue {
     pub negative: bool,
     pub years: u32,
@@ -736,41 +861,31 @@ pub struct DurationValue {
     pub seconds: Decimal,
 }
 
-impl DurationValue {
-    /// Convert duration to approximate total seconds for comparison.
-    /// Uses average Gregorian month length (365.2425 / 12 = 30.436875 days).
-    /// This provides a total order consistent with the NIST conformance test
-    /// suite expectations. Strict XSD 1.0 §3.2.6.2 uses a partial order via
-    /// 4 reference dates, but most practical implementations use a total order.
-    fn to_approx_total_seconds(&self) -> Decimal {
-        // Average month in seconds: 30.436875 * 86400 = 2629746
-        let month_secs = Decimal::from(2629746i64);
-        let total_months = Decimal::from(self.years as i64) * Decimal::from(12)
-            + Decimal::from(self.months as i64);
-        let day_time_secs = Decimal::from(self.days as i64) * Decimal::from(86400)
-            + Decimal::from(self.hours as i64) * Decimal::from(3600)
-            + Decimal::from(self.minutes as i64) * Decimal::from(60)
-            + self.seconds;
-        let total = total_months * month_secs + day_time_secs;
-        if self.negative {
-            -total
-        } else {
-            total
-        }
+impl PartialOrd for DurationValue {
+    /// The order of the duration value space (Datatypes 1.1 §3.3.6.1, XSD 1.0
+    /// §3.2.6.2): by the four reference dateTimes; `None` for ·incomparable·
+    /// values (`P1M` and `P30D`).
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        crate::types::value_order::duration_cmp(
+            &crate::types::value_order::duration_value_parts(self),
+            &crate::types::value_order::duration_value_parts(other),
+        )
     }
 }
 
-impl PartialOrd for DurationValue {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.to_approx_total_seconds()
-            .partial_cmp(&other.to_approx_total_seconds())
+/// Equality in the same order: the four reference sums agree (`PT1M` equals
+/// `PT60S`, `P1D` equals `PT24H`, `P400Y` equals `P146097D`).
+impl PartialEq for DurationValue {
+    fn eq(&self, other: &Self) -> bool {
+        self.partial_cmp(other) == Some(std::cmp::Ordering::Equal)
     }
 }
 
 impl fmt::Display for DurationValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Normalize year-month part
-        let total_months = self.years * 12 + self.months;
+        // In `u64`: twelve times a `u32` year count does not fit `u32`.
+        let total_months = u64::from(self.years) * 12 + u64::from(self.months);
         let years = total_months / 12;
         let months = total_months % 12;
 
@@ -814,7 +929,7 @@ impl fmt::Display for DurationValue {
 }
 
 /// xs:yearMonthDuration (XSD 1.1)
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct YearMonthDurationValue {
     pub negative: bool,
     pub years: u32,
@@ -824,7 +939,8 @@ pub struct YearMonthDurationValue {
 impl fmt::Display for YearMonthDurationValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Normalize months → years + months
-        let total_months = self.years * 12 + self.months;
+        // In `u64`: twelve times a `u32` year count does not fit `u32`.
+        let total_months = u64::from(self.years) * 12 + u64::from(self.months);
         let years = total_months / 12;
         let months = total_months % 12;
 
@@ -846,6 +962,13 @@ impl fmt::Display for YearMonthDurationValue {
     }
 }
 
+/// Equality in its (total) order: `P12M` equals `P1Y`, `PT24H` equals `P1D`.
+impl PartialEq for YearMonthDurationValue {
+    fn eq(&self, other: &Self) -> bool {
+        self.partial_cmp(other) == Some(std::cmp::Ordering::Equal)
+    }
+}
+
 impl PartialOrd for YearMonthDurationValue {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         let self_months = if self.negative {
@@ -863,7 +986,7 @@ impl PartialOrd for YearMonthDurationValue {
 }
 
 /// xs:dayTimeDuration (XSD 1.1)
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct DayTimeDurationValue {
     pub negative: bool,
     pub days: u32,
@@ -906,48 +1029,42 @@ impl fmt::Display for DayTimeDurationValue {
     }
 }
 
+/// Equality in its (total) order: `P12M` equals `P1Y`, `PT24H` equals `P1D`.
+impl PartialEq for DayTimeDurationValue {
+    fn eq(&self, other: &Self) -> bool {
+        self.partial_cmp(other) == Some(std::cmp::Ordering::Equal)
+    }
+}
+
 impl PartialOrd for DayTimeDurationValue {
+    /// The order of the seconds, a total order (Datatypes 1.1 §3.4.27) —
+    /// that of the four reference dateTimes for durations without months —
+    /// on the exact sums (whole seconds in `i128`, the fraction apart).
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        let self_secs = {
-            let s = Decimal::from(self.days as i64) * Decimal::from(86400i64)
-                + Decimal::from(self.hours as i64) * Decimal::from(3600i64)
-                + Decimal::from(self.minutes as i64) * Decimal::from(60i64)
-                + self.seconds;
-            if self.negative {
-                -s
-            } else {
-                s
-            }
-        };
-        let other_secs = {
-            let s = Decimal::from(other.days as i64) * Decimal::from(86400i64)
-                + Decimal::from(other.hours as i64) * Decimal::from(3600i64)
-                + Decimal::from(other.minutes as i64) * Decimal::from(60i64)
-                + other.seconds;
-            if other.negative {
-                -s
-            } else {
-                s
-            }
-        };
-        self_secs.partial_cmp(&other_secs)
+        crate::types::value_order::duration_cmp(
+            &crate::types::value_order::day_time_duration_parts(self),
+            &crate::types::value_order::day_time_duration_parts(other),
+        )
     }
 }
 
 /// xs:gYearMonth value
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct GYearMonthValue {
     pub year: i32,
     pub month: u8,
     pub timezone: Option<TimezoneOffset>,
 }
 
-impl PartialOrd for GYearMonthValue {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+impl GYearMonthValue {
+    /// The order of the two values on the time line with a missing time
+    /// zone offset read as `Z` — the building block of the XSD order, which
+    /// [`PartialOrd`] gives.
+    pub(crate) fn timeline_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         let tz1 = self.timezone.map_or(0i64, |tz| tz.0 as i64);
         let tz2 = other.timezone.map_or(0i64, |tz| tz.0 as i64);
-        let d1 = date_to_days(self.year, self.month as i32, 1) * 1440 - tz1;
-        let d2 = date_to_days(other.year, other.month as i32, 1) * 1440 - tz2;
+        let d1 = day_number(self.year, self.month, 1) * 1440 - i128::from(tz1);
+        let d2 = day_number(other.year, other.month, 1) * 1440 - i128::from(tz2);
         d1.partial_cmp(&d2)
     }
 }
@@ -964,18 +1081,21 @@ impl fmt::Display for GYearMonthValue {
 }
 
 /// xs:gYear value
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct GYearValue {
     pub year: i32,
     pub timezone: Option<TimezoneOffset>,
 }
 
-impl PartialOrd for GYearValue {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+impl GYearValue {
+    /// The order of the two values on the time line with a missing time
+    /// zone offset read as `Z` — the building block of the XSD order, which
+    /// [`PartialOrd`] gives.
+    pub(crate) fn timeline_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         let tz1 = self.timezone.map_or(0i64, |tz| tz.0 as i64);
         let tz2 = other.timezone.map_or(0i64, |tz| tz.0 as i64);
-        let d1 = date_to_days(self.year, 1, 1) * 1440 - tz1;
-        let d2 = date_to_days(other.year, 1, 1) * 1440 - tz2;
+        let d1 = day_number(self.year, 1, 1) * 1440 - i128::from(tz1);
+        let d2 = day_number(other.year, 1, 1) * 1440 - i128::from(tz2);
         d1.partial_cmp(&d2)
     }
 }
@@ -991,20 +1111,23 @@ impl fmt::Display for GYearValue {
 }
 
 /// xs:gMonthDay value
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct GMonthDayValue {
     pub month: u8,
     pub day: u8,
     pub timezone: Option<TimezoneOffset>,
 }
 
-impl PartialOrd for GMonthDayValue {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+impl GMonthDayValue {
+    /// The order of the two values on the time line with a missing time
+    /// zone offset read as `Z` — the building block of the XSD order, which
+    /// [`PartialOrd`] gives.
+    pub(crate) fn timeline_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         let tz1 = self.timezone.map_or(0i64, |tz| tz.0 as i64);
         let tz2 = other.timezone.map_or(0i64, |tz| tz.0 as i64);
         // Use reference year 2000 for gMonthDay comparison
-        let d1 = date_to_days(2000, self.month as i32, self.day as i32) * 1440 - tz1;
-        let d2 = date_to_days(2000, other.month as i32, other.day as i32) * 1440 - tz2;
+        let d1 = day_number(2000, self.month, self.day) * 1440 - i128::from(tz1);
+        let d2 = day_number(2000, other.month, other.day) * 1440 - i128::from(tz2);
         d1.partial_cmp(&d2)
     }
 }
@@ -1020,14 +1143,17 @@ impl fmt::Display for GMonthDayValue {
 }
 
 /// xs:gDay value
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct GDayValue {
     pub day: u8,
     pub timezone: Option<TimezoneOffset>,
 }
 
-impl PartialOrd for GDayValue {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+impl GDayValue {
+    /// The order of the two values on the time line with a missing time
+    /// zone offset read as `Z` — the building block of the XSD order, which
+    /// [`PartialOrd`] gives.
+    pub(crate) fn timeline_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         let tz1 = self.timezone.map_or(0i64, |tz| tz.0 as i64);
         let tz2 = other.timezone.map_or(0i64, |tz| tz.0 as i64);
         let d1 = (self.day as i64) * 1440 - tz1;
@@ -1047,18 +1173,27 @@ impl fmt::Display for GDayValue {
 }
 
 /// xs:gMonth value
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct GMonthValue {
     pub month: u8,
     pub timezone: Option<TimezoneOffset>,
 }
 
-impl PartialOrd for GMonthValue {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+/// A gMonth is a month of 1972 on the time line (Datatypes 1.1 §E.3.4: "Let yr
+/// be 1971 when dt's ·year· is absent", "mo be 12 or dt's ·month·"; XSD 1.0
+/// §3.2.14: "the order relation on gMonth is the order relation on their
+/// starting instants"), in minutes. Two months are at least 28 days apart, so
+/// no pair of time zone offsets (at most 28 hours apart) reorders them. 1.1
+/// places a month at its last day, 1.0 at its first: the order is the same.
+impl GMonthValue {
+    /// The order of the two values on the time line with a missing time
+    /// zone offset read as `Z` — the building block of the XSD order, which
+    /// [`PartialOrd`] gives.
+    pub(crate) fn timeline_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         let tz1 = self.timezone.map_or(0i64, |tz| tz.0 as i64);
         let tz2 = other.timezone.map_or(0i64, |tz| tz.0 as i64);
-        let d1 = (self.month as i64) * 1440 - tz1;
-        let d2 = (other.month as i64) * 1440 - tz2;
+        let d1 = day_number(1972, self.month, 1) * 1440 - i128::from(tz1);
+        let d2 = day_number(1972, other.month, 1) * 1440 - i128::from(tz2);
         d1.partial_cmp(&d2)
     }
 }
@@ -1072,6 +1207,54 @@ impl fmt::Display for GMonthValue {
         Ok(())
     }
 }
+
+/// The order of the date/time datatypes of the seven-property model
+/// (Datatypes 1.1 §D.2.1): values "are ordered the same as their
+/// ·timeOnTimeline· values, except that if one value's ·timezoneOffset· is
+/// absent and the other's is not, and using maximum and minimum
+/// ·timezoneOffset· values for the one whose ·timezoneOffset· is actually
+/// absent changes the resulting (strict) inequality, the original two values
+/// are incomparable" (XSD 1.0 §3.2.7.4 alike) — `None` then. Equality is the
+/// `Equal` of this order: one instant in two offsets is one value; a value
+/// with an offset equals no value without one. The year is read with the XSD
+/// 1.1 numbering (`0000` is 1 BCE).
+macro_rules! seven_property_order {
+    ($($ty:ty),*) => {$(
+        impl PartialOrd for $ty {
+            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                let impute = |value: &Self, minutes: i16| Self {
+                    timezone: Some(TimezoneOffset(minutes)),
+                    ..value.clone()
+                };
+                match (self.timezone.is_some(), other.timezone.is_some()) {
+                    (true, false) => crate::types::value_order::same_order_at_both_extreme_offsets(
+                        |minutes| self.timeline_cmp(&impute(other, minutes)),
+                    ),
+                    (false, true) => crate::types::value_order::same_order_at_both_extreme_offsets(
+                        |minutes| impute(self, minutes).timeline_cmp(other),
+                    ),
+                    _ => self.timeline_cmp(other),
+                }
+            }
+        }
+
+        impl PartialEq for $ty {
+            fn eq(&self, other: &Self) -> bool {
+                self.partial_cmp(other) == Some(std::cmp::Ordering::Equal)
+            }
+        }
+    )*};
+}
+seven_property_order!(
+    DateTimeValue,
+    DateValue,
+    TimeValue,
+    GYearMonthValue,
+    GYearValue,
+    GMonthDayValue,
+    GDayValue,
+    GMonthValue
+);
 
 /// Timezone offset in minutes from UTC
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1113,39 +1296,64 @@ impl fmt::Display for TimezoneOffset {
 /// Normalize day-time duration components.
 /// Convert a date to total days from a reference epoch (year 1, month 1, day 1).
 /// Used for comparing date/time values.
-fn date_to_days(year: i32, month: i32, day: i32) -> i64 {
-    // Adjust for months < 3 by treating Jan/Feb as months 13/14 of the previous year
-    let (y, m) = if month <= 2 {
-        (year as i64 - 1, month as i64 + 12)
-    } else {
-        (year as i64, month as i64)
-    };
-    // Use a simplified Julian day calculation
-    365 * y + y / 4 - y / 100 + y / 400 + (153 * (m - 3) + 2) / 5 + day as i64 - 307
+/// The day of `year-month-day` counted from 1970-01-01 in the proleptic
+/// Gregorian calendar of Datatypes 1.1 (§E.3.4: the year 0000 is a leap year),
+/// exact for every year (`i128`, floor division).
+pub(crate) fn day_number(year: i32, month: u8, day: u8) -> i128 {
+    crate::types::value_order::days_from_civil(i128::from(year), i128::from(month))
+        + i128::from(day)
+        - 1
 }
 
-///
-/// Carries over whole seconds into minutes, minutes into hours, hours into days.
-/// Only the integer part of seconds is carried; the fractional part stays in seconds.
+/// A position on the time line, exactly: whole seconds from 1970-01-01T00:00Z
+/// (a missing time zone offset read as `Z`), and the fraction of a second in
+/// `[0, 1)` as parsed — kept apart so that no sum rounds (Datatypes 1.1 §E.3.4
+/// ·timeOnTimeline·). Compared lexicographically. The XPath operators order
+/// date/time values on the same key, with their implicit time zone in place
+/// of a missing offset.
+pub(crate) fn time_line_seconds(
+    days: i128,
+    hour: u8,
+    minute: u8,
+    second: Decimal,
+    timezone: Option<TimezoneOffset>,
+) -> (i128, Decimal) {
+    let whole = second.trunc();
+    let fraction = (second - whole).normalize();
+    let whole = whole.to_i128().unwrap_or_default();
+    let offset = timezone.map_or(0, |tz| i128::from(tz.0));
+    (
+        days * 86_400 + i128::from(hour) * 3_600 + i128::from(minute) * 60 + whole - offset * 60,
+        fraction,
+    )
+}
+
+/// The canonical day-time fields of a duration (Datatypes 1.1 §E.3.2
+/// ·durationCanonicalMap·): carries over whole seconds into minutes, minutes
+/// into hours, hours into days; only the integer part of seconds is carried,
+/// the fractional part stays in seconds. In `u128`, so that every value the
+/// fields hold (whole seconds up to 2⁹⁶, `u32` days, hours and minutes)
+/// carries without overflow.
 fn normalize_day_time(
     days: u32,
     hours: u32,
     minutes: u32,
     seconds: Decimal,
-) -> (u32, u32, u32, Decimal) {
+) -> (u128, u128, u128, Decimal) {
     let whole_secs = seconds.trunc();
     let frac_secs = seconds - whole_secs;
 
-    let total_secs: u64 = whole_secs.to_u64().unwrap_or(0);
-    let mut mins = minutes as u64 + total_secs / 60;
+    // A non-negative `Decimal`'s integral part (below 2⁹⁶) always fits `u128`.
+    let total_secs: u128 = whole_secs.to_u128().unwrap_or(0);
+    let mut mins = u128::from(minutes) + total_secs / 60;
     let rem_secs = (total_secs % 60) as u32;
-    let mut hrs = hours as u64 + mins / 60;
+    let mut hrs = u128::from(hours) + mins / 60;
     mins %= 60;
-    let d = days as u64 + hrs / 24;
+    let d = u128::from(days) + hrs / 24;
     hrs %= 24;
 
     let out_seconds = Decimal::from(rem_secs) + frac_secs;
-    (d as u32, hrs as u32, mins as u32, out_seconds)
+    (d, hrs, mins, out_seconds)
 }
 
 /// Format seconds with optional fractional part (zero-padded for time-of-day: HH:MM:SS)
@@ -1304,6 +1512,25 @@ mod tests {
     }
 
     #[test]
+    fn test_canonical_durations_of_the_largest_fields() {
+        use crate::types::validators::{DurationValidator, TypeValidator};
+        let canonical = |lexical: &str| {
+            DurationValidator
+                .validate(lexical)
+                .unwrap()
+                .to_string_value()
+        };
+        // 4294967295 years and months: 55834574835 months; the day-time part
+        // carries 2⁹⁶ − 1 seconds and the u32 fields without overflow.
+        assert_eq!(canonical("P4294967295Y4294967295M"), "P4652881236Y3M");
+        assert_eq!(
+            canonical("-P4294967295DT4294967295H4294967295M79228162514264337593543950335S"),
+            "-P916992621692878754609936DT18H47M15S"
+        );
+        assert_eq!(canonical("PT0.5S"), "PT0.5S");
+    }
+
+    #[test]
     fn test_hex_binary_display() {
         let v = XmlAtomicValue::HexBinary(vec![0xDE, 0xAD, 0xBE, 0xEF]);
         assert_eq!(format!("{}", v), "DEADBEEF");
@@ -1313,5 +1540,85 @@ mod tests {
     fn test_base64_binary_display() {
         let v = XmlAtomicValue::Base64Binary(b"Hello".to_vec());
         assert_eq!(format!("{}", v), "SGVsbG8=");
+    }
+
+    /// F&O §17.1.2: a QName or NOTATION converts to `prefix:local`, or to the
+    /// local name when it has no prefix — with no name table at hand.
+    #[test]
+    fn test_qname_value_string_form() {
+        let names = NameTable::new();
+        let ns = names.add("urn:x");
+        let local = names.add("local");
+        let prefix = names.add("p");
+        let empty = names.add("");
+        let prefixed = QNameValue::new(QualifiedName::new(Some(ns), local, Some(prefix)), &names);
+        assert_eq!(prefixed.lexical(), "p:local");
+        assert_eq!(prefixed.prefix(), Some("p"));
+        assert_eq!(prefixed.local_name(), "local");
+        assert_eq!(prefixed.name().namespace_uri, Some(ns));
+        let bare = QNameValue::new(QualifiedName::new(Some(ns), local, None), &names);
+        assert_eq!((bare.lexical(), bare.prefix()), ("local", None));
+        // An empty prefix is no prefix.
+        let empty_prefix = QNameValue::new(QualifiedName::new(None, local, Some(empty)), &names);
+        assert_eq!(
+            (empty_prefix.lexical(), empty_prefix.prefix()),
+            ("local", None)
+        );
+
+        for (code, atom) in [
+            (XmlTypeCode::QName, XmlAtomicValue::QName(prefixed.clone())),
+            (
+                XmlTypeCode::Notation,
+                XmlAtomicValue::Notation(prefixed.clone()),
+            ),
+        ] {
+            assert_eq!(atom.to_string(), "p:local");
+            let value = XmlValue::new(code, XmlValueKind::Atomic(atom));
+            assert_eq!(value.to_string_value(), "p:local");
+        }
+        let qname = XmlValue::new(
+            XmlTypeCode::QName,
+            XmlValueKind::Atomic(XmlAtomicValue::QName(prefixed.clone())),
+        );
+        assert_eq!(qname.as_qname(), Some(prefixed.name()));
+    }
+
+    /// F&O §11.2.1: equality (and so hashing) ignores the prefix.
+    #[test]
+    fn test_qname_value_equality_ignores_the_prefix() {
+        use std::hash::BuildHasher;
+        let names = NameTable::new();
+        let ns = names.add("urn:x");
+        let local = names.add("l");
+        let p = QNameValue::new(
+            QualifiedName::new(Some(ns), local, Some(names.add("p"))),
+            &names,
+        );
+        let q = QNameValue::new(
+            QualifiedName::new(Some(ns), local, Some(names.add("q"))),
+            &names,
+        );
+        let other = QNameValue::new(
+            QualifiedName::new(None, local, Some(names.add("p"))),
+            &names,
+        );
+        assert_eq!(p, q);
+        assert_ne!(p, other);
+        let state = std::collections::hash_map::RandomState::new();
+        assert_eq!(state.hash_one(&p), state.hash_one(&q));
+    }
+
+    /// A list's string value joins its members' string values with spaces.
+    #[test]
+    fn test_list_string_value_joins_members() {
+        let list = XmlValue::new(
+            XmlTypeCode::AnySimpleType,
+            XmlValueKind::List {
+                item_type: XmlTypeCode::AnySimpleType,
+                items: vec![XmlValue::integer(BigInt::from(1)), XmlValue::string("x")],
+            },
+        );
+        assert_eq!(list.to_string_value(), "1 x");
+        assert!(list.is_list());
     }
 }

@@ -7,7 +7,7 @@ use super::attributes::{
     WildcardRestrictionOutcome,
 };
 use super::normalize::{is_effectively_empty, normalize_model_group_as_particle};
-use super::particle::{particle_is_emptiable, particle_restricts};
+use super::particle::{particle_accepts_nothing, particle_is_emptiable, particle_restricts};
 use super::{
     effective_attribute_wildcard, effective_wildcard_allows_attribute, format_type_name,
     is_type_derived_from, DerivationStats,
@@ -148,6 +148,11 @@ pub(super) fn validate_all_redefine_group_restrictions(
         // exact same surviving shape. Mirror the existing short-circuit in
         // `validate_content_particle_restriction` (derivation.rs:1148-1161):
         // empty derived is a valid restriction iff the base is emptiable.
+        // A derived group that accepts no sequence at all: see
+        // `validate_content_particle_restriction`.
+        if schema_set.is_xsd11() && particle_accepts_nothing(&derived_particle) {
+            continue;
+        }
         if is_effectively_empty(&derived_particle) {
             if !particle_is_emptiable(&base_particle) {
                 errors.push(make_redefine_group_restriction_error(
@@ -363,6 +368,7 @@ pub(super) fn validate_all_redefine_attribute_group_restrictions(
             schema_set,
             derived_effective_wc.as_ref(),
             base_effective_wc.as_ref(),
+            true,
         ) {
             WildcardRestrictionOutcome::DerivedAbsent | WildcardRestrictionOutcome::Valid => {}
             WildcardRestrictionOutcome::AddedInDerived => {

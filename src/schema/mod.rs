@@ -15,6 +15,7 @@
 //! - `derivation` - Type derivation validation
 //! - `redefine` - xs:redefine processing
 //! - `override_dir` - xs:override processing (XSD 1.1)
+//! - `value_constraint` - an element declaration's {value constraint} for hosts
 
 pub mod annotation;
 pub mod composition;
@@ -28,10 +29,12 @@ pub mod edc;
 pub mod group;
 pub mod inline;
 pub mod model;
+pub(crate) mod nesting;
 #[cfg(feature = "xsd11")]
 pub mod override_dir;
 pub mod redefine;
 pub mod resolver;
+pub mod value_constraint;
 pub mod wildcard;
 
 // Re-exports from model
@@ -46,6 +49,9 @@ pub use decl::{
     AttributeDecl, DeclarationScope, ElementDecl, FormKind, NotationDecl, TypeReference,
     ValueConstraint,
 };
+
+// Re-exports from value_constraint
+pub use value_constraint::{ElementValueConstraint, ValueConstraintVariety};
 
 // Re-exports from group
 pub use group::{AttributeGroupDef, AttributeGroupRef, ModelGroupDef, ModelGroupRef, Occurrence};
@@ -80,6 +86,8 @@ pub use inline::{
 pub use dependencies::{build_dependency_graph, DependencyGraph, DependencyStats};
 
 // Re-exports from derivation
+#[cfg(feature = "xsd11")]
+pub use cta::validate_assertion_xpath;
 #[cfg(feature = "xsd11")]
 pub use cta::validate_cta_substitutability;
 #[cfg(feature = "xsd11")]

@@ -20,6 +20,10 @@ pub(super) struct EffectiveAttributeUse {
     pub(super) use_kind: AttributeUseKind,
     pub(super) resolved_type: Option<TypeKey>,
     pub(super) fixed_value: Option<String>,
+    /// The declaration the fixed value was written on — the use's own
+    /// `<attribute>`, or the referenced declaration (its namespace bindings
+    /// read a QName value).
+    pub(super) fixed_source: Option<crate::parser::location::SourceRef>,
     pub(super) default_value: Option<String>,
     /// XSD 1.1 §3.5.1 / §3.2.2.3: the use-level `{inheritable}` is the local
     /// `inheritable` attribute when present; for `ref`-based uses without an
@@ -69,12 +73,14 @@ pub(super) fn resolve_single_attribute_use(
     });
 
     // For fixed_value: use the inline fixed, or the resolved global decl's fixed.
-    let fixed_value = attr_use.attribute.fixed_value.clone().or_else(|| {
-        resolved
+    let (fixed_value, fixed_source) = match &attr_use.attribute.fixed_value {
+        Some(fixed) => (Some(fixed.clone()), attr_use.attribute.source.clone()),
+        None => resolved
             .and_then(|r| r.resolved_ref)
             .and_then(|ref_key| schema_set.arenas.attributes.get(ref_key))
-            .and_then(|decl| decl.fixed_value.clone())
-    });
+            .map(|decl| (decl.fixed_value.clone(), decl.source.clone()))
+            .unwrap_or((None, None)),
+    };
     // For default_value: use the inline default, or the resolved global decl's default.
     let default_value = attr_use.attribute.default_value.clone().or_else(|| {
         resolved
@@ -83,24 +89,14 @@ pub(super) fn resolve_single_attribute_use(
             .and_then(|decl| decl.default_value.clone())
     });
 
-    // {inheritable} per §3.2.2.3: the actual value of the use's
-    // `inheritable` attribute (default false). For ref-based uses, the
-    // mapping rule says use the {attribute declaration}.{inheritable} —
-    // but the parser stores the use's literal value with a `false`
-    // default, indistinguishable from "unspecified". Fall back to the
-    // referenced declaration's inheritable when the use itself is a
-    // ref and is not flagged.
-    let inheritable = if attr_use.attribute.inheritable {
-        true
-    } else if attr_use.attribute.ref_name.is_some() {
+    // {inheritable} per §3.2.2.2 / §3.2.2.3: the actual value of the use's
+    // `inheritable` attribute, if present, otherwise false for a local
+    // declaration and the referenced declaration's {inheritable} for a ref.
+    let inheritable = attr_use.use_inheritable(
         resolved
             .and_then(|r| r.resolved_ref)
-            .and_then(|ref_key| schema_set.arenas.attributes.get(ref_key))
-            .map(|decl| decl.inheritable)
-            .unwrap_or(false)
-    } else {
-        false
-    };
+            .and_then(|ref_key| schema_set.arenas.attributes.get(ref_key)),
+    );
 
     Some(EffectiveAttributeUse {
         name,
@@ -108,76 +104,132 @@ pub(super) fn resolve_single_attribute_use(
         use_kind: attr_use.use_kind,
         resolved_type,
         fixed_value,
+        fixed_source,
         default_value,
         inheritable,
     })
 }
 
-/// Collect effective attribute uses from a complex type definition.
+/// The attribute uses a complex type declares itself — §3.4.2.4 (Mapping
+/// Rule for Attribute Uses Property) clauses 1 and 2: "1 The set of attribute
+/// uses corresponding to the <attribute> \[children\], if any. 2 The
+/// {attribute uses} of the attribute groups ·resolved· to by the ·actual
+/// value·s of the ref \[attribute\] of the <attributeGroup> \[children\], if
+/// any." — each name once, the type's own first.
 ///
-/// Resolves attribute refs and expands attribute groups into a flat list.
+/// An `<attribute use="prohibited">` corresponds to no attribute use
+/// (§3.2.2.2 / §3.2.2.3: "unless use='prohibited', in which case the item
+/// corresponds to nothing at all"; XSD 1.0 §3.2.2 alike). An attribute
+/// group's is therefore dropped. The type's own is kept, after the uses and
+/// only for a name none of them has, as a marker (`use_kind` `Prohibited`):
+/// in a restriction it keeps the base's use of that name from being inherited
+/// (clause 3.2.2: "what would have been an attribute use corresponding to an
+/// <attribute> \[child\], if the <attribute> had not had use = prohibited";
+/// XSD 1.0 clause 3.2: "the relevant <attribute> among the \[children\] of
+/// <restriction>"), in an extension it is ignored (clause 3.1). This is the
+/// rule the validation runtime's walk of the {attribute uses} follows
+/// (`ValidationRuntime::for_each_attribute_use`).
+///
 /// Attributes are always on `type_def.attributes` (moved from sc/cc at parse time).
 fn collect_effective_attribute_uses(
     schema_set: &SchemaSet,
     type_def: &crate::arenas::ComplexTypeDefData,
 ) -> Vec<EffectiveAttributeUse> {
+    fn has(list: &[EffectiveAttributeUse], eau: &EffectiveAttributeUse) -> bool {
+        list.iter()
+            .any(|a| a.name == eau.name && a.target_namespace == eau.target_namespace)
+    }
     let mut result = Vec::new();
+    let mut prohibited = Vec::new();
 
     for (i, attr_use) in type_def.attributes.iter().enumerate() {
         let resolved = type_def.resolved_attributes.get(i);
         if let Some(eau) = resolve_single_attribute_use(schema_set, attr_use, resolved) {
+            if eau.use_kind == AttributeUseKind::Prohibited {
+                prohibited.push(eau);
+            } else if !has(&result, &eau) {
+                result.push(eau);
+            }
+        }
+    }
+
+    let mut group_uses = Vec::new();
+    for &ag_key in &type_def.resolved_attribute_groups {
+        collect_attribute_group_uses(schema_set, ag_key, &mut group_uses, 0);
+    }
+    for eau in group_uses {
+        if eau.use_kind != AttributeUseKind::Prohibited && !has(&result, &eau) {
             result.push(eau);
         }
     }
 
-    for &ag_key in &type_def.resolved_attribute_groups {
-        collect_attribute_group_uses(schema_set, ag_key, &mut result, 0);
+    for eau in prohibited {
+        if !has(&result, &eau) {
+            result.push(eau);
+        }
     }
 
     result
 }
 
 /// The complete `{attribute uses}` of a complex type, including the ones it
-/// inherits from its base type definition (§3.4.2.4).
+/// inherits from its base type definition (§3.4.2.4) — the *base* side of a
+/// restriction check, which needs the full picture, or every attribute the
+/// base itself inherited looks like an attribute the restriction invented.
+/// ([`collect_effective_attribute_uses`] is the *derived* side: the checks
+/// below are written around "not re-declared here means inherited
+/// unchanged".)
 ///
-/// `collect_effective_attribute_uses` only reports what a type declares
-/// itself (plus its attribute groups).  That is the right input for the
-/// *derived* side of a restriction — the checks below are written around
-/// "not re-declared here means inherited unchanged" — but the *base* side
-/// needs the full picture, or every attribute the base itself inherited looks
-/// like an attribute the restriction invented.
-///
-/// Uses declared locally win over inherited ones of the same expanded name;
-/// `use="prohibited"` therefore removes the inherited use, and per §3.4.2.4
-/// contributes no attribute use of its own.
+/// Clause 3: the uses "inherited" from the {base type definition} — for an
+/// extension all of them (3.1), for a restriction all but those whose name is
+/// "3.2.1 the expanded name of the {attribute declaration} of an attribute use
+/// which has already been included in the set, following the rules in clause
+/// 1 or clause 2 above; 3.2.2 the expanded name of the {attribute
+/// declaration} of what would have been an attribute use corresponding to an
+/// <attribute> \[child\], if the <attribute> had not had use = prohibited."
+/// So a prohibition only stops a restriction's inheritance — an extension's
+/// is "simply ignored", an attribute group's is no use at all — and the set
+/// is cumulative down the base chain to `xs:anyType`, as the clause composes.
+/// The same walk as the validation runtime's.
 fn collect_inherited_attribute_uses(
     schema_set: &SchemaSet,
     type_def: &crate::arenas::ComplexTypeDefData,
-    depth: usize,
 ) -> Vec<EffectiveAttributeUse> {
-    let mut result = collect_effective_attribute_uses(schema_set, type_def);
-
-    if depth < 50 {
-        if let Some(TypeKey::Complex(base_key)) = type_def.resolved_base_type {
-            if base_key != schema_set.any_type_key() {
-                if let Some(base_type) = schema_set.arenas.complex_types.get(base_key) {
-                    for inherited in
-                        collect_inherited_attribute_uses(schema_set, base_type, depth + 1)
-                    {
-                        let overridden = result.iter().any(|a| {
-                            a.name == inherited.name
-                                && a.target_namespace == inherited.target_namespace
-                        });
-                        if !overridden {
-                            result.push(inherited);
-                        }
-                    }
+    let any_type = schema_set.any_type_key();
+    let mut result = Vec::new();
+    // Names a more derived level keeps out of what its base types contribute.
+    let mut not_inherited: Vec<(Option<NameId>, NameId)> = Vec::new();
+    let mut current = Some(type_def);
+    let mut depth = 0;
+    while let Some(level) = current {
+        if depth > schema_set.recursion_bound(50) {
+            break;
+        }
+        let restriction = level.derivation_method != Some(DerivationMethod::Extension);
+        let mut level_names = Vec::new();
+        for eau in collect_effective_attribute_uses(schema_set, level) {
+            let name = (eau.target_namespace, eau.name);
+            if eau.use_kind == AttributeUseKind::Prohibited {
+                // Clause 3.2.2 (a restriction); an extension's is ignored.
+                if restriction {
+                    level_names.push(name);
                 }
+                continue;
+            }
+            level_names.push(name);
+            if !not_inherited.contains(&name) {
+                result.push(eau);
             }
         }
+        not_inherited.extend(level_names);
+        current = match level.resolved_base_type {
+            Some(TypeKey::Complex(base_key)) if base_key != any_type => {
+                schema_set.arenas.complex_types.get(base_key)
+            }
+            _ => None,
+        };
+        depth += 1;
     }
-
-    result.retain(|a| a.use_kind != AttributeUseKind::Prohibited);
     result
 }
 
@@ -587,7 +639,9 @@ pub(crate) fn effective_attribute_wildcard(
     Ok(combine_effective_wildcards(local, w))
 }
 
-/// Runtime entry point for attribute wildcard matching.
+/// The type's `{attribute wildcard}`: the runtime entry point for attribute
+/// wildcard matching, and the base side of derivation-ok-restriction
+/// (`validate_attribute_restriction`), so the two never disagree.
 ///
 /// Returns the type's full effective `{attribute wildcard}` per §3.6.2.2
 /// (intersection of own + attribute groups) chained with §3.4.2.5's
@@ -613,7 +667,7 @@ fn compute_runtime_attribute_wildcard_bounded(
     ct_key: ComplexTypeKey,
     depth: u32,
 ) -> Option<EffectiveAttributeWildcard> {
-    if depth > 100 {
+    if depth as usize > schema_set.recursion_bound(100) {
         return None;
     }
     let ct = schema_set.arenas.complex_types.get(ct_key)?;
@@ -635,11 +689,14 @@ fn compute_runtime_attribute_wildcard_bounded(
     let Some(TypeKey::Complex(base_key)) = ct.resolved_base_type else {
         return own;
     };
-    if base_key == schema_set.any_type_key() {
+    if base_key == ct_key {
         return own;
     }
 
     match ct.derivation_method {
+        // §3.4.2.5 clause 2.2.1.1: the ·base wildcard· is the base's
+        // {attribute wildcard} — `xs:anyType`'s too (§3.4.7: {variety} any,
+        // {process contents} lax), which its extensions therefore have.
         Some(DerivationMethod::Extension) => {
             let base = compute_runtime_attribute_wildcard_bounded(schema_set, base_key, depth + 1);
             match (own, base) {
@@ -677,7 +734,9 @@ fn own_attribute_wildcard_ref(ct: &crate::arenas::ComplexTypeDefData) -> Option<
     }
 }
 
-/// §3.4.2.5 extension union of two effective attribute wildcards.
+/// §3.4.2.5 extension union of the ·complete wildcard· `a` (the extending
+/// type's own) and the ·base wildcard· `b` (the base type's
+/// {attribute wildcard}).
 ///
 /// - `namespace`: `union_canonical_ns` (set-theoretic union)
 /// - `not_qname`: per §3.10.6.3 cos-aw-union, the union must not admit any
@@ -686,7 +745,9 @@ fn own_attribute_wildcard_ref(ct: &crate::arenas::ComplexTypeDefData) -> Option<
 ///   doesn't admit it either (whether by namespace or by its own
 ///   disallowed_names). `##defined` / `##definedSibling` keep the simple
 ///   intersection rule — each is in the result iff both inputs have it.
-/// - `process_contents`: less restrictive of the two (Skip > Lax > Strict).
+/// - `process_contents`: the complete wildcard's — clause 2.2.2.3, "a
+///   wildcard whose {process contents} and {annotations} are those of the
+///   ·complete wildcard·" (XSD 1.0 §3.4.2 clause 3.2.2.1.2 says the same).
 fn union_effective_attribute_wildcards(
     a: &EffectiveAttributeWildcard,
     b: &EffectiveAttributeWildcard,
@@ -741,18 +802,10 @@ fn union_effective_attribute_wildcards(
         consider(item, a);
     }
 
-    let process_contents = if process_contents_strictness(a.process_contents)
-        <= process_contents_strictness(b.process_contents)
-    {
-        a.process_contents
-    } else {
-        b.process_contents
-    };
-
     EffectiveAttributeWildcard {
         namespace,
         not_qname,
-        process_contents,
+        process_contents: a.process_contents,
     }
 }
 
@@ -769,7 +822,7 @@ fn collect_effective_group_wildcards(
     out: &mut Vec<EffectiveAttributeWildcard>,
     depth: usize,
 ) -> SchemaResult<()> {
-    if depth > 20 {
+    if depth > schema_set.recursion_bound(20) {
         return Err(attribute_group_cycle_error());
     }
 
@@ -797,7 +850,7 @@ fn effective_attribute_wildcard_for_group(
     ag: &crate::arenas::AttributeGroupData,
     depth: usize,
 ) -> SchemaResult<Option<EffectiveAttributeWildcard>> {
-    if depth > 20 {
+    if depth > schema_set.recursion_bound(20) {
         return Err(attribute_group_cycle_error());
     }
 
@@ -838,7 +891,10 @@ fn effective_attribute_wildcard_for_group(
 ///    (§3.10.6.2 clause 2); same for `##sibling` (clause 3). These
 ///    two keywords require literal containment, unlike QName members.
 /// 4. derived processContents strictness ≥ base strictness (mirrors
-///    `validate_open_content_restriction` at derivation.rs:2488-2501).
+///    `validate_open_content_restriction` at derivation.rs:2488-2501),
+///    when `compare_process_contents` — not for a restriction of
+///    `xs:anyType` (XSD 1.0 clause 4.3: "Unless the {base type definition} is
+///    the ·ur-type definition·").
 ///
 /// Takes `schema_set` because `##defined` coverage requires a lookup
 /// against `schema_set.lookup_attribute` via
@@ -850,6 +906,7 @@ pub(super) fn effective_attribute_wildcard_restricts(
     schema_set: &SchemaSet,
     derived: &EffectiveAttributeWildcard,
     base: &EffectiveAttributeWildcard,
+    compare_process_contents: bool,
 ) -> Result<(), &'static str> {
     use crate::parser::frames::NotQNameItem;
 
@@ -897,8 +954,9 @@ pub(super) fn effective_attribute_wildcard_restricts(
         }
     }
 
-    if process_contents_strictness(derived.process_contents)
-        < process_contents_strictness(base.process_contents)
+    if compare_process_contents
+        && process_contents_strictness(derived.process_contents)
+            < process_contents_strictness(base.process_contents)
     {
         return Err("processContents is weaker than the base wildcard");
     }
@@ -966,7 +1024,7 @@ pub(super) fn collect_attribute_group_uses(
     result: &mut Vec<EffectiveAttributeUse>,
     depth: usize,
 ) {
-    if depth > 20 {
+    if depth > schema_set.recursion_bound(20) {
         return;
     }
 
@@ -1008,19 +1066,24 @@ pub(super) enum WildcardRestrictionOutcome {
 
 /// Compare two precomputed effective attribute wildcards and classify
 /// the restriction relationship. The caller is responsible for deciding
-/// how to report each outcome.
+/// how to report each outcome. `compare_process_contents` is false for a
+/// restriction of `xs:anyType` (see [`effective_attribute_wildcard_restricts`]).
 pub(super) fn classify_attribute_wildcard_restriction(
     schema_set: &SchemaSet,
     derived_eff: Option<&EffectiveAttributeWildcard>,
     base_eff: Option<&EffectiveAttributeWildcard>,
+    compare_process_contents: bool,
 ) -> WildcardRestrictionOutcome {
     match (derived_eff, base_eff) {
         (None, _) => WildcardRestrictionOutcome::DerivedAbsent,
         (Some(_), None) => WildcardRestrictionOutcome::AddedInDerived,
-        (Some(d), Some(b)) => match effective_attribute_wildcard_restricts(schema_set, d, b) {
-            Ok(()) => WildcardRestrictionOutcome::Valid,
-            Err(reason) => WildcardRestrictionOutcome::NotSubset(reason),
-        },
+        (Some(d), Some(b)) => {
+            match effective_attribute_wildcard_restricts(schema_set, d, b, compare_process_contents)
+            {
+                Ok(()) => WildcardRestrictionOutcome::Valid,
+                Err(reason) => WildcardRestrictionOutcome::NotSubset(reason),
+            }
+        }
     }
 }
 
@@ -1047,7 +1110,7 @@ pub(super) fn validate_attribute_restriction(
     base: &crate::arenas::ComplexTypeDefData,
 ) -> SchemaResult<()> {
     let derived_attrs = collect_effective_attribute_uses(schema_set, derived);
-    let base_attrs = collect_inherited_attribute_uses(schema_set, base, 0);
+    let base_attrs = collect_inherited_attribute_uses(schema_set, base);
 
     let location = derived
         .source
@@ -1056,16 +1119,37 @@ pub(super) fn validate_attribute_restriction(
     let type_name = format_type_name(schema_set, derived.name, derived.target_namespace);
     let base_name = format_type_name(schema_set, base.name, base.target_namespace);
 
+    // The base's {attribute wildcard} (§3.4.2.5): its ·complete wildcard·,
+    // or — when the base is itself an extension — that combined with its
+    // own base's {attribute wildcard} (clause 2.2; XSD 1.0 §3.4.2 clause
+    // 3.2). It is the wildcard the runtime matches with, computed by the same
+    // function, and both the attribute-use half and the wildcard half of
+    // derivation-ok-restriction compare against it. Computed on first use.
+    let base_key = match derived.resolved_base_type {
+        Some(TypeKey::Complex(key)) => Some(key),
+        _ => None,
+    };
+    let base_wildcard_cell = std::cell::OnceCell::new();
+    let base_wildcard = || {
+        base_wildcard_cell
+            .get_or_init(|| {
+                base_key.and_then(|k| compute_runtime_attribute_wildcard(schema_set, k))
+            })
+            .as_ref()
+    };
+
     // Check clause 3: required base attributes must remain required in the
     // derived type's effective {attribute uses}.
     //
-    // Per §3.4.2.3 mapping rules, an attribute use in the base that is NOT
-    // matched (by name + target namespace) by a directly-declared use in the
-    // restriction is inherited into the derived type's {attribute uses}
-    // unchanged.  The derived type therefore satisfies clause 3 trivially for
-    // inherited attribute uses — we only need to reject cases where the
-    // derived type explicitly *declares* the attribute with a weaker use
-    // kind (optional or prohibited).
+    // Per the §3.4.2.4 mapping rule, an attribute use in the base that is NOT
+    // matched (by name + target namespace) by a use of the restriction — its
+    // own `<attribute>` or one of its attribute groups' — nor by its own
+    // prohibited `<attribute>` is inherited into the derived type's
+    // {attribute uses} unchanged (an attribute group's prohibited
+    // `<attribute>` is no use and removes nothing). The derived type
+    // therefore satisfies clause 3 trivially for inherited attribute uses —
+    // we only need to reject cases where the derived type *declares* the
+    // attribute with a weaker use kind (optional) or prohibits it itself.
     for base_attr in &base_attrs {
         if base_attr.use_kind != AttributeUseKind::Required {
             continue;
@@ -1142,9 +1226,8 @@ pub(super) fn validate_attribute_restriction(
     // admitted by the base's complete {attribute wildcard} (msData ctO004:
     // unqualified attribute vs a base wildcard of ##other). xs:anyType's
     // wildcard admits everything, so restrictions of anyType are exempt.
-    if let Some(TypeKey::Complex(base_key)) = derived.resolved_base_type {
+    if let Some(base_key) = base_key {
         if base_key != schema_set.any_type_key() {
-            let base_wildcard = compute_runtime_attribute_wildcard_bounded(schema_set, base_key, 0);
             for derived_attr in &derived_attrs {
                 if derived_attr.use_kind == AttributeUseKind::Prohibited {
                     continue;
@@ -1156,7 +1239,7 @@ pub(super) fn validate_attribute_restriction(
                 if matches_base {
                     continue;
                 }
-                let admitted = base_wildcard.as_ref().is_some_and(|wc| {
+                let admitted = base_wildcard().is_some_and(|wc| {
                     effective_wildcard_allows_attribute(
                         schema_set,
                         wc,
@@ -1190,6 +1273,7 @@ pub(super) fn validate_attribute_restriction(
         let Some(base_fixed) = base_attr.fixed_value.as_deref() else {
             continue;
         };
+        let base_fixed_ns = schema_set.value_constraint_namespaces(base_attr.fixed_source.as_ref());
         // Find re-declared derived attr matching this base attr.
         let Some(derived_attr) = derived_attrs
             .iter()
@@ -1206,9 +1290,11 @@ pub(super) fn validate_attribute_restriction(
         }
         match derived_attr.fixed_value.as_deref() {
             Some(d_fixed)
-                if crate::validation::simple::fixed_values_equal(
+                if crate::validation::simple::fixed_values_equal_in(
                     d_fixed,
+                    schema_set.value_constraint_namespaces(derived_attr.fixed_source.as_ref()),
                     base_fixed,
+                    base_fixed_ns,
                     base_attr.resolved_type,
                     schema_set,
                 ) => {}
@@ -1281,12 +1367,14 @@ pub(super) fn validate_attribute_restriction(
         }
     }
 
-    // §3.4.6.3 clause 3 (attribute wildcard half): compute the effective
-    // attribute wildcard for both sides per §3.6.2.2 and verify
-    // derived ⊆ base. When the derived type has no wildcard source at
-    // all, the §3.6.2.2 walk is guaranteed to return `None` and the
-    // restriction is trivially valid — skip both walks in that common
-    // case to avoid O(types × groups) arena lookups per compile.
+    // §3.4.6.3 clause 3 (attribute wildcard half; XSD 1.0 §3.4.6 clause 4):
+    // the derived type's {attribute wildcard} — a restriction's is its
+    // ·complete wildcard· (§3.4.2.5 clause 2.1, the §3.6.2.2 walk) — must
+    // be a subset of the base's {attribute wildcard} (above). When the
+    // derived type has no wildcard source at all, the §3.6.2.2 walk is
+    // guaranteed to return `None` and the restriction is trivially valid —
+    // skip both walks in that common case to avoid O(types × groups) arena
+    // lookups per compile.
     if !complex_type_has_no_attribute_wildcard_source(derived) {
         let derived_eff = effective_attribute_wildcard(
             schema_set,
@@ -1294,17 +1382,19 @@ pub(super) fn validate_attribute_restriction(
             derived.target_namespace,
             &derived.resolved_attribute_groups,
         )?;
-        let base_eff = effective_attribute_wildcard(
-            schema_set,
-            base.attribute_wildcard.as_ref(),
-            base.target_namespace,
-            &base.resolved_attribute_groups,
-        )?;
 
+        // XSD 1.0 clause 4.3 exempts a restriction of the ur-type from the
+        // {process contents} comparison: "Unless the {base type definition}
+        // is the ·ur-type definition·". In 1.1 an explicit
+        // `<xs:restriction base="xs:anyType">` is the same component as the
+        // shorthand `<xs:complexType>` (§3.4.2.6), whose wildcard is never
+        // compared with anyType's, so the exemption holds there too.
+        let base_is_any_type = base_key == Some(schema_set.any_type_key());
         match classify_attribute_wildcard_restriction(
             schema_set,
             derived_eff.as_ref(),
-            base_eff.as_ref(),
+            base_wildcard(),
+            !base_is_any_type,
         ) {
             WildcardRestrictionOutcome::DerivedAbsent | WildcardRestrictionOutcome::Valid => {}
             WildcardRestrictionOutcome::AddedInDerived => {

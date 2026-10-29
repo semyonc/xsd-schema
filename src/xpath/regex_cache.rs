@@ -43,11 +43,11 @@
 //!
 //! One cache per run is the right lifetime for a host that evaluates an
 //! expression once over many items. It is the wrong one for a host that
-//! evaluates the same expression *many times*, once per item — an XSLT
-//! processor evaluating the `test` of an `xsl:if` inside an `xsl:for-each`, or a
-//! validator evaluating an assertion per element: every run starts empty, so
-//! every run compiles the pattern again. Such a host creates a [`RegexCache`],
-//! keeps it for as long as it likes (one transformation, say) and lends it to
+//! evaluates the same expression *many times*, once per item — a host
+//! evaluating the same test for every item of a loop, or a validator
+//! evaluating an assertion per element: every run starts empty, so every run
+//! compiles the pattern again. Such a host creates a [`RegexCache`], keeps it
+//! for as long as it likes (one run of the host's own work, say) and lends it to
 //! each run with
 //! [`XPathEvaluator::with_regex_cache`](crate::xpath::XPathEvaluator::with_regex_cache)
 //! or [`DynamicContext::set_regex_cache`](crate::xpath::DynamicContext::set_regex_cache).
@@ -56,7 +56,7 @@
 //!
 //! The host's cache is the host's state, not the process's: it is `Send` but not
 //! `Sync`, so it can move to another thread but is never shared by two threads
-//! at once, and two hosts — or two transformations of one host — only share one
+//! at once, and two hosts — or two runs of one host's work — only share one
 //! if they are handed the same value. It uses interior mutability so that runs
 //! can borrow it by shared reference, and holds its inner borrow only while it
 //! looks a key up or stores one, never while a pattern is matched — so a run
@@ -320,8 +320,8 @@ impl<T> Table<T> {
 /// compiles each distinct `(pattern, flags)` pair of `fn:matches`,
 /// `fn:replace` and `fn:tokenize` only once, but it forgets them when it
 /// returns. A host that evaluates the same expressions over and over — once per
-/// item or per node, as an XSLT processor evaluates an `xsl:if` test inside an
-/// `xsl:for-each` — would then compile the same pattern in every run. Keeping a
+/// item or per node, as when the same test is evaluated for every item of a
+/// loop — would then compile the same pattern in every run. Keeping a
 /// `RegexCache` and lending it to every run makes each pattern compile once for
 /// the life of the cache:
 ///
@@ -391,8 +391,8 @@ impl RegexCache {
     /// The capacity of [`new`](Self::new) and [`Default`]: 64 entries.
     ///
     /// Twice the bound of a single run's own cache, because a host cache serves
-    /// every expression of the host — all the regular-expression literals of a
-    /// stylesheet, say — rather than the few of one expression; and small enough
+    /// every expression of the host — all the regular-expression literals of
+    /// its program, say — rather than the few of one expression; and small enough
     /// that its worst case for ordinary patterns (64 programs of a few category
     /// classes each, see [Memory](#memory)) stays at a few megabytes. A host that
     /// cycles through more distinct patterns than this pays one compilation per

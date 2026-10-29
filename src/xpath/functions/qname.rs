@@ -16,7 +16,7 @@ use crate::xpath::{DomNodeType, NamespaceAxisScope};
 
 use super::{atomize_to_single_opt, atomize_to_string_opt, XPathValue};
 use crate::namespace::qname::{is_ncname, QualifiedName};
-use crate::types::value::{XmlAtomicValue, XmlValue, XmlValueKind};
+use crate::types::value::{QNameValue, XmlAtomicValue, XmlValue, XmlValueKind};
 use crate::types::XmlTypeCode;
 use crate::xpath::iterator::XmlItem;
 
@@ -50,7 +50,7 @@ pub fn resolve_qname<N: DomNavigator>(
         None => return Ok(XPathValue::Empty),
         Some(s) if s.is_empty() => {
             return Err(XPathError::FOCA0002 {
-                qname: String::new(),
+                value: String::new(),
             });
         }
         Some(s) => s,
@@ -59,7 +59,7 @@ pub fn resolve_qname<N: DomNavigator>(
     // Parse the lexical QName
     let (prefix, local_name) =
         parse_lexical_qname(&qname_str).map_err(|_| XPathError::FOCA0002 {
-            qname: qname_str.clone(),
+            value: qname_str.clone(),
         })?;
 
     // Lookup namespace for prefix using element's in-scope namespaces
@@ -113,7 +113,7 @@ pub fn qname_constructor<N: DomNavigator>(
 
     // Check constraint: if prefix is present, namespace must be non-empty
     if prefix.is_some() && namespace_uri.is_none() {
-        return Err(XPathError::FOCA0002 { qname: param_qname });
+        return Err(XPathError::FOCA0002 { value: param_qname });
     }
 
     // Create the QName value
@@ -157,7 +157,7 @@ pub fn prefix_from_qname<N: DomNavigator>(
                 if prefix.is_empty() {
                     Ok(XPathValue::Empty)
                 } else {
-                    Ok(XPathValue::string(prefix))
+                    Ok(make_ncname(prefix))
                 }
             }
         },
@@ -190,7 +190,7 @@ pub fn local_name_from_qname<N: DomNavigator>(
                 .names
                 .try_resolve(qn.local_name)
                 .unwrap_or_default();
-            Ok(XPathValue::string(local))
+            Ok(make_ncname(local))
         }
     }
 }
@@ -280,7 +280,9 @@ pub fn namespace_uri_for_prefix<N: DomNavigator>(
 /// fn:in-scope-prefixes($element as element()) as xs:string*
 ///
 /// Returns a sequence of all prefixes bound to namespaces in scope for an element.
-/// Always includes "xml" prefix.
+/// Always includes "xml" prefix. F&O §11.2.6: "For namespaces that have a
+/// prefix, it returns the prefix as an xs:NCName. For the default namespace,
+/// which has no prefix, it returns the zero-length string."
 pub fn in_scope_prefixes<N: DomNavigator>(
     _context: &mut DynamicContext<'_, N>,
     mut args: Vec<XPathValue<N>>,
@@ -315,10 +317,16 @@ pub fn in_scope_prefixes<N: DomNavigator>(
         }
     }
 
-    // Convert to sequence of strings
+    // An `xs:NCName` per prefix, an `xs:string` for the default namespace.
     let items: Vec<XmlItem<N>> = prefixes
         .into_iter()
-        .map(|p| XmlItem::Atomic(XmlValue::string(p)))
+        .map(|p| {
+            XmlItem::Atomic(if p.is_empty() {
+                XmlValue::string(p)
+            } else {
+                ncname_value(p)
+            })
+        })
         .collect();
 
     Ok(XPathValue::from_sequence(items))
@@ -471,6 +479,19 @@ fn lookup_namespace_for_prefix_opt<N: DomNavigator>(
 }
 
 /// Create an xs:anyURI value.
+/// An `xs:NCName` value (the caller passes a name that is one).
+fn ncname_value(name: impl Into<String>) -> XmlValue {
+    XmlValue::new(
+        XmlTypeCode::NCName,
+        XmlValueKind::Atomic(XmlAtomicValue::String(name.into())),
+    )
+}
+
+/// Create an `xs:NCName` XPathValue.
+fn make_ncname<N: DomNavigator>(name: impl Into<String>) -> XPathValue<N> {
+    XPathValue::Item(XmlItem::Atomic(ncname_value(name)))
+}
+
 fn make_any_uri<N: DomNavigator>(uri: &str) -> XPathValue<N> {
     let value = XmlValue::new(
         XmlTypeCode::AnyUri,
@@ -495,7 +516,7 @@ fn create_qname_value<N: DomNavigator>(
     let ns_id = namespace_uri.map(|ns| names.add(ns));
     let prefix_id = prefix.map(|p| names.add(p));
 
-    let qn = QualifiedName::new(ns_id, local_id, prefix_id);
+    let qn = QNameValue::new(QualifiedName::new(ns_id, local_id, prefix_id), names);
 
     // Create a QName value
     let value = XmlValue::new(

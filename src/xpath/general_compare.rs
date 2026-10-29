@@ -77,7 +77,7 @@ use num_bigint::BigInt;
 use rust_decimal::Decimal;
 
 use crate::namespace::qname::QualifiedName;
-use crate::types::value::{XmlAtomicValue, XmlValue, XmlValueKind};
+use crate::types::value::{TimezoneOffset, XmlAtomicValue, XmlValue, XmlValueKind};
 use crate::types::XmlTypeCode;
 use crate::xpath::atomize::push_atoms;
 use crate::xpath::collation::CollationRef;
@@ -85,8 +85,8 @@ use crate::xpath::context::XPathContext;
 use crate::xpath::error::XPathError;
 use crate::xpath::iterator::{BufferedNodeIterator, XmlItem, XmlItemRef, XmlNodeIterator};
 use crate::xpath::operators::{
-    atomize_item, is_date_time_code, is_duration_code, is_string_like, is_temporal_type,
-    magnitude_relationship_ctx, numeric_class, value_eq_collated, NumericClass,
+    atomize_item, is_date_time_code, is_duration_code, is_gregorian_code, is_string_like,
+    is_temporal_type, magnitude_relationship_ctx, numeric_class, value_eq_collated, NumericClass,
 };
 
 /// Hasher used for the join tables. A `BuildHasherDefault` is a ZST, so a table
@@ -118,13 +118,14 @@ pub(super) fn try_indexed_eq<I1, I2>(
     left: &I1,
     right: &BufferedNodeIterator<I2>,
     collation: CollationRef<'_>,
+    tz: TimezoneOffset,
 ) -> Option<Result<bool, XPathError>>
 where
     I1: XmlNodeIterator,
     I2: XmlNodeIterator,
 {
     let (lvals, rvals) = collect_operands(left, right)?;
-    match general_eq_indexed(context, &lvals, &rvals, collation) {
+    match general_eq_indexed(context, &lvals, &rvals, collation, tz) {
         FastOutcome::Decided(result) => Some(Ok(result)),
         FastOutcome::Raise(err) => Some(Err(err)),
         FastOutcome::Fallback => None,
@@ -138,13 +139,14 @@ pub(super) fn try_indexed_ne<I1, I2>(
     left: &I1,
     right: &BufferedNodeIterator<I2>,
     collation: CollationRef<'_>,
+    tz: TimezoneOffset,
 ) -> Option<Result<bool, XPathError>>
 where
     I1: XmlNodeIterator,
     I2: XmlNodeIterator,
 {
     let (lvals, rvals) = collect_operands(left, right)?;
-    match general_ne_indexed(&lvals, &rvals, collation) {
+    match general_ne_indexed(&lvals, &rvals, collation, tz) {
         FastOutcome::Decided(result) => Some(Ok(result)),
         FastOutcome::Raise(err) => Some(Err(err)),
         FastOutcome::Fallback => None,
@@ -263,10 +265,16 @@ pub(super) enum Class {
     /// `xs:duration`, `xs:yearMonthDuration` and `xs:dayTimeDuration`, which all
     /// compare as a (months, seconds) pair.
     Duration,
+    /// One of the gregorian types (`xs:gYear`, …), compared by its starting
+    /// instant with values of the same type only (F&O §10.4.15 – §10.4.19).
+    Gregorian(XmlTypeCode),
     QName,
+    /// `xs:NOTATION` and the types derived from it: `op:NOTATION-equal`
+    /// compares expanded names, ignoring the prefixes (XPath 2.0 §3.5.1).
+    Notation,
     /// Everything else: `eq` reduces to structural equality of two values that
-    /// carry the same type code (`xs:hexBinary`, `xs:base64Binary`, the
-    /// gregorian types, `xs:NOTATION`, list types, …).
+    /// carry the same type code (`xs:hexBinary`, `xs:base64Binary`, list
+    /// types, …).
     Opaque(XmlTypeCode),
 }
 
@@ -298,6 +306,9 @@ fn classify(value: &XmlValue) -> Option<Class> {
         }
         return None;
     }
+    if is_gregorian_code(code) {
+        return Some(Class::Gregorian(code));
+    }
     if code.is_list() {
         return Some(Class::Opaque(code));
     }
@@ -313,6 +324,9 @@ fn classify(value: &XmlValue) -> Option<Class> {
     if code == XmlTypeCode::QName {
         return Some(Class::QName);
     }
+    if code == XmlTypeCode::Notation {
+        return Some(Class::Notation);
+    }
     Some(Class::Opaque(code))
 }
 
@@ -326,7 +340,9 @@ pub(super) enum Bucket {
     Date,
     Time,
     Duration,
+    Gregorian(XmlTypeCode),
     QName,
+    Notation,
     Opaque(XmlTypeCode),
 }
 
@@ -362,7 +378,10 @@ pub(super) fn pair_kind(left: Class, right: Class) -> PairKind {
         (Date, Date) => PairKind::Comparable(Bucket::Date),
         (Time, Time) => PairKind::Comparable(Bucket::Time),
         (Duration, Duration) => PairKind::Comparable(Bucket::Duration),
+        (Gregorian(l), Gregorian(r)) if l == r => PairKind::Comparable(Bucket::Gregorian(l)),
         (QName, QName) => PairKind::Comparable(Bucket::QName),
+        // A QName against a NOTATION falls through: no row of the §3.5.1 table.
+        (Notation, Notation) => PairKind::Comparable(Bucket::Notation),
         (Opaque(l), Opaque(r)) if l == r => PairKind::Comparable(Bucket::Opaque(l)),
 
         _ => PairKind::Incomparable,
@@ -390,10 +409,12 @@ enum Key<'a> {
     /// `f64` bit pattern, with `-0.0` folded onto `0.0`.
     F64(u64),
     Bool(Option<bool>),
-    /// A date/time normalized to the instant `eq` compares.
-    Instant(Decimal),
-    /// (months, seconds), the pair `eq` compares two durations by.
-    Duration(i64, Decimal),
+    /// A date/time normalized to the instant `eq` compares: whole seconds and
+    /// the fraction of a second, exactly.
+    Instant(i128, Decimal),
+    /// (months, whole seconds, fraction of a second), the parts `eq` compares
+    /// two durations by.
+    Duration(i128, i128, Decimal),
     QName(&'a QualifiedName),
 }
 
@@ -461,6 +482,7 @@ fn key_of<'a>(
     class: Class,
     bucket: Bucket,
     collation: CollationRef<'_>,
+    tz: TimezoneOffset,
 ) -> KeyOutcome<'a> {
     match bucket {
         // A deferred default collation is resolved here, because a string key
@@ -508,31 +530,66 @@ fn key_of<'a>(
             }
         }
         Bucket::Bool => KeyOutcome::Found(Key::Bool(value.as_boolean())),
-        Bucket::DateTime => match crate::xpath::operators::datetime_compare_key(value) {
-            Some(Ok(instant)) => KeyOutcome::Found(Key::Instant(instant)),
-            _ => KeyOutcome::Failed,
+        // The implicit timezone `tz` places a value without a timezone, as
+        // `eq` does (F&O §10.4).
+        Bucket::DateTime => match crate::xpath::operators::datetime_compare_key(value, tz) {
+            Some((whole, fraction)) => KeyOutcome::Found(Key::Instant(whole, fraction)),
+            None => KeyOutcome::Failed,
         },
-        Bucket::Date => match crate::xpath::operators::date_compare_key(value) {
-            Some(Ok(instant)) => KeyOutcome::Found(Key::Instant(instant)),
-            _ => KeyOutcome::Failed,
+        Bucket::Date => match crate::xpath::operators::date_compare_key(value, tz) {
+            Some((whole, fraction)) => KeyOutcome::Found(Key::Instant(whole, fraction)),
+            None => KeyOutcome::Failed,
         },
-        Bucket::Time => match crate::xpath::operators::time_compare_key(value) {
-            Some(Ok(instant)) => KeyOutcome::Found(Key::Instant(instant)),
-            _ => KeyOutcome::Failed,
+        Bucket::Time => match crate::xpath::operators::time_compare_key(value, tz) {
+            Some((whole, fraction)) => KeyOutcome::Found(Key::Instant(whole, fraction)),
+            None => KeyOutcome::Failed,
+        },
+        Bucket::Gregorian(_) => match crate::xpath::operators::gregorian_compare_key(value, tz) {
+            Some((whole, fraction)) => KeyOutcome::Found(Key::Instant(whole, fraction)),
+            None => KeyOutcome::Failed,
         },
         Bucket::Duration => match crate::xpath::operators::duration_compare_key(value) {
-            Ok(Some((months, seconds))) => KeyOutcome::Found(Key::Duration(months, seconds)),
-            _ => KeyOutcome::Failed,
+            Some(parts) => {
+                KeyOutcome::Found(Key::Duration(parts.months, parts.seconds, parts.fraction))
+            }
+            None => KeyOutcome::Failed,
         },
         Bucket::QName => match value.as_qname() {
             Some(qname) => KeyOutcome::Found(Key::QName(qname)),
             None => KeyOutcome::Failed,
         },
-        // `eq` compares these by structural equality of the value, and
-        // `to_string_value` is a pure function of the value, so equal values
-        // always share a key. Unequal values may collide; confirmation settles
-        // them.
+        // The expanded name, never the lexical form: two NOTATIONs that differ
+        // only in their prefixes are `eq`. A NOTATION still held in lexical
+        // form (no namespace context resolved it) is left to the pairwise loop.
+        Bucket::Notation => match &value.value {
+            XmlValueKind::Atomic(XmlAtomicValue::Notation(name)) => {
+                KeyOutcome::Found(Key::QName(name.name()))
+            }
+            _ => KeyOutcome::Failed,
+        },
+        // `eq` compares these by structural equality of the value, and the
+        // string value of each of these types is a function of exactly what
+        // that equality compares (no part of the value is ignored), so equal
+        // values always share a key. Unequal values may collide; confirmation
+        // settles them. (`xs:QName` and `xs:NOTATION` are not here: their
+        // string value carries the prefix, which equality ignores — so a list
+        // value holding such members, which atomization never hands over but a
+        // host may, is left to the pairwise loop.)
+        Bucket::Opaque(_) if holds_a_name(value) => KeyOutcome::Failed,
         Bucket::Opaque(_) => KeyOutcome::Found(Key::Str(string_key(value))),
+    }
+}
+
+/// Whether a list value has an `xs:QName` or `xs:NOTATION` member.
+fn holds_a_name(value: &XmlValue) -> bool {
+    match &value.value {
+        XmlValueKind::List { items, .. } => items.iter().any(|member| {
+            matches!(
+                member.value,
+                XmlValueKind::Atomic(XmlAtomicValue::QName(_) | XmlAtomicValue::Notation(_))
+            )
+        }),
+        _ => false,
     }
 }
 
@@ -563,8 +620,9 @@ pub(super) fn key_hash(
     class: Class,
     bucket: Bucket,
     collation: CollationRef<'_>,
+    tz: TimezoneOffset,
 ) -> KeyHash {
-    match key_of(value, class, bucket, collation) {
+    match key_of(value, class, bucket, collation, tz) {
         KeyOutcome::Found(key) => {
             let mut hasher = AHasher::default();
             key.hash(&mut hasher);
@@ -586,9 +644,10 @@ pub(super) fn confirm(
     left: &XmlValue,
     right: &XmlValue,
     collation: CollationRef<'_>,
+    tz: TimezoneOffset,
 ) -> Result<bool, XPathError> {
     let (l, r) = magnitude_relationship_ctx(context, left, right)?;
-    value_eq_collated(&l, &r, collation)
+    value_eq_collated(&l, &r, collation, tz)
 }
 
 /// One comparable class pair, with the keys of the values it joins.
@@ -602,6 +661,7 @@ fn general_eq_indexed(
     lvals: &[XmlValue],
     rvals: &[XmlValue],
     collation: CollationRef<'_>,
+    tz: TimezoneOffset,
 ) -> FastOutcome {
     if lvals.is_empty() || rvals.is_empty() {
         return FastOutcome::Decided(false);
@@ -633,11 +693,11 @@ fn general_eq_indexed(
     // pair, so the whole comparison goes back to the pairwise loop.
     let mut prepared: Vec<Join<'_>> = Vec::with_capacity(joins.len());
     for &(lc, rc, bucket) in &joins {
-        let left = match collect_keys(lvals, &lclasses, lc, bucket, collation) {
+        let left = match collect_keys(lvals, &lclasses, lc, bucket, collation, tz) {
             Some(keys) => keys,
             None => return FastOutcome::Fallback,
         };
-        let right = match collect_keys(rvals, &rclasses, rc, bucket, collation) {
+        let right = match collect_keys(rvals, &rclasses, rc, bucket, collation, tz) {
             Some(keys) => keys,
             None => return FastOutcome::Fallback,
         };
@@ -647,7 +707,7 @@ fn general_eq_indexed(
     // Phase 2 — hash join. No hard error is possible from here on, so the first
     // confirmed true pair decides the comparison whatever its position.
     for join in &prepared {
-        match join_any_true(context, lvals, rvals, join, collation) {
+        match join_any_true(context, lvals, rvals, join, collation, tz) {
             Ok(true) => return FastOutcome::Decided(true),
             Ok(false) => {}
             Err(_) => return FastOutcome::Fallback,
@@ -660,7 +720,7 @@ fn general_eq_indexed(
         return FastOutcome::Decided(false);
     }
     match first_incomparable_pair(&lclasses, &rclasses, &incomparable) {
-        Some((i, j)) => match confirm(context, &lvals[i], &rvals[j], collation) {
+        Some((i, j)) => match confirm(context, &lvals[i], &rvals[j], collation, tz) {
             Err(err) => FastOutcome::Raise(err),
             // The class pair was classified as always-raising, so this is
             // unreachable; falling back is the safe way to say so.
@@ -692,13 +752,14 @@ fn collect_keys<'a>(
     class: Class,
     bucket: Bucket,
     collation: CollationRef<'_>,
+    tz: TimezoneOffset,
 ) -> Option<Vec<(usize, Key<'a>)>> {
     let mut out = Vec::new();
     for (index, value) in values.iter().enumerate() {
         if classes[index] != class {
             continue;
         }
-        match key_of(value, class, bucket, collation) {
+        match key_of(value, class, bucket, collation, tz) {
             KeyOutcome::Found(key) => out.push((index, key)),
             KeyOutcome::Never => {}
             KeyOutcome::Failed => return None,
@@ -739,6 +800,7 @@ fn join_any_true(
     rvals: &[XmlValue],
     join: &Join<'_>,
     collation: CollationRef<'_>,
+    tz: TimezoneOffset,
 ) -> Result<bool, XPathError> {
     if join.left.is_empty() || join.right.is_empty() {
         return Ok(false);
@@ -761,7 +823,7 @@ fn join_any_true(
             } else {
                 (&lvals[*probe_index], &rvals[hit])
             };
-            if confirm(context, left, right, collation)? {
+            if confirm(context, left, right, collation, tz)? {
                 return Ok(true);
             }
             slot = table.next[slot];
@@ -828,6 +890,7 @@ fn general_ne_indexed(
     lvals: &[XmlValue],
     rvals: &[XmlValue],
     collation: CollationRef<'_>,
+    tz: TimezoneOffset,
 ) -> FastOutcome {
     if lvals.is_empty() || rvals.is_empty() {
         return FastOutcome::Decided(false);
@@ -847,7 +910,7 @@ fn general_ne_indexed(
     let mut reference: Option<Key<'_>> = None;
     for (values, classes) in [(lvals, &lclasses), (rvals, &rclasses)] {
         for (index, value) in values.iter().enumerate() {
-            let key = match key_of(value, classes[index], bucket, collation) {
+            let key = match key_of(value, classes[index], bucket, collation, tz) {
                 KeyOutcome::Found(key) => key,
                 // `Never` cannot occur: none of the three buckets is a float
                 // bucket. `Failed` means the comparison itself would raise, or
@@ -908,8 +971,8 @@ pub(super) mod tests {
     use crate::namespace::NameTable;
     use crate::navigator::RoXmlNavigator;
     use crate::types::value::{
-        DateTimeValue, DateValue, DayTimeDurationValue, DurationValue, GYearValue, TimeValue,
-        TimezoneOffset, YearMonthDurationValue,
+        DateTimeValue, DateValue, DayTimeDurationValue, DurationValue, GYearValue, QNameValue,
+        TimeValue, TimezoneOffset, YearMonthDurationValue,
     };
     use crate::xpath::iterator::{VecNodeIterator, XmlItem};
     use crate::xpath::operators::{general_eq_iter_pairwise, general_ne_iter_pairwise};
@@ -938,7 +1001,13 @@ pub(super) mod tests {
         // The very collation the pairwise loop just used, so that the two
         // paths are compared under the same rule whatever the context says.
         let active = crate::xpath::collation::resolve_default(context);
-        let actual = try_indexed_eq(context, &left_iter, &right_buf, active.as_ref());
+        let actual = try_indexed_eq(
+            context,
+            &left_iter,
+            &right_buf,
+            active.as_ref(),
+            crate::xpath::operators::static_timezone(context),
+        );
 
         match actual {
             Some(got) => {
@@ -964,7 +1033,12 @@ pub(super) mod tests {
         let expected = general_ne_iter_pairwise(context, &left_iter, &right_buf);
 
         let active = crate::xpath::collation::resolve_default(context);
-        let actual = try_indexed_ne(&left_iter, &right_buf, active.as_ref());
+        let actual = try_indexed_ne(
+            &left_iter,
+            &right_buf,
+            active.as_ref(),
+            crate::xpath::operators::static_timezone(context),
+        );
 
         match actual {
             Some(got) => {
@@ -1005,6 +1079,10 @@ pub(super) mod tests {
 
     fn typed(code: XmlTypeCode, atom: XmlAtomicValue) -> XmlValue {
         XmlValue::new(code, XmlValueKind::Atomic(atom))
+    }
+
+    fn nmtoken(token: &str) -> XmlValue {
+        typed(XmlTypeCode::NmToken, XmlAtomicValue::String(token.into()))
     }
 
     fn dec(text: &str) -> Decimal {
@@ -1252,36 +1330,53 @@ pub(super) mod tests {
             ),
             typed(
                 XmlTypeCode::QName,
-                XmlAtomicValue::QName(QualifiedName::new(Some(ns), local_a, Some(prefix))),
+                XmlAtomicValue::QName(QNameValue::new(
+                    QualifiedName::new(Some(ns), local_a, Some(prefix)),
+                    names,
+                )),
             ),
             typed(
                 XmlTypeCode::QName,
-                XmlAtomicValue::QName(QualifiedName::new(Some(ns), local_a, None)),
+                XmlAtomicValue::QName(QNameValue::new(
+                    QualifiedName::new(Some(ns), local_a, None),
+                    names,
+                )),
             ),
             typed(
                 XmlTypeCode::QName,
-                XmlAtomicValue::QName(QualifiedName::new(None, local_b, None)),
+                XmlAtomicValue::QName(QNameValue::new(
+                    QualifiedName::new(None, local_b, None),
+                    names,
+                )),
             ),
             typed(
                 XmlTypeCode::Notation,
-                XmlAtomicValue::Notation(QualifiedName::new(Some(ns), local_a, None)),
+                XmlAtomicValue::Notation(QNameValue::new(
+                    QualifiedName::new(Some(ns), local_a, None),
+                    names,
+                )),
+            ),
+            // The same NOTATION spelled with a prefix: `eq` to the one above.
+            typed(
+                XmlTypeCode::Notation,
+                XmlAtomicValue::Notation(QNameValue::new(
+                    QualifiedName::new(Some(ns), local_a, Some(prefix)),
+                    names,
+                )),
             ),
             // A node whose typed value is a list.
             XmlValue::new(
                 XmlTypeCode::NmTokens,
                 XmlValueKind::List {
                     item_type: XmlTypeCode::NmToken,
-                    items: vec![
-                        XmlAtomicValue::String("a".into()),
-                        XmlAtomicValue::String("b".into()),
-                    ],
+                    items: vec![nmtoken("a"), nmtoken("b")],
                 },
             ),
             XmlValue::new(
                 XmlTypeCode::NmTokens,
                 XmlValueKind::List {
                     item_type: XmlTypeCode::NmToken,
-                    items: vec![XmlAtomicValue::String("a b".into())],
+                    items: vec![nmtoken("a b")],
                 },
             ),
             // A union-typed value, which the index path always declines.
@@ -1434,16 +1529,28 @@ pub(super) mod tests {
         let left_iter = iter_of(left);
         let right_buf = BufferedNodeIterator::preload(iter_of(right)).unwrap();
         let active = crate::xpath::collation::resolve_default(context);
-        try_indexed_eq(context, &left_iter, &right_buf, active.as_ref())
-            .expect("the index path should have decided this comparison")
-            .expect("the comparison should not raise")
+        try_indexed_eq(
+            context,
+            &left_iter,
+            &right_buf,
+            active.as_ref(),
+            crate::xpath::operators::static_timezone(context),
+        )
+        .expect("the index path should have decided this comparison")
+        .expect("the comparison should not raise")
     }
 
     fn indexed_eq_error(context: &XPathContext, left: &[XmlValue], right: &[XmlValue]) -> String {
         let left_iter = iter_of(left);
         let right_buf = BufferedNodeIterator::preload(iter_of(right)).unwrap();
         let active = crate::xpath::collation::resolve_default(context);
-        let result = try_indexed_eq(context, &left_iter, &right_buf, active.as_ref());
+        let result = try_indexed_eq(
+            context,
+            &left_iter,
+            &right_buf,
+            active.as_ref(),
+            crate::xpath::operators::static_timezone(context),
+        );
         format!(
             "{}",
             result
@@ -1666,6 +1773,45 @@ pub(super) mod tests {
         ));
     }
 
+    /// XPath 2.0 §3.5.1: "A eq B xs:NOTATION xs:NOTATION op:NOTATION-equal(A,
+    /// B)", which, like `op:QName-equal`, ignores the prefixes; and a NOTATION
+    /// never meets a QName (no row of the table).
+    #[test]
+    fn notation_equality_ignores_the_prefix() {
+        let names = NameTable::new();
+        let context = XPathContext::new(&names);
+        let ns = names.add("urn:n");
+        let gif = names.add("gif");
+        let png = names.add("png");
+        let jpg = names.add("jpg");
+        let (n, m) = (names.add("n"), names.add("m"));
+        let notation = |local, prefix| {
+            typed(
+                XmlTypeCode::Notation,
+                XmlAtomicValue::Notation(QNameValue::new(
+                    QualifiedName::new(Some(ns), local, Some(prefix)),
+                    &names,
+                )),
+            )
+        };
+        let mut left = vec![notation(png, n); 70];
+        left.push(notation(gif, n));
+        let mut right = vec![notation(jpg, m); 70];
+        right.push(notation(gif, m));
+        assert!(indexed_eq(&context, &left, &right));
+        assert!(!indexed_eq(&context, &left[..70], &right));
+
+        let qname = typed(
+            XmlTypeCode::QName,
+            XmlAtomicValue::QName(QNameValue::new(
+                QualifiedName::new(Some(ns), gif, Some(n)),
+                &names,
+            )),
+        );
+        let message = indexed_eq_error(&context, &[qname], &[notation(gif, n)]);
+        assert!(message.contains("XPTY0004"), "{message}");
+    }
+
     #[test]
     fn qname_equality_ignores_the_prefix() {
         let names = NameTable::new();
@@ -1676,15 +1822,24 @@ pub(super) mod tests {
         let prefix = names.add("p");
         let prefixed = typed(
             XmlTypeCode::QName,
-            XmlAtomicValue::QName(QualifiedName::new(Some(ns), local, Some(prefix))),
+            XmlAtomicValue::QName(QNameValue::new(
+                QualifiedName::new(Some(ns), local, Some(prefix)),
+                &names,
+            )),
         );
         let bare = typed(
             XmlTypeCode::QName,
-            XmlAtomicValue::QName(QualifiedName::new(Some(ns), local, None)),
+            XmlAtomicValue::QName(QNameValue::new(
+                QualifiedName::new(Some(ns), local, None),
+                &names,
+            )),
         );
         let other = typed(
             XmlTypeCode::QName,
-            XmlAtomicValue::QName(QualifiedName::new(Some(ns), other_local, None)),
+            XmlAtomicValue::QName(QNameValue::new(
+                QualifiedName::new(Some(ns), other_local, None),
+                &names,
+            )),
         );
         assert!(indexed_eq(
             &context,
@@ -1776,7 +1931,13 @@ pub(super) mod tests {
         let left_iter = iter_of(&left);
         let right_buf = BufferedNodeIterator::preload(iter_of(&right)).unwrap();
         let active = crate::xpath::collation::resolve_default(&context);
-        let result = try_indexed_eq(&context, &left_iter, &right_buf, active.as_ref());
+        let result = try_indexed_eq(
+            &context,
+            &left_iter,
+            &right_buf,
+            active.as_ref(),
+            crate::xpath::operators::static_timezone(&context),
+        );
         assert!(
             result.is_none(),
             "a failing cast must hand the comparison back to the pairwise loop"

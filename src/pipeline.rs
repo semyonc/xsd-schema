@@ -31,10 +31,10 @@ use crate::error::SchemaResult;
 use crate::ids::DocumentId;
 use crate::parser::parse::{parse_schema_with_config, ParserConfig};
 #[cfg(feature = "async")]
-use crate::parser::resolver::resolve_all_directives_async;
+use crate::parser::resolver::resolve_directive_closure_async;
 use crate::parser::resolver::{
-    fixup_composition_edges, resolve_all_directives, ResolutionResult, ResolverConfig,
-    SchemaResolver,
+    fixup_composition_edges, resolve_directive_closure, DirectiveClosure, ResolutionResult,
+    ResolverConfig, SchemaResolver,
 };
 use crate::schema::{
     allocate_content_particle_elements, allocate_model_group_particle_elements,
@@ -139,6 +139,14 @@ impl From<&ResolutionResult> for DirectiveStats {
 /// 4. **Inline Assembly**: Allocate inline type definitions in arenas
 /// 5. **Reference Resolution**: Resolve QName references to component keys
 ///
+/// With the full configuration (the default) the schema is checked exactly as
+/// [`SchemaSetBuilder::compile`](crate::SchemaSetBuilder::compile) checks it:
+/// the same directive rules (the XML catalog included), the same phases
+/// ([`process_loaded_schemas`]), the same nesting limits
+/// (`config.parser.max_depth`, `config.resolver.max_depth`). A directive
+/// whose document cannot be read is kept on the set
+/// ([`SchemaSet::directive_failures`]).
+///
 /// # Arguments
 ///
 /// * `xml` - Raw XML bytes of the schema document
@@ -184,55 +192,89 @@ pub fn load_and_process_schema(
     let doc_id = parse_schema_with_config(xml, base_uri, schema_set, &config.parser)?;
     stats.doc_id = doc_id;
 
-    // Phase 2: Resolve directives (include/import/redefine)
+    // Phase 2: Resolve directives (include/import/redefine/override), with
+    // the builder's rules
     if config.resolve_directives {
-        let mut resolver = SchemaResolver::with_config(config.resolver.clone());
+        let mut resolver = pipeline_resolver(&config);
+        mark_primary_loaded(&resolver, base_uri, doc_id, schema_set);
+        let closure = resolve_directive_closure(&[doc_id], &mut resolver, schema_set);
+        finish_directives(schema_set, closure, &mut stats)?;
+    }
 
-        // Process directives for the primary document
-        let dir_result = resolve_all_directives(doc_id, &mut resolver, schema_set);
+    run_phases(schema_set, &config, &mut stats)?;
+    Ok(stats)
+}
 
-        // Collect loaded document IDs and errors
-        stats.loaded_docs.extend(dir_result.loaded.iter().copied());
-        stats.directive_result = Some(DirectiveStats::from(&dir_result));
-        let mut directive_errors: Vec<crate::error::SchemaError> = dir_result.errors;
-        let mut import_errors: Vec<crate::error::SchemaError> = dir_result.import_errors;
+/// The resolver of the pipeline: the configured one, with the XML catalog
+/// the builder adds (the `xml` and `xlink` namespaces map to the embedded
+/// schemas).
+fn pipeline_resolver(config: &PipelineConfig) -> SchemaResolver {
+    let mut resolver = SchemaResolver::with_config(config.resolver.clone());
+    resolver.catalog_mut().add_xml_catalog();
+    resolver
+}
 
-        // Recursively process directives in loaded documents
-        let mut pending_docs = dir_result.loaded.clone();
-        while !pending_docs.is_empty() {
-            let current_batch: Vec<_> = std::mem::take(&mut pending_docs);
-            for loaded_doc_id in current_batch {
-                let nested_result =
-                    resolve_all_directives(loaded_doc_id, &mut resolver, schema_set);
-                stats
-                    .loaded_docs
-                    .extend(nested_result.loaded.iter().copied());
-                pending_docs.extend(nested_result.loaded.iter().copied());
+/// Record the primary document under its location — spelled as a directive
+/// of the document resolves it — so that a directive that reads it again (a
+/// cycle of includes) finds it, as in the builder.
+fn mark_primary_loaded(
+    resolver: &SchemaResolver,
+    base_uri: &str,
+    doc_id: DocumentId,
+    schema_set: &mut SchemaSet,
+) {
+    let Ok(location) = resolver.resolve_location(base_uri, "") else {
+        return;
+    };
+    if !schema_set.is_loaded(&location) {
+        schema_set.mark_loaded(location, doc_id);
+    }
+}
 
-                // Accumulate stats
-                if let Some(ref mut dir_stats) = stats.directive_result {
-                    dir_stats.loaded_count += nested_result.loaded.len();
-                    dir_stats.skipped_count += nested_result.skipped.len();
-                    dir_stats.error_count +=
-                        nested_result.errors.len() + nested_result.import_errors.len();
-                }
-                directive_errors.extend(nested_result.errors);
-                import_errors.extend(nested_result.import_errors);
-            }
-        }
+/// After directive resolution: the statistics, the composition graph's
+/// cycle edges, and the first error that makes the schema invalid.
+fn finish_directives(
+    schema_set: &mut SchemaSet,
+    closure: DirectiveClosure,
+    stats: &mut PipelineStats,
+) -> SchemaResult<()> {
+    stats.loaded_docs.extend(closure.loaded.iter().copied());
+    stats.directive_result = Some(DirectiveStats {
+        loaded_count: closure.loaded.len(),
+        skipped_count: closure.skipped_count,
+        error_count: closure.errors.len() + closure.import_errors.len(),
+    });
 
-        // Fixup cycle edges now that all documents have been loaded
-        fixup_composition_edges(schema_set);
+    // Fixup cycle edges now that all documents have been loaded
+    fixup_composition_edges(schema_set);
 
-        // Propagate schema-content errors from directive resolution.
-        // Resolution/IO errors are non-fatal for all directive types.
-        if let Some(err) = directive_errors
-            .into_iter()
-            .chain(import_errors)
-            .find(|e| e.is_schema_content_error())
-        {
-            return Err(err);
-        }
+    // Propagate schema-content errors from directive resolution.
+    // Resolution/IO errors are non-fatal for all directive types; they are
+    // kept on the set (`SchemaSet::directive_failures`).
+    match closure.into_first_schema_error() {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
+}
+
+/// The phases after directive resolution, as the configuration selects
+/// them. The full configuration runs exactly what
+/// [`process_loaded_schemas`] — the builder's path — runs.
+fn run_phases(
+    schema_set: &mut SchemaSet,
+    config: &PipelineConfig,
+    stats: &mut PipelineStats,
+) -> SchemaResult<()> {
+    // The components of the set are processed with this configuration's
+    // limit; a parse-only call leaves the set's own.
+    if config.assemble_inline_types || config.resolve_references {
+        schema_set.set_max_depth(config.parser.max_depth);
+    }
+    if config.assemble_inline_types && config.resolve_references {
+        let (inline_stats, resolution_stats) = process_loaded_schemas(schema_set)?;
+        stats.inline_stats = Some(inline_stats);
+        stats.resolution_stats = Some(resolution_stats);
+        return Ok(());
     }
 
     // Fail early if parsing collected structural errors (error-recovery mode)
@@ -241,83 +283,38 @@ pub fn load_and_process_schema(
         return Err(errors.into_iter().next().unwrap());
     }
 
-    // Phase 2.5: Apply redefine/override directives (operates on already-parsed
-    // data, no I/O). Skipped in parse-only mode because not all schemas may be
-    // loaded yet; callers use process_loaded_schemas() to apply later.
+    // A partial configuration (parse only, or one of assembly and
+    // resolution). Redefine/override application is skipped in parse-only
+    // mode because not all schemas may be loaded yet; callers use
+    // process_loaded_schemas() to apply later.
     if config.assemble_inline_types || config.resolve_references {
         crate::schema::apply_redefine_override(schema_set)?;
     }
-
-    // Phase 3: Assemble inline types (global operation across all documents)
     if config.assemble_inline_types {
         let inline_stats = assemble_inline_types(schema_set)?;
         stats.inline_stats = Some(inline_stats);
     }
-
-    // Phase 4: Resolve all QName references (global operation across all documents)
     if config.resolve_references {
+        crate::schema::nesting::check_nesting_depth(schema_set)?;
         let resolution_stats = resolve_all_references(schema_set)?;
         stats.resolution_stats = Some(resolution_stats);
-    }
-
-    // Phase 4.5: Compile all deferred pattern facets
-    if config.resolve_references {
         compile_all_patterns(schema_set)?;
-    }
-
-    // Phase 4.6 (XSD 1.1): Validate default open content declarations
-    #[cfg(feature = "xsd11")]
-    if config.resolve_references {
+        #[cfg(feature = "xsd11")]
         crate::compiler::validate_all_default_open_content(schema_set)?;
-    }
-
-    // Phase 4.7: Validate type derivation constraints (cos-ct-extends, derivation-ok-restriction, etc.)
-    //
-    // The dependency graph's toposort is also the only place circular type
-    // derivations are detected, and a cycle leaves the type system with no
-    // valid compilation order.
-    if config.resolve_references {
         let (dep_graph, _dep_stats) = build_dependency_graph(schema_set)?;
         validate_all_derivations(schema_set, &dep_graph)?;
-    }
-
-    // Phase 4.75: Validate cos-attribute-decl (XSD 1.0: ID attrs must not have default/fixed)
-    // and e-props-correct.2 / .4 (element default/fixed values).
-    if config.resolve_references {
         validate_attribute_id_constraints(schema_set)?;
         validate_attribute_value_constraints(schema_set)?;
         validate_element_value_constraints(schema_set)?;
         #[cfg(feature = "xsd11")]
         xsd11_pre_resolution_validations(schema_set)?;
-    }
-
-    // Phase 4.76 (XSD 1.0): strict xs:anyURI lexical check on annotation
-    // source attributes. XSD 1.1 explicitly relaxed the rule, so this is
-    // a no-op there.
-    if config.resolve_references {
         crate::schema::validate_xsd10_annotation_source_anyuri(schema_set)?;
-    }
-
-    // Phase 4.77: ct-props-correct.4 / ag-props-correct.2 — every complex
-    // type's effective attribute uses must be unique by (namespace, name).
-    // Applies to BOTH XSD 1.0 and 1.1.
-    if config.resolve_references {
         crate::schema::validate_complex_type_attribute_uniqueness(schema_set)?;
-    }
-
-    // Phase 4.8: Validate substitution group membership constraints (e-props-correct.4)
-    if config.resolve_references {
+        crate::schema::validate_local_decl_target_namespace(schema_set)?;
+        crate::schema::validate_no_xsi_attribute_declarations(schema_set)?;
         crate::compiler::substitution::validate_all_substitution_groups(schema_set)?;
     }
-
-    // Phase 5: Allocate arena element declarations for local elements in content particles
-    if config.assemble_inline_types && config.resolve_references {
-        allocate_content_particle_elements(schema_set)?;
-        allocate_model_group_particle_elements(schema_set)?;
-        finalize_local_element_pass(schema_set)?;
-    }
-
-    Ok(stats)
+    Ok(())
 }
 
 /// Load and process a schema with full processing (convenience function)
@@ -362,10 +359,74 @@ pub fn process_loaded_schemas(
         return Err(errors.into_iter().next().unwrap());
     }
 
+    schema_set.refresh_directive_failures();
+    process_loaded_schemas_inner(schema_set).map_err(|e| note_unread_documents(e, schema_set))
+}
+
+/// A reference that fails to resolve may be due to a schema document that
+/// could not be read: name those documents in the error.
+fn note_unread_documents(
+    error: crate::error::SchemaError,
+    schema_set: &SchemaSet,
+) -> crate::error::SchemaError {
+    match error {
+        crate::error::SchemaError::StructuralError {
+            constraint,
+            message,
+            location,
+        } if constraint.starts_with("src-resolve") => match unread_documents_note(schema_set) {
+            Some(note) => crate::error::SchemaError::StructuralError {
+                constraint,
+                message: format!("{message}{note}"),
+                location,
+            },
+            None => crate::error::SchemaError::StructuralError {
+                constraint,
+                message,
+                location,
+            },
+        },
+        other => other,
+    }
+}
+
+/// `"; schema documents that could not be read: 'a.xsd' (main.xsd:2:3), …"`
+/// for a reference that fails to resolve, when directives failed.
+pub(crate) fn unread_documents_note(schema_set: &SchemaSet) -> Option<String> {
+    let failures = schema_set.directive_failures();
+    if failures.is_empty() {
+        return None;
+    }
+    let mut unread: Vec<String> = failures
+        .iter()
+        .take(3)
+        .map(|f| {
+            let name = f.resolved_location().or(f.schema_location()).unwrap_or("?");
+            match f.location() {
+                Some(at) => format!("'{name}' ({at})"),
+                None => format!("'{name}'"),
+            }
+        })
+        .collect();
+    if failures.len() > 3 {
+        unread.push(format!("and {} more", failures.len() - 3));
+    }
+    Some(format!(
+        "; schema documents that could not be read: {}",
+        unread.join(", ")
+    ))
+}
+
+fn process_loaded_schemas_inner(
+    schema_set: &mut SchemaSet,
+) -> SchemaResult<(InlineAssemblyStats, ResolutionStats)> {
     // Apply redefine/override directives before assembly
     crate::schema::apply_redefine_override(schema_set)?;
 
     let inline_stats = assemble_inline_types(schema_set)?;
+    // Bound the nesting of components before any pass recurses along it
+    // (reference resolution and everything after it).
+    crate::schema::nesting::check_nesting_depth(schema_set)?;
     let resolution_stats = resolve_all_references(schema_set)?;
 
     // Compile all deferred pattern facets
@@ -446,12 +507,18 @@ fn finalize_local_element_pass(schema_set: &mut SchemaSet) -> SchemaResult<()> {
     // element couldn't resolve until now (the local IC was registered by the
     // allocation pass).
     crate::schema::finalize_pending_ic_refs(schema_set)?;
+    // Every identity constraint is in the arena now (top-level and local
+    // elements, every document): a keyref's `refer` may name any of them.
+    crate::schema::inline::validate_all_keyref_refers(schema_set)?;
     // e-props-correct.2 / .4 against local element default/fixed values
     // (saxon `s3_3_4si07/08`).
     validate_element_value_constraints(schema_set)?;
     #[cfg(feature = "xsd11")]
     {
         crate::schema::validate_cta_xpath(schema_set)?;
+        // Every complex and simple type exists now, the inline types of local
+        // elements' alternatives included.
+        crate::schema::validate_assertion_xpath(schema_set)?;
         crate::schema::validate_cta_substitutability(schema_set)?;
     }
     #[cfg(feature = "xsd11")]
@@ -474,8 +541,9 @@ fn finalize_local_element_pass(schema_set: &mut SchemaSet) -> SchemaResult<()> {
 fn xsd11_pre_resolution_validations(schema_set: &SchemaSet) -> SchemaResult<()> {
     // src-type-alternative: only the last <xs:alternative> may omit @test.
     crate::schema::validate_element_type_alternatives(schema_set)?;
-    // §3.12.4: undefined variables, unbound prefixes, user-defined types
-    // in instance-of/cast.
+    // §3.12.6 / §3.13.6.2: XPath Valid with only the built-in components in
+    // the static context (undefined variables, unbound prefixes, user-defined
+    // types and declarations, unknown constructors).
     crate::schema::validate_cta_xpath(schema_set)?;
     // §3.12.6 cos-ct-alternative-substitutable.
     crate::schema::validate_cta_substitutability(schema_set)?;
@@ -664,18 +732,19 @@ fn check_particle_all_group_constraints(
     Ok(())
 }
 
-/// Validate XSD 1.0 cos-all-limited.1.2 placement: an `xs:all` model group
-/// (whether inline or reached through a named-group reference) may only
-/// appear as the top-level particle of a complex type's content. It must
-/// not appear nested inside `xs:sequence` / `xs:choice`, nor reached via a
-/// chain of group references that pass through a non-all compositor.
+/// Validate cos-all-limited placement: an `xs:all` model group (whether
+/// inline or reached through a named-group reference) may only appear as the
+/// top-level particle of a complex type's content. It must not appear nested
+/// inside `xs:sequence` / `xs:choice`, nor reached via a chain of group
+/// references that pass through a non-all compositor.
+///
+/// XSD 1.0 §3.8.6 clauses 1–2; XSD 1.1 §3.8.6.2 All Group Limited clause 1,
+/// which also admits an all group inside another all group (clause 1.3, a
+/// group reference with minOccurs = maxOccurs = 1) — checked when the all
+/// group is compiled, as the top-level particle below is not walked.
 fn validate_all_group_placement(schema_set: &SchemaSet) -> SchemaResult<()> {
     use crate::compiler::{is_top_level_all_group, resolve_top_level_all_group_ref};
     use crate::parser::frames::ComplexContentResult;
-
-    if !schema_set.is_xsd10() {
-        return Ok(());
-    }
 
     for (_, type_def) in schema_set.arenas.complex_types.iter() {
         let ComplexContentResult::Complex(content) = &type_def.content else {
@@ -717,18 +786,54 @@ fn check_no_nested_all_group(
             .or_else(|| schema_set.locate(group.source.as_ref()))
     }
 
+    // A particle with minOccurs = maxOccurs = 0 is no component (1.1 §3.7.2:
+    // "Otherwise, the <group> has minOccurs=maxOccurs=0, in which case it maps
+    // to no component at all"; §3.8.2 likewise for <all>, <choice> and
+    // <sequence>; XSD 1.0 §3.7.2 / §3.8.2 the same): it places no all group.
+    if particle.min_occurs == 0 && particle.max_occurs == Some(0) {
+        return Ok(());
+    }
     let ParticleTerm::Group(group) = &particle.term else {
         return Ok(());
     };
 
-    if group.compositor == Some(Compositor::All) && group.ref_name.is_none() {
-        return Err(crate::error::SchemaError::structural(
+    // XSD 1.1 §3.8.6.2 clause 1: "It appears only as the value of one or more
+    // of the following properties: 1.1 the {model group} property of a model
+    // group definition. 1.2 the {term} property of a Particle with {max
+    // occurs} = 1 which is the {particle} of the {content type} of a complex
+    // type definition. 1.3 the {term} property of a Particle P with {min
+    // occurs} = {max occurs} = 1, where P is among the {particles} of a Model
+    // Group whose {compositor} is all."
+    let misplaced = |reference: bool| {
+        let message = match (schema_set.is_xsd10(), reference) {
+            (true, false) => {
+                "In XSD 1.0, an xs:all model group may only appear as the top-level \
+                 particle of a complex type definition"
+            }
+            (true, true) => {
+                "In XSD 1.0, a reference to a named xs:all group may only \
+                 appear as the top-level particle of a complex type definition"
+            }
+            (false, false) => {
+                "An xs:all model group may only appear as the top-level particle of a \
+                 complex type definition or inside another xs:all group (All Group \
+                 Limited, clause 1)"
+            }
+            (false, true) => {
+                "A reference to a named xs:all group may only appear as the top-level \
+                 particle of a complex type definition or inside another xs:all group \
+                 (All Group Limited, clause 1)"
+            }
+        };
+        crate::error::SchemaError::structural(
             "cos-all-limited",
-            "In XSD 1.0, an xs:all model group may only appear as the top-level \
-             particle of a complex type definition"
-                .to_string(),
+            message.to_string(),
             placement_location(particle, group, schema_set),
-        ));
+        )
+    };
+
+    if group.compositor == Some(Compositor::All) && group.ref_name.is_none() {
+        return Err(misplaced(false));
     }
 
     if let Some(ref_name) = group.ref_name.as_ref() {
@@ -737,13 +842,7 @@ fn check_no_nested_all_group(
         {
             if let Some(group_data) = schema_set.arenas.get_model_group(group_key) {
                 if group_data.compositor == Some(Compositor::All) {
-                    return Err(crate::error::SchemaError::structural(
-                        "cos-all-limited",
-                        "In XSD 1.0, a reference to a named xs:all group may only \
-                         appear as the top-level particle of a complex type definition"
-                            .to_string(),
-                        placement_location(particle, group, schema_set),
-                    ));
+                    return Err(misplaced(true));
                 }
                 if visited.insert(group_key) {
                     for child in &group_data.particles {
@@ -837,6 +936,22 @@ fn validate_all_upa_constraints(schema_set: &SchemaSet) -> SchemaResult<()> {
                 let location = error
                     .location()
                     .and_then(|source| schema_set.source_maps.locate(source));
+                if let crate::compiler::NfaCompileError::RecursionLimitExceeded { .. } = error {
+                    // The compiler's own recursion bound: reached only with
+                    // `SchemaSet::max_depth` = 0 (no nesting limit) or past it.
+                    let bound = schema_set.recursion_bound(100);
+                    return crate::error::SchemaError::limit(
+                        crate::error::SchemaLimit::ComponentDepth,
+                        bound,
+                        bound + 1,
+                        format!(
+                            "the content model nests more than {bound} group references \
+                             (the compiler's own recursion bound; SchemaSet::max_depth is {})",
+                            schema_set.max_depth()
+                        ),
+                        location,
+                    );
+                }
                 crate::error::SchemaError::structural(
                     "cos-nonambig",
                     format!(
@@ -879,9 +994,9 @@ fn validate_all_upa_constraints(schema_set: &SchemaSet) -> SchemaResult<()> {
 
 /// Load and fully process an XSD schema document asynchronously.
 ///
-/// Async variant of [`load_and_process_schema`]. Only the directive resolution
-/// phase (I/O) is async; all computation phases (parse, assembly, resolution)
-/// remain synchronous.
+/// Async variant of [`load_and_process_schema`], with the same rules and
+/// outcome. Only the directive resolution phase (I/O) is async; all
+/// computation phases (parse, assembly, resolution) remain synchronous.
 ///
 /// # Arguments
 ///
@@ -903,131 +1018,16 @@ pub async fn load_and_process_schema_async(
     let doc_id = parse_schema_with_config(xml, base_uri, schema_set, &config.parser)?;
     stats.doc_id = doc_id;
 
-    // Phase 2: Resolve directives asynchronously
+    // Phase 2: Resolve directives asynchronously, with the same rules
     if config.resolve_directives {
-        let mut resolver = SchemaResolver::with_config(config.resolver.clone());
-
-        let dir_result = resolve_all_directives_async(doc_id, &mut resolver, schema_set).await;
-
-        stats.loaded_docs.extend(dir_result.loaded.iter().copied());
-        stats.directive_result = Some(DirectiveStats::from(&dir_result));
-        let mut directive_errors: Vec<crate::error::SchemaError> = dir_result.errors;
-        let mut import_errors: Vec<crate::error::SchemaError> = dir_result.import_errors;
-
-        // Recursively process directives in loaded documents
-        let mut pending_docs = dir_result.loaded.clone();
-        while !pending_docs.is_empty() {
-            let current_batch: Vec<_> = std::mem::take(&mut pending_docs);
-            for loaded_doc_id in current_batch {
-                let nested_result =
-                    resolve_all_directives_async(loaded_doc_id, &mut resolver, schema_set).await;
-                stats
-                    .loaded_docs
-                    .extend(nested_result.loaded.iter().copied());
-                pending_docs.extend(nested_result.loaded.iter().copied());
-
-                if let Some(ref mut dir_stats) = stats.directive_result {
-                    dir_stats.loaded_count += nested_result.loaded.len();
-                    dir_stats.skipped_count += nested_result.skipped.len();
-                    dir_stats.error_count +=
-                        nested_result.errors.len() + nested_result.import_errors.len();
-                }
-                directive_errors.extend(nested_result.errors);
-                import_errors.extend(nested_result.import_errors);
-            }
-        }
-
-        // Fixup cycle edges now that all documents have been loaded
-        fixup_composition_edges(schema_set);
-
-        // Propagate schema-content errors from directive resolution
-        if let Some(err) = directive_errors
-            .into_iter()
-            .chain(import_errors)
-            .find(|e| e.is_schema_content_error())
-        {
-            return Err(err);
-        }
+        let mut resolver = pipeline_resolver(&config);
+        mark_primary_loaded(&resolver, base_uri, doc_id, schema_set);
+        let closure = resolve_directive_closure_async(&[doc_id], &mut resolver, schema_set).await;
+        finish_directives(schema_set, closure, &mut stats)?;
     }
 
-    // Phase 2.5: Apply redefine/override directives (sync)
-    if config.assemble_inline_types || config.resolve_references {
-        crate::schema::apply_redefine_override(schema_set)?;
-    }
-
-    // Phase 3: Assemble inline types (sync)
-    if config.assemble_inline_types {
-        let inline_stats = assemble_inline_types(schema_set)?;
-        stats.inline_stats = Some(inline_stats);
-    }
-
-    // Phase 4: Resolve all QName references (sync)
-    if config.resolve_references {
-        let resolution_stats = resolve_all_references(schema_set)?;
-        stats.resolution_stats = Some(resolution_stats);
-    }
-
-    // Phase 4.5: Compile all deferred pattern facets (sync)
-    if config.resolve_references {
-        compile_all_patterns(schema_set)?;
-    }
-
-    // Phase 4.6 (XSD 1.1): Validate default open content declarations
-    #[cfg(feature = "xsd11")]
-    if config.resolve_references {
-        crate::compiler::validate_all_default_open_content(schema_set)?;
-    }
-
-    // Phase 4.7: Validate type derivation constraints. The dependency graph's
-    // toposort also reports circular derivations.
-    if config.resolve_references {
-        let (dep_graph, _dep_stats) = build_dependency_graph(schema_set)?;
-        validate_all_derivations(schema_set, &dep_graph)?;
-    }
-
-    // Phase 4.75: Validate cos-attribute-decl (XSD 1.0: ID attrs must not have default/fixed)
-    // and e-props-correct.2 / .4 (element default/fixed values).
-    if config.resolve_references {
-        validate_attribute_id_constraints(schema_set)?;
-        validate_attribute_value_constraints(schema_set)?;
-        validate_element_value_constraints(schema_set)?;
-        #[cfg(feature = "xsd11")]
-        xsd11_pre_resolution_validations(schema_set)?;
-    }
-
-    // Phase 4.76 (XSD 1.0): strict xs:anyURI lexical check on annotation
-    // source attributes. XSD 1.1 explicitly relaxed the rule, so this is
-    // a no-op there.
-    if config.resolve_references {
-        crate::schema::validate_xsd10_annotation_source_anyuri(schema_set)?;
-    }
-
-    // Phase 4.77: ct-props-correct.4 / ag-props-correct.2 — every complex
-    // type's effective attribute uses must be unique by (namespace, name).
-    // Applies to BOTH XSD 1.0 and 1.1.
-    if config.resolve_references {
-        crate::schema::validate_complex_type_attribute_uniqueness(schema_set)?;
-    }
-
-    // Phase 5: Allocate arena element declarations (sync)
-    if config.assemble_inline_types && config.resolve_references {
-        allocate_content_particle_elements(schema_set)?;
-        allocate_model_group_particle_elements(schema_set)?;
-        // XSD 1.1: assemble inline alternative types attached to local
-        // elements (which only acquired their ElementKey above).
-        #[cfg(feature = "xsd11")]
-        {
-            let new_alt_types =
-                crate::schema::inline::resolve_local_element_alternatives(schema_set)?;
-            if !new_alt_types.is_empty() {
-                resolve_all_references(schema_set)?;
-                allocate_content_particle_elements(schema_set)?;
-            }
-        }
-        #[cfg(feature = "xsd11")]
-        xsd11_element_consistency_checks(schema_set)?;
-    }
-
+    // The same phases as the synchronous pipeline (sync — CPU-bound)
+    run_phases(schema_set, &config, &mut stats)?;
     Ok(stats)
 }
 

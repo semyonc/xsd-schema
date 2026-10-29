@@ -10,7 +10,9 @@
 
 use std::collections::HashSet;
 
-use crate::types::value::XmlValue;
+use crate::ids::NameId;
+use crate::types::value::{XmlAtomicValue, XmlValue, XmlValueKind};
+use crate::types::XmlTypeCode;
 
 use super::error::XPathError;
 use super::item_set::{ItemSet, XPathComparer, XPathEqualityComparer};
@@ -201,8 +203,50 @@ pub fn except_nodes<N: DomNavigator + Clone>(
 // ============================================================================
 // Atomic value sequence operations (for fn:distinct-values, etc.)
 // ============================================================================
+//
+// These helpers compare two atomic values by their string values, except that
+// an `xs:QName` or `xs:NOTATION` compares by its expanded name (namespace URI
+// and local name, ignoring the prefix) and never equals a value of another
+// type. That is not the XPath `eq` (`1` and `1.0e0` share a string value;
+// `xs:decimal("1.0")` and `"1"` do too): the evaluator's `fn:distinct-values`,
+// `fn:index-of` and `fn:deep-equal` do not use them.
 
-/// Compute the union of two atomic value sequences (deduplicates by value equality).
+/// The key the atomic-value helpers below compare values by.
+///
+/// An `xs:QName` or `xs:NOTATION` is its expanded name — namespace URI and
+/// local name, never the prefix (F&O §11.2.1 `op:QName-equal`: "The prefix
+/// parts of $arg1 and $arg2, if any, are ignored"; `op:NOTATION-equal` is the
+/// same) — kept apart from every other value, so a QName never equals the
+/// string that spells it. Every other value is its string value, as before.
+#[derive(Debug, PartialEq, Eq, Hash)]
+enum AtomKey {
+    Name {
+        notation: bool,
+        namespace_uri: Option<NameId>,
+        local_name: NameId,
+    },
+    Text(String),
+}
+
+fn atom_key(value: &XmlValue) -> AtomKey {
+    let mut inner = value;
+    while let XmlValueKind::Union(member) = &inner.value {
+        inner = member;
+    }
+    match &inner.value {
+        XmlValueKind::Atomic(XmlAtomicValue::QName(name) | XmlAtomicValue::Notation(name)) => {
+            AtomKey::Name {
+                notation: inner.type_code == XmlTypeCode::Notation,
+                namespace_uri: name.name().namespace_uri,
+                local_name: name.name().local_name,
+            }
+        }
+        _ => AtomKey::Text(value.to_string_value()),
+    }
+}
+
+/// Compute the union of two atomic value sequences, without duplicates (by
+/// string value; an `xs:QName` or `xs:NOTATION` by expanded name).
 ///
 /// Note: This is NOT the XPath `|` operator (which is node-only).
 /// This is for internal use with atomic value sequences.
@@ -211,7 +255,7 @@ pub fn union_atomic_values(left: Vec<XmlValue>, right: Vec<XmlValue>) -> Vec<Xml
     let mut result = Vec::with_capacity(left.len() + right.len());
 
     for item in left.into_iter().chain(right) {
-        let key = item.to_string_value();
+        let key = atom_key(&item);
         if !seen.contains(&key) {
             seen.insert(key);
             result.push(item);
@@ -225,13 +269,13 @@ pub fn union_atomic_values(left: Vec<XmlValue>, right: Vec<XmlValue>) -> Vec<Xml
 ///
 /// Note: This is NOT the XPath `intersect` operator (which is node-only).
 pub fn intersect_atomic_values(left: Vec<XmlValue>, right: Vec<XmlValue>) -> Vec<XmlValue> {
-    let right_set: HashSet<String> = right.iter().map(|v| v.to_string_value()).collect();
+    let right_set: HashSet<AtomKey> = right.iter().map(atom_key).collect();
 
     let mut seen = HashSet::new();
     let mut result = Vec::new();
 
     for item in left {
-        let key = item.to_string_value();
+        let key = atom_key(&item);
         if right_set.contains(&key) && !seen.contains(&key) {
             seen.insert(key);
             result.push(item);
@@ -245,13 +289,13 @@ pub fn intersect_atomic_values(left: Vec<XmlValue>, right: Vec<XmlValue>) -> Vec
 ///
 /// Note: This is NOT the XPath `except` operator (which is node-only).
 pub fn except_atomic_values(left: Vec<XmlValue>, right: Vec<XmlValue>) -> Vec<XmlValue> {
-    let right_set: HashSet<String> = right.iter().map(|v| v.to_string_value()).collect();
+    let right_set: HashSet<AtomKey> = right.iter().map(atom_key).collect();
 
     let mut seen = HashSet::new();
     let mut result = Vec::new();
 
     for item in left {
-        let key = item.to_string_value();
+        let key = atom_key(&item);
         if !right_set.contains(&key) && !seen.contains(&key) {
             seen.insert(key);
             result.push(item);
@@ -301,10 +345,11 @@ pub fn count(values: &[XmlValue]) -> usize {
     values.len()
 }
 
-/// Check if a sequence contains a specific value (by value equality).
+/// Check if a sequence contains a specific value (by string value; an
+/// `xs:QName` or `xs:NOTATION` by expanded name).
 pub fn contains_value(values: &[XmlValue], target: &XmlValue) -> bool {
-    let target_str = target.to_string_value();
-    values.iter().any(|v| v.to_string_value() == target_str)
+    let target = atom_key(target);
+    values.iter().any(|v| atom_key(v) == target)
 }
 
 /// Insert an item at a specific position.
@@ -341,15 +386,17 @@ pub fn subsequence(values: &[XmlValue], start: usize, length: Option<usize>) -> 
     values[start_idx..end_idx].to_vec()
 }
 
-/// Get distinct values from a sequence (removes duplicates by value equality).
+/// Get distinct values from a sequence (removes duplicates by string value; an
+/// `xs:QName` or `xs:NOTATION` by expanded name).
 ///
-/// This implements fn:distinct-values which works on atomic values.
+/// A simplified `fn:distinct-values`: the comparison is the string-value rule
+/// above, not `eq`.
 pub fn distinct_values(values: Vec<XmlValue>) -> Vec<XmlValue> {
     let mut seen = HashSet::new();
     let mut result = Vec::with_capacity(values.len());
 
     for item in values {
-        let key = item.to_string_value();
+        let key = atom_key(&item);
         if !seen.contains(&key) {
             seen.insert(key);
             result.push(item);
@@ -359,27 +406,29 @@ pub fn distinct_values(values: Vec<XmlValue>) -> Vec<XmlValue> {
     result
 }
 
-/// Find the index of a value in a sequence (1-based, XPath style).
+/// Find the index of a value in a sequence (1-based, XPath style), by string
+/// value; an `xs:QName` or `xs:NOTATION` by expanded name.
 ///
 /// Returns 0 if not found.
 pub fn index_of(values: &[XmlValue], target: &XmlValue) -> usize {
-    let target_str = target.to_string_value();
+    let target = atom_key(target);
     for (i, v) in values.iter().enumerate() {
-        if v.to_string_value() == target_str {
+        if atom_key(v) == target {
             return i + 1; // 1-based
         }
     }
     0
 }
 
-/// Deep equality check between two atomic value sequences.
+/// Deep equality check between two atomic value sequences (item by item, by
+/// string value; an `xs:QName` or `xs:NOTATION` by expanded name).
 pub fn deep_equal(left: &[XmlValue], right: &[XmlValue]) -> bool {
     if left.len() != right.len() {
         return false;
     }
 
     for (l, r) in left.iter().zip(right.iter()) {
-        if l.to_string_value() != r.to_string_value() {
+        if atom_key(l) != atom_key(r) {
             return false;
         }
     }
@@ -542,4 +591,65 @@ mod tests {
 
     // Tests for node-only operations would require a DomNavigator implementation
     // which is available in integration tests with roxmltree
+
+    /// The atomic-value helpers compare `xs:QName` and `xs:NOTATION` values by
+    /// expanded name (F&O §11.2.1 `op:QName-equal`: "The prefix parts of $arg1
+    /// and $arg2, if any, are ignored"), never by the lexical form — and never
+    /// as equal to a string that spells the same lexical form.
+    #[test]
+    fn qnames_and_notations_compare_by_expanded_name() {
+        use crate::namespace::qname::QualifiedName;
+        use crate::namespace::table::NameTable;
+        use crate::types::value::{QNameValue, XmlAtomicValue, XmlValueKind};
+        use crate::types::XmlTypeCode;
+
+        let names = NameTable::new();
+        let ns = names.add("urn:x");
+        let local = names.add("l");
+        let name = |code: XmlTypeCode, prefix: &str| {
+            let value = QNameValue::new(
+                QualifiedName::new(Some(ns), local, Some(names.add(prefix))),
+                &names,
+            );
+            let atom = if code == XmlTypeCode::Notation {
+                XmlAtomicValue::Notation(value)
+            } else {
+                XmlAtomicValue::QName(value)
+            };
+            XmlValue::new(code, XmlValueKind::Atomic(atom))
+        };
+        let (p, q) = (name(XmlTypeCode::QName, "p"), name(XmlTypeCode::QName, "q"));
+        let (np, nq) = (
+            name(XmlTypeCode::Notation, "p"),
+            name(XmlTypeCode::Notation, "q"),
+        );
+        let text = XmlValue::string("p:l");
+
+        assert_eq!(distinct_values(vec![p.clone(), q.clone()]).len(), 1);
+        assert_eq!(distinct_values(vec![np.clone(), nq.clone()]).len(), 1);
+        assert_eq!(distinct_values(vec![p.clone(), np.clone()]).len(), 2);
+        assert_eq!(distinct_values(vec![p.clone(), text.clone()]).len(), 2);
+        assert_eq!(index_of(&[text.clone(), q.clone()], &p), 2);
+        assert_eq!(index_of(std::slice::from_ref(&np), &p), 0);
+        assert!(contains_value(std::slice::from_ref(&nq), &np));
+        assert!(!contains_value(std::slice::from_ref(&text), &p));
+        assert!(deep_equal(
+            &[p.clone(), np.clone()],
+            &[q.clone(), nq.clone()]
+        ));
+        assert!(!deep_equal(
+            std::slice::from_ref(&p),
+            std::slice::from_ref(&text)
+        ));
+        assert_eq!(
+            union_atomic_values(vec![p.clone()], vec![q.clone()]).len(),
+            1
+        );
+        assert_eq!(
+            intersect_atomic_values(vec![p.clone()], vec![q.clone()]).len(),
+            1
+        );
+        assert!(except_atomic_values(vec![p.clone()], vec![q.clone()]).is_empty());
+        assert_eq!(except_atomic_values(vec![p], vec![text]).len(), 1);
+    }
 }

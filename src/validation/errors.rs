@@ -7,12 +7,469 @@
 //! - `cos-*` - Component constraints (e.g., `cos-valid-default`)
 //! - `src-*` - Schema representation constraints (e.g., `src-element`)
 
+use std::sync::{Arc, OnceLock};
+
 use crate::error::FacetError;
 use crate::parser::location::SourceLocation;
 use crate::types::validators::ValidationError as TypeValidationError;
 
-/// Instance validation error with spec-aligned constraint code
+// ---------------------------------------------------------------------------
+// Subject and path of a diagnostic
+// ---------------------------------------------------------------------------
+
+/// An expanded name: an optional namespace name and a local name.
+///
+/// The parts are shared, reference-counted strings, so a name outlives the
+/// validation run that produced it and cloning it does not copy them. The
+/// representation is private: read the parts with
+/// [`namespace`](Self::namespace) and [`local_name`](Self::local_name).
+/// A name in no namespace has no namespace — an empty namespace given to
+/// [`new`](Self::new) is no namespace, for equality and hashing too.
+///
+/// `Display` writes the XPath 3.0 braced-URI form `Q{uri}local`
+/// (`Q{}local` for a name in no namespace). XPath 3.0's `BracedURILiteral`
+/// cannot contain `{` or `}`: a namespace name that does is written as it is,
+/// and the result is then not a parsable name.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ExpandedName {
+    namespace: Option<Arc<str>>,
+    local_name: Arc<str>,
+}
+
+impl ExpandedName {
+    /// An expanded name. An empty `namespace` counts as no namespace.
+    pub fn new(namespace: Option<&str>, local_name: &str) -> Self {
+        ExpandedName {
+            namespace: namespace.filter(|ns| !ns.is_empty()).map(Arc::from),
+            local_name: Arc::from(local_name),
+        }
+    }
+
+    /// An expanded name over already shared parts (no copy).
+    pub(crate) fn from_shared(namespace: Option<Arc<str>>, local_name: Arc<str>) -> Self {
+        ExpandedName {
+            namespace: namespace.filter(|ns| !ns.is_empty()),
+            local_name,
+        }
+    }
+
+    /// The namespace name; `None` for a name in no namespace.
+    pub fn namespace(&self) -> Option<&str> {
+        self.namespace.as_deref()
+    }
+
+    /// The namespace name, `""` for a name in no namespace.
+    pub fn namespace_uri(&self) -> &str {
+        self.namespace.as_deref().unwrap_or("")
+    }
+
+    /// The local name.
+    pub fn local_name(&self) -> &str {
+        &self.local_name
+    }
+}
+
+impl std::fmt::Display for ExpandedName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Q{{{}}}{}", self.namespace_uri(), self.local_name)
+    }
+}
+
+/// The information item a validation error or warning is about.
+///
+/// For a diagnostic the runtime reports, this is the item it was processing
+/// when it found the problem: the attribute while an attribute is being
+/// validated (also when the attributes of an element with type alternatives
+/// are validated after the selection), otherwise the element being validated
+/// — the element just opened, or the element being closed during its
+/// end-of-element checks; the same element
+/// [`element_path`](ValidationError::element_path) names. So an unexpected
+/// child (`cvc-complex-type.2.4`, found while advancing the parent's content
+/// model) is reported about the parent, and the message names the child; a
+/// duplicate key value is reported about the element the selector selected.
+/// A diagnostic made later is about the item recorded when it was deferred:
+/// an unresolved IDREF (`cvc-id.1`, reported by `end_validation`) is about
+/// the attribute or element that carried it, a failed keyref retried at an
+/// ancestor about the keyref's element, a nested element's assertion
+/// (evaluated when the outermost asserted element closes) about that nested
+/// element.
+///
+/// `Display` writes the name, preceded by `@` for an attribute.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ValidationSubject {
+    /// An element information item.
+    Element(ExpandedName),
+    /// An attribute information item.
+    Attribute(ExpandedName),
+}
+
+impl ValidationSubject {
+    /// The subject's expanded name.
+    pub fn name(&self) -> &ExpandedName {
+        match self {
+            ValidationSubject::Element(name) | ValidationSubject::Attribute(name) => name,
+        }
+    }
+}
+
+impl std::fmt::Display for ValidationSubject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ValidationSubject::Element(name) => write!(f, "{name}"),
+            ValidationSubject::Attribute(name) => write!(f, "@{name}"),
+        }
+    }
+}
+
+/// One step of an [`InstancePath`]. Build one with [`element`](Self::element)
+/// or [`attribute`](Self::attribute).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum PathStep {
+    /// A child element, `Q{uri}local[position]`: `position` is 1-based among
+    /// the preceding siblings with the same expanded name, plus one — the
+    /// position the XPath step `Q{uri}local[position]` selects.
+    #[non_exhaustive]
+    Element {
+        /// The element's expanded name.
+        name: ExpandedName,
+        /// The 1-based position among same-named siblings.
+        position: usize,
+    },
+    /// An attribute, `@Q{uri}local` (always the last step).
+    #[non_exhaustive]
+    Attribute {
+        /// The attribute's expanded name.
+        name: ExpandedName,
+    },
+}
+
+impl PathStep {
+    /// An element step: the `position`-th child element named `name`.
+    pub fn element(name: ExpandedName, position: usize) -> Self {
+        PathStep::Element { name, position }
+    }
+
+    /// An attribute step.
+    pub fn attribute(name: ExpandedName) -> Self {
+        PathStep::Attribute { name }
+    }
+
+    /// The step's expanded name.
+    pub fn name(&self) -> &ExpandedName {
+        match self {
+            PathStep::Element { name, .. } | PathStep::Attribute { name } => name,
+        }
+    }
+
+    /// The position of an element step; `None` for an attribute step.
+    pub fn position(&self) -> Option<usize> {
+        match self {
+            PathStep::Element { position, .. } => Some(*position),
+            PathStep::Attribute { .. } => None,
+        }
+    }
+}
+
+impl std::fmt::Display for PathStep {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PathStep::Element { name, position } => write!(f, "{name}[{position}]"),
+            PathStep::Attribute { name } => write!(f, "@{name}"),
+        }
+    }
+}
+
+/// A node of an [`InstancePath`]: a step and the path to its parent.
+struct PathNode {
+    step: PathStep,
+    parent: Option<Arc<PathNode>>,
+    /// Number of steps from the top down to this one.
+    len: usize,
+}
+
+impl Drop for PathNode {
+    /// Unlink the parents iteratively: a path can be as deep as the document,
+    /// and the default recursive drop of a long chain would exhaust the stack.
+    fn drop(&mut self) {
+        let mut parent = self.parent.take();
+        while let Some(node) = parent {
+            match Arc::try_unwrap(node) {
+                Ok(mut node) => parent = node.parent.take(),
+                Err(_) => break,
+            }
+        }
+    }
+}
+
+/// A namespace-aware, positional path from the document to an element or
+/// attribute of the instance, as XPath 3.0 steps.
+///
+/// `Display` writes the path as an absolute XPath 3.0 path expression that
+/// selects the item, every name in the braced-URI form, e.g.
+/// `/Q{urn:po}order[1]/Q{}item[3]/@Q{}qty`. The first step is the
+/// validation root: for a run over a fragment pushed through the API, the
+/// path starts at that fragment's outermost element.
+///
+/// Paths share their ancestor steps: the diagnostics of one run hold one copy
+/// of each ancestor, so reporting an error costs the same at any depth. The
+/// representation is private.
+#[derive(Clone, Default)]
+pub struct InstancePath {
+    last: Option<Arc<PathNode>>,
+}
+
+impl InstancePath {
+    /// A path of `steps`, outermost first.
+    pub fn new(steps: Vec<PathStep>) -> Self {
+        steps
+            .into_iter()
+            .fold(InstancePath::default(), |path, step| path.child(step))
+    }
+
+    /// This path extended by `step` (sharing this path).
+    pub(crate) fn child(&self, step: PathStep) -> Self {
+        InstancePath {
+            last: Some(Arc::new(PathNode {
+                step,
+                parent: self.last.clone(),
+                len: self.len() + 1,
+            })),
+        }
+    }
+
+    /// The number of steps.
+    pub fn len(&self) -> usize {
+        self.last.as_ref().map_or(0, |node| node.len)
+    }
+
+    /// Whether the path has no step (the document).
+    pub fn is_empty(&self) -> bool {
+        self.last.is_none()
+    }
+
+    /// The last step: the item the path designates.
+    pub fn last(&self) -> Option<&PathStep> {
+        self.last.as_deref().map(|node| &node.step)
+    }
+
+    /// The steps, outermost first: a double-ended iterator that knows its
+    /// length (`.rev()` gives them innermost first).
+    ///
+    /// The path is stored innermost first (each step links to its parent), so
+    /// the iterator gathers the step references on creation: in a buffer on
+    /// the stack for a path of up to 32 steps — no allocation — and in one
+    /// `Vec` for a deeper path.
+    pub fn steps(&self) -> impl DoubleEndedIterator<Item = &PathStep> + ExactSizeIterator + '_ {
+        PathSteps::new(self)
+    }
+
+    /// The nodes, innermost first.
+    fn nodes(&self) -> impl Iterator<Item = &PathNode> {
+        std::iter::successors(self.last.as_deref(), |node| node.parent.as_deref())
+    }
+
+    /// The local names of the element steps, `/root/child` — the form of
+    /// [`ValidationError::element_path`].
+    pub(crate) fn local_name_path(&self) -> String {
+        let mut names: Vec<&str> = self
+            .nodes()
+            .filter(|node| matches!(node.step, PathStep::Element { .. }))
+            .map(|node| node.step.name().local_name())
+            .collect();
+        names.reverse();
+        let mut path = String::with_capacity(names.iter().map(|n| n.len() + 1).sum());
+        for name in names {
+            path.push('/');
+            path.push_str(name);
+        }
+        path
+    }
+}
+
+/// Steps a [`PathSteps`] holds on the stack before it allocates.
+const INLINE_STEPS: usize = 32;
+
+/// The iterator of [`InstancePath::steps`]: the step references, outermost
+/// first, at `front..back` of `inline` (a path of up to [`INLINE_STEPS`]
+/// steps) or of `heap` (a deeper one; empty, so unallocated, otherwise).
+struct PathSteps<'a> {
+    inline: [Option<&'a PathStep>; INLINE_STEPS],
+    heap: Vec<&'a PathStep>,
+    front: usize,
+    back: usize,
+}
+
+impl<'a> PathSteps<'a> {
+    fn new(path: &'a InstancePath) -> Self {
+        let len = path.len();
+        let mut inline = [None; INLINE_STEPS];
+        let mut heap = Vec::new();
+        if len <= INLINE_STEPS {
+            for (slot, node) in inline[..len].iter_mut().rev().zip(path.nodes()) {
+                *slot = Some(&node.step);
+            }
+        } else {
+            heap = path.nodes().map(|node| &node.step).collect();
+            heap.reverse();
+        }
+        PathSteps {
+            inline,
+            heap,
+            front: 0,
+            back: len,
+        }
+    }
+
+    fn get(&self, i: usize) -> &'a PathStep {
+        if self.heap.is_empty() {
+            self.inline[i].expect("a filled step")
+        } else {
+            self.heap[i]
+        }
+    }
+}
+
+impl<'a> Iterator for PathSteps<'a> {
+    type Item = &'a PathStep;
+
+    fn next(&mut self) -> Option<&'a PathStep> {
+        if self.front == self.back {
+            return None;
+        }
+        self.front += 1;
+        Some(self.get(self.front - 1))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let n = self.back - self.front;
+        (n, Some(n))
+    }
+}
+
+impl DoubleEndedIterator for PathSteps<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.front == self.back {
+            return None;
+        }
+        self.back -= 1;
+        Some(self.get(self.back))
+    }
+}
+
+impl ExactSizeIterator for PathSteps<'_> {}
+
+impl std::iter::FusedIterator for PathSteps<'_> {}
+
+impl PartialEq for InstancePath {
+    fn eq(&self, other: &Self) -> bool {
+        if self.len() != other.len() {
+            return false;
+        }
+        let mut a = self.last.as_ref();
+        let mut b = other.last.as_ref();
+        while let (Some(x), Some(y)) = (a, b) {
+            if Arc::ptr_eq(x, y) {
+                return true; // the rest is shared
+            }
+            if x.step != y.step {
+                return false;
+            }
+            a = x.parent.as_ref();
+            b = y.parent.as_ref();
+        }
+        true
+    }
+}
+
+impl Eq for InstancePath {}
+
+impl std::hash::Hash for InstancePath {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write_usize(self.len());
+        for node in self.nodes() {
+            node.step.hash(state);
+        }
+    }
+}
+
+impl std::fmt::Debug for InstancePath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("InstancePath")
+            .field(&format_args!("{self}"))
+            .finish()
+    }
+}
+
+impl From<Vec<PathStep>> for InstancePath {
+    fn from(steps: Vec<PathStep>) -> Self {
+        InstancePath::new(steps)
+    }
+}
+
+impl std::fmt::Display for InstancePath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.is_empty() {
+            return f.write_str("/");
+        }
+        for step in self.steps() {
+            write!(f, "/{step}")?;
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ValidationError
+// ---------------------------------------------------------------------------
+
+/// The subject and the path of a diagnostic, held behind one `Box` so that
+/// carrying them costs a [`ValidationError`] one pointer: the error travels
+/// in `Result`s on the hot path of simple-type validation, where it is built
+/// without either.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DiagnosticItem {
+    subject: Option<ValidationSubject>,
+    instance_path: Option<InstancePath>,
+    /// Set when the local-name element path is the element part of
+    /// `instance_path`: it is then written only when first asked for.
+    derived_element_path: Option<OnceLock<String>>,
+}
+
+impl DiagnosticItem {
+    pub(crate) fn subject(item: &Option<Box<Self>>) -> Option<&ValidationSubject> {
+        item.as_ref().and_then(|i| i.subject.as_ref())
+    }
+
+    pub(crate) fn instance_path(item: &Option<Box<Self>>) -> Option<&InstancePath> {
+        item.as_ref().and_then(|i| i.instance_path.as_ref())
+    }
+
+    pub(crate) fn set_subject(item: &mut Option<Box<Self>>, subject: ValidationSubject) {
+        item.get_or_insert_with(Default::default).subject = Some(subject);
+    }
+
+    pub(crate) fn set_instance_path(item: &mut Option<Box<Self>>, path: InstancePath) {
+        item.get_or_insert_with(Default::default).instance_path = Some(path);
+    }
+}
+
+/// Instance validation error with spec-aligned constraint code.
+///
+/// Besides the code and the message, an error reported by the validation
+/// runtime names its [`subject`](Self::subject) — the element or attribute
+/// it is about — and the [`instance_path`](Self::instance_path) to it, so a
+/// host can filter errors or build a fault report without parsing the
+/// message. Both are `None` when the diagnostic is not about an instance
+/// item (a schema-level problem, or a run-level error such as an unclosed
+/// element at the end).
+///
+/// The struct is `#[non_exhaustive]`: build one with [`error`],
+/// [`error_with_path`], [`from_value_error`] or [`from_facet_error`], then
+/// set the public fields or use the `with_*` builders.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ValidationError {
     /// Spec constraint code (cvc-*, cos-*, src-*)
     pub constraint: &'static str,
@@ -20,17 +477,24 @@ pub struct ValidationError {
     pub message: String,
     /// Source location in the instance document
     pub location: Option<SourceLocation>,
-    /// XPath-like path to the element (e.g., "/root/child\[1\]")
-    pub element_path: Option<String>,
+    /// The local-name path set by [`with_path`](Self::with_path); see
+    /// [`element_path`](Self::element_path).
+    element_path: Option<String>,
+    /// Subject and positional path; see [`subject`](Self::subject).
+    item: Option<Box<DiagnosticItem>>,
 }
 
 impl std::fmt::Display for ValidationError {
+    /// `[constraint] message`, then ` at location` and ` (element path)` when
+    /// they are known. The element path is the local-name form of
+    /// [`element_path`](Self::element_path); the structured
+    /// [`instance_path`](Self::instance_path) is not written.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "[{}] {}", self.constraint, self.message)?;
         if let Some(loc) = &self.location {
             write!(f, " at {}", loc)?;
         }
-        if let Some(path) = &self.element_path {
+        if let Some(path) = self.element_path() {
             write!(f, " ({})", path)?;
         }
         Ok(())
@@ -40,14 +504,66 @@ impl std::fmt::Display for ValidationError {
 impl std::error::Error for ValidationError {}
 
 impl ValidationError {
+    /// Set the source location.
     pub fn with_location(mut self, location: SourceLocation) -> Self {
         self.location = Some(location);
         self
     }
 
+    /// Set the local-name [`element_path`](Self::element_path).
     pub fn with_path(mut self, path: impl Into<String>) -> Self {
         self.element_path = Some(path.into());
         self
+    }
+
+    /// Set the [`subject`](Self::subject).
+    pub fn with_subject(mut self, subject: ValidationSubject) -> Self {
+        DiagnosticItem::set_subject(&mut self.item, subject);
+        self
+    }
+
+    /// Set the [`instance_path`](Self::instance_path).
+    pub fn with_instance_path(mut self, path: InstancePath) -> Self {
+        DiagnosticItem::set_instance_path(&mut self.item, path);
+        self
+    }
+
+    /// The element or attribute the error is about, when there is one.
+    pub fn subject(&self) -> Option<&ValidationSubject> {
+        DiagnosticItem::subject(&self.item)
+    }
+
+    /// The namespace-aware positional path to the [`subject`](Self::subject)
+    /// — `/Q{uri}local[n]/…`, ending in `@Q{uri}local` for an attribute.
+    pub fn instance_path(&self) -> Option<&InstancePath> {
+        DiagnosticItem::instance_path(&self.item)
+    }
+
+    /// The path to the element as local names, `/root/child` — no
+    /// namespaces, no positions; for an attribute error, the path of its
+    /// element. Kept as a readable convenience (it is what `Display` writes);
+    /// [`instance_path`](Self::instance_path) identifies the item exactly.
+    pub fn element_path(&self) -> Option<&str> {
+        if let Some(path) = &self.element_path {
+            return Some(path);
+        }
+        let item = self.item.as_deref()?;
+        let cell = item.derived_element_path.as_ref()?;
+        let path = item.instance_path.as_ref()?;
+        Some(cell.get_or_init(|| path.local_name_path()))
+    }
+
+    /// Make the local-name element path the element part of the
+    /// [`instance_path`](Self::instance_path), written only when first asked
+    /// for (replacing a path set by [`with_path`](Self::with_path)). No
+    /// effect without an instance path.
+    pub(crate) fn derive_element_path(&mut self) {
+        if let Some(item) = self.item.as_deref_mut() {
+            if item.instance_path.is_some() {
+                item.derived_element_path = Some(OnceLock::new());
+                self.element_path = None;
+            }
+        }
     }
 }
 
@@ -65,6 +581,7 @@ pub fn error(
         message: message.into(),
         location,
         element_path: None,
+        item: None,
     }
 }
 
@@ -80,6 +597,7 @@ pub fn error_with_path(
         message: message.into(),
         location,
         element_path: Some(element_path.into()),
+        item: None,
     }
 }
 
@@ -97,6 +615,7 @@ pub fn from_value_error(
         message: err.to_string(),
         location,
         element_path: None,
+        item: None,
     }
 }
 
@@ -127,6 +646,7 @@ pub fn from_facet_error(
         message: err.to_string(),
         location,
         element_path: None,
+        item: None,
     }
 }
 
@@ -212,7 +732,9 @@ mod tests {
         assert_eq!(err.constraint, "cvc-elt");
         assert_eq!(err.message, "Element is invalid");
         assert!(err.location.is_none());
-        assert!(err.element_path.is_none());
+        assert!(err.element_path().is_none());
+        assert!(err.subject().is_none());
+        assert!(err.instance_path().is_none());
     }
 
     #[test]
@@ -224,7 +746,7 @@ mod tests {
             "/root/child",
         );
         assert_eq!(err.constraint, "cvc-complex-type");
-        assert_eq!(err.element_path.as_deref(), Some("/root/child"));
+        assert_eq!(err.element_path(), Some("/root/child"));
     }
 
     #[test]
@@ -408,7 +930,7 @@ mod tests {
     #[test]
     fn test_with_path() {
         let err = error("cvc-elt", "test", None).with_path("/root/child");
-        assert_eq!(err.element_path.as_deref(), Some("/root/child"));
+        assert_eq!(err.element_path(), Some("/root/child"));
     }
 
     #[test]
@@ -423,7 +945,7 @@ mod tests {
             .with_path("/root/elem[2]");
         assert_eq!(err.constraint, "cvc-type");
         assert_eq!(err.location.as_ref().unwrap().line, 3);
-        assert_eq!(err.element_path.as_deref(), Some("/root/elem[2]"));
+        assert_eq!(err.element_path(), Some("/root/elem[2]"));
         let display = format!("{}", err);
         assert!(display.contains("[cvc-type]"));
         assert!(display.contains("Type mismatch"));

@@ -17,8 +17,9 @@ use crate::ids::{NameId, SimpleTypeKey, TypeKey};
 use crate::navigator::{
     DomNavigator, DomNodeType, NamespaceAxisScope, NavigatorError, TypedValue, XmlNodeOrder,
 };
+use crate::schema::SchemaSet;
 use crate::validation::info::ContentType;
-use crate::validation::simple::validate_simple_type;
+use crate::validation::simple::validate_simple_type_in;
 
 use super::buffer::BufferDocument;
 use super::node::{Node, NodeType};
@@ -152,6 +153,23 @@ impl<'a> BufferDocNavigator<'a> {
             assertion_fragment_root: node,
             orphan_root: node,
             ..Self::new(doc, node)
+        }
+    }
+
+    /// A navigator on the attribute node `attr_ref` (the attribute's index
+    /// among its element's attributes set, for document order).
+    fn at_attribute(doc: &'a BufferDocument<'a>, attr_ref: u32) -> Self {
+        let owner = doc.nodes.get(attr_ref).parent;
+        let mut index: u16 = 0;
+        let mut cursor = owner + 1;
+        while cursor != attr_ref && cursor != NULL {
+            cursor = doc.nodes.get(cursor).next_sibling;
+            index += 1;
+        }
+        Self {
+            virtual_parent: owner,
+            attr_index: index,
+            ..Self::new(doc, attr_ref)
         }
     }
 
@@ -374,23 +392,15 @@ impl<'a> BufferDocNavigator<'a> {
         self.doc.fragment_base_uri.unwrap_or("")
     }
 
-    /// Finds the NsRef boundary for Local namespace scope on `elem`.
-    ///
-    /// Walks ancestors to find the nearest element with `HAS_NMSP_DECLS`
-    /// and returns its namespace chain head.  Returns `NsRef::NULL` if no
-    /// ancestor has namespace declarations.
+    /// Finds the NsRef boundary for Local namespace scope on `elem`: the
+    /// chain in scope at its parent (the chain head of the nearest ancestor
+    /// with `HAS_NMSP_DECLS`), where `elem`'s own declarations end.  Returns
+    /// `NsRef::NULL` if no ancestor has namespace declarations.
     fn find_local_ns_boundary(&self, elem: u32) -> NsRef {
-        let mut cursor = self.doc.nodes.get(elem).parent;
-        while cursor != NULL {
-            let node = self.doc.nodes.get(cursor);
-            if node.node_type() == NodeType::Element && node.has_flag(Node::HAS_NMSP_DECLS) {
-                if let Some(&head) = self.doc.element_namespaces.get(&cursor) {
-                    return head;
-                }
-            }
-            cursor = node.parent;
+        match self.doc.nodes.get(elem).parent {
+            NULL => NsRef::NULL,
+            parent => self.doc.namespace_scope(parent),
         }
-        NsRef::NULL
     }
 
     /// Collects namespace NsRefs for the given scope.
@@ -400,6 +410,12 @@ impl<'a> BufferDocNavigator<'a> {
     /// - **All**: All in-scope namespaces including inherited, plus the
     ///   implicit `xml:` binding.
     /// - **ExcludeXml**: Like All but without the `xml:` namespace.
+    ///
+    /// `All` and `ExcludeXml` read one chain, the one in scope at `elem`
+    /// (`BufferDocument::namespace_scope`): it holds the declarations of
+    /// `elem` and of every ancestor, innermost first, so the first node of
+    /// each prefix is the binding in force. Finding the chain and walking it
+    /// take the same time at any depth (see `NamespaceScopes`).
     fn collect_namespaces(&self, elem: u32, scope: NamespaceAxisScope) -> Vec<NsRef> {
         match scope {
             NamespaceAxisScope::Local => {
@@ -433,59 +449,32 @@ impl<'a> BufferDocNavigator<'a> {
                 let mut result: Vec<NsRef> = Vec::new();
                 let mut seen_prefixes: Option<HashSet<NameId>> = None;
 
-                let mut cursor = elem;
-                loop {
-                    let node = self.doc.nodes.get(cursor);
-                    if node.node_type() == NodeType::Element && node.has_flag(Node::HAS_NMSP_DECLS)
+                for (ns_ref, ns_node) in self.doc.scope_walk(self.doc.namespace_scope(elem)) {
+                    let seen = seen_prefixes.get_or_insert_with(HashSet::new);
+                    if !seen.insert(ns_node.prefix) {
+                        continue;
+                    }
+                    if scope == NamespaceAxisScope::ExcludeXml
+                        && self.doc.names.resolve_ref(ns_node.prefix) == "xml"
                     {
-                        if let Some(&ns_head) = self.doc.element_namespaces.get(&cursor) {
-                            let mut ns_ref = ns_head;
-                            while !ns_ref.is_null() {
-                                let ns_node = self.doc.namespace_pages.get(ns_ref);
-                                let seen = seen_prefixes.get_or_insert_with(HashSet::new);
-                                if seen.insert(ns_node.prefix) {
-                                    if scope == NamespaceAxisScope::ExcludeXml {
-                                        let prefix_str = self.doc.names.resolve_ref(ns_node.prefix);
-                                        if prefix_str == "xml" {
-                                            ns_ref = ns_node.next;
-                                            continue;
-                                        }
-                                    }
-                                    // A zero-length URI is a namespace
-                                    // *undeclaration* (`xmlns=""`). It cancels
-                                    // an outer binding — it must stay in
-                                    // `seen` so the outer one is shadowed —
-                                    // but it is the absence of a binding, so
-                                    // under `All` (the XDM
-                                    // `dm:namespace-nodes` accessor behind the
-                                    // `namespace::` axis and
-                                    // `fn:in-scope-prefixes`) no namespace
-                                    // node exists for it. `Local` and
-                                    // `ExcludeXml` are views of the
-                                    // *declarations* — serialization, shallow
-                                    // copy and the namespace context that
-                                    // resolves QNames during validation — and
-                                    // must keep it.
-                                    if scope == NamespaceAxisScope::All
-                                        && self
-                                            .doc
-                                            .names
-                                            .resolve_ref(ns_node.namespace_uri)
-                                            .is_empty()
-                                    {
-                                        ns_ref = ns_node.next;
-                                        continue;
-                                    }
-                                    result.push(ns_ref);
-                                }
-                                ns_ref = ns_node.next;
-                            }
-                        }
+                        continue;
                     }
-                    if node.parent == NULL {
-                        break;
+                    // A zero-length URI is a namespace *undeclaration*
+                    // (`xmlns=""`). It cancels an outer binding — it must
+                    // stay in `seen` so the outer one is shadowed — but it
+                    // is the absence of a binding, so under `All` (the XDM
+                    // `dm:namespace-nodes` accessor behind the `namespace::`
+                    // axis and `fn:in-scope-prefixes`) no namespace node
+                    // exists for it. `Local` and `ExcludeXml` are views of
+                    // the *declarations* — serialization, shallow copy and
+                    // the namespace context that resolves QNames during
+                    // validation — and must keep it.
+                    if scope == NamespaceAxisScope::All
+                        && self.doc.names.resolve_ref(ns_node.namespace_uri).is_empty()
+                    {
+                        continue;
                     }
-                    cursor = node.parent;
+                    result.push(ns_ref);
                 }
 
                 // XDM contract: `All` always exposes the implicit `xml:` binding,
@@ -534,55 +523,99 @@ impl<'a> BufferDocNavigator<'a> {
     /// Post-process a typed value for QName/Notation: resolve the lexical
     /// form against the navigator's in-scope namespaces if the inner atomic
     /// is still stored as a `String` (the simple-type validator has no
-    /// namespace context, so QName/Notation values come back lexically).
+    /// namespace context, so QName/Notation values come back lexically) —
+    /// the value itself, a union's member value, and every member of a list
+    /// (of `xs:QName`, or of a union with a QName or NOTATION member type).
     ///
-    /// Returns the value unchanged for any other type or shape.
+    /// Returns the value unchanged for any other type or shape, and a lexical
+    /// form that does not resolve unchanged.
     fn resolve_qname_typed_value(
         &self,
         value: crate::types::value::XmlValue,
     ) -> crate::types::value::XmlValue {
-        use crate::namespace::qname::QualifiedName;
-        use crate::types::value::{XmlAtomicValue, XmlValue, XmlValueKind};
-        use crate::types::XmlTypeCode;
-        use crate::xpath::functions::qname::parse_lexical_qname;
+        use crate::types::value::{XmlValue, XmlValueKind};
 
-        if !matches!(value.type_code, XmlTypeCode::QName | XmlTypeCode::Notation) {
+        if !crate::validation::simple::holds_lexical_qname(&value) {
             return value;
         }
-        let lexical: &str = match &value.value {
-            XmlValueKind::Atomic(XmlAtomicValue::String(s)) => s.as_str(),
-            _ => return value,
-        };
-        let (prefix, local_name) = match parse_lexical_qname(lexical) {
-            Ok(parts) => parts,
-            Err(_) => return value,
-        };
-
-        let ns_id = match prefix.as_deref() {
-            Some(p) => match self.resolve_prefix_in_scope(Some(p)) {
-                Some(uri_id) => Some(uri_id),
-                None => return value,
+        let XmlValue {
+            type_code,
+            schema_type,
+            value: kind,
+        } = value;
+        let kind = match kind {
+            XmlValueKind::Union(inner) => {
+                XmlValueKind::Union(Box::new(self.resolve_qname_typed_value(*inner)))
+            }
+            XmlValueKind::List { item_type, items } => XmlValueKind::List {
+                item_type,
+                items: items
+                    .into_iter()
+                    .map(|member| self.resolve_qname_typed_value(member))
+                    .collect(),
             },
+            XmlValueKind::Atomic(crate::types::value::XmlAtomicValue::String(lexical)) => {
+                match self.resolve_lexical_qname(&lexical, type_code) {
+                    Some(atom) => XmlValueKind::Atomic(atom),
+                    None => {
+                        XmlValueKind::Atomic(crate::types::value::XmlAtomicValue::String(lexical))
+                    }
+                }
+            }
+            other => other,
+        };
+        XmlValue {
+            type_code,
+            schema_type,
+            value: kind,
+        }
+    }
+
+    /// The `xs:QName` (or, for `type_code` `xs:NOTATION`, `xs:NOTATION`)
+    /// value `lexical` denotes in the navigator's in-scope namespaces; `None`
+    /// when it is not a QName or its prefix is not in scope.
+    fn resolve_lexical_qname(
+        &self,
+        lexical: &str,
+        type_code: crate::types::XmlTypeCode,
+    ) -> Option<crate::types::value::XmlAtomicValue> {
+        use crate::namespace::qname::QualifiedName;
+        use crate::types::value::{QNameValue, XmlAtomicValue};
+        use crate::xpath::functions::qname::parse_lexical_qname;
+
+        let (prefix, local_name) = parse_lexical_qname(lexical).ok()?;
+        let ns_id = match prefix.as_deref() {
+            Some(p) => Some(self.resolve_prefix_in_scope(Some(p))?),
             None => self.resolve_prefix_in_scope(None),
         };
-
         let names = self.doc.names;
         let local_id = names.add(&local_name);
         let prefix_id = prefix.as_deref().map(|p| names.add(p));
-        let qn = QualifiedName::new(ns_id, local_id, prefix_id);
+        let qn = QNameValue::new(QualifiedName::new(ns_id, local_id, prefix_id), names);
+        Some(if type_code == crate::types::XmlTypeCode::Notation {
+            XmlAtomicValue::Notation(qn)
+        } else {
+            XmlAtomicValue::QName(qn)
+        })
+    }
 
-        let mut new_value = XmlValue::new(
-            value.type_code,
-            XmlValueKind::Atomic(XmlAtomicValue::QName(qn)),
-        );
-        new_value.schema_type = value.schema_type;
-        new_value
+    /// The namespace an `xs:QName` / `xs:NOTATION` lexical form's prefix is
+    /// bound to at this node, as simple-type validation asks it
+    /// (`validation::simple::PrefixResolver`): for a prefix, `Some` of its
+    /// namespace or `None` when it is bound nowhere; for no prefix, `Some` of
+    /// the default namespace (`Some(None)` without one).
+    pub(crate) fn prefix_binding(&self, prefix: Option<&str>) -> Option<Option<NameId>> {
+        match prefix {
+            Some(p) if !p.is_empty() => self.resolve_prefix_in_scope(Some(p)).map(Some),
+            _ => Some(self.resolve_prefix_in_scope(None)),
+        }
     }
 
     /// Resolve a prefix to its in-scope namespace URI's `NameId`.
     ///
-    /// Walks from the owning element (or current element if not on a virtual
-    /// node) up the ancestor chain. Returns `None` if the prefix is
+    /// Reads the chain in scope at the owning element (or the current node if
+    /// not on a virtual node): its first node of the prefix is the binding in
+    /// force. Returns `None` if the prefix is
     /// undeclared or bound to an empty URI (XML 1.1 namespace undeclaration).
     /// `prefix.is_none()` requests the default namespace; `Some("")` is
     /// equivalent. The implicit `xml` prefix always resolves.
@@ -600,31 +633,49 @@ impl<'a> BufferDocNavigator<'a> {
             self.current
         };
 
-        let mut cursor = start;
-        loop {
-            let node = self.doc.nodes.get(cursor);
-            if node.node_type() == NodeType::Element && node.has_flag(Node::HAS_NMSP_DECLS) {
-                if let Some(&head) = self.doc.element_namespaces.get(&cursor) {
-                    let mut ns_ref = head;
-                    while !ns_ref.is_null() {
-                        let ns_node = self.doc.namespace_pages.get(ns_ref);
-                        if names.resolve_ref(ns_node.prefix) == target_prefix {
-                            if names.resolve_ref(ns_node.namespace_uri).is_empty() {
-                                return None;
-                            }
-                            return Some(ns_node.namespace_uri);
-                        }
-                        ns_ref = ns_node.next;
-                    }
+        for (_, ns_node) in self.doc.scope_walk(self.doc.namespace_scope(start)) {
+            if names.resolve_ref(ns_node.prefix) == target_prefix {
+                if names.resolve_ref(ns_node.namespace_uri).is_empty() {
+                    return None;
                 }
+                return Some(ns_node.namespace_uri);
             }
-            if node.parent == NULL {
-                break;
-            }
-            cursor = node.parent;
         }
 
         None
+    }
+}
+
+/// The lexical value an element bound with `binding` has its typed value
+/// computed from: its string value `value`, or — when that is empty and the
+/// element has no element children — its declaration's `default` / `fixed`
+/// value (clause 5.1 of Element Locally Valid (Element), Structures §3.3.4.3;
+/// the default first, as validation takes it). A typed build that makes
+/// defaults nodes has given such an element its default as text already; a
+/// tree built as read has not, and gets the same typed value. The builder's id
+/// and idrefs indexes compute an element's typed value from the same value.
+pub(crate) fn element_value_or_default<'v>(
+    value: Cow<'v, str>,
+    has_element_children: bool,
+    binding: &NodeSchemaBinding,
+    schema_set: &'v SchemaSet,
+) -> Cow<'v, str> {
+    if !value.is_empty() || has_element_children {
+        return value;
+    }
+    let Some(element) = binding
+        .element_decl
+        .and_then(|key| schema_set.arenas.elements.get(key))
+    else {
+        return value;
+    };
+    match element
+        .default_value
+        .as_deref()
+        .or(element.fixed_value.as_deref())
+    {
+        Some(default) => Cow::Borrowed(default),
+        None => value,
     }
 }
 
@@ -1157,35 +1208,73 @@ impl<'a> DomNavigator for BufferDocNavigator<'a> {
         // Borrow the lexical value (single-text leaves borrow; only true mixed
         // content allocates) so simple-content elements cost no per-element copy.
         let value_str = self.value_ref();
+        let has_element_children = value_str.is_empty() && self.has_element_children();
+        let effective_value =
+            element_value_or_default(value_str, has_element_children, binding, schema_set);
 
-        // Default/fixed-aware value resolution (cvc-elt.5.2):
-        // Substitute element default or fixed only when there is no text
-        // content AND no child elements (matching runtime.rs semantics).
-        // XSD spec forbids both default and fixed on the same element,
-        // so at most one will be Some.  Priority matches runtime.rs.
-        let effective_value: Cow<'_, str> = if value_str.is_empty() && !self.has_element_children()
-        {
-            if let Some(elem_key) = binding.element_decl {
-                let elem_data = &schema_set.arenas.elements[elem_key];
-                if let Some(default_val) = &elem_data.default_value {
-                    Cow::Owned(default_val.clone())
-                } else if let Some(fixed_val) = &elem_data.fixed_value {
-                    // §3.3.4.3: fixed behaves as default when element is empty
-                    Cow::Owned(fixed_val.clone())
-                } else {
-                    value_str
-                }
-            } else {
-                value_str
-            }
-        } else {
-            value_str
-        };
-
-        match validate_simple_type(&effective_value, binding.type_key, schema_set) {
+        // QName / NOTATION values resolve their prefixes with the node's
+        // in-scope namespaces (Datatypes §3.3.18), as the validation runtime
+        // does with the element's, so that the typed value and the verdict
+        // agree (enumeration by expanded name, `$value` of an assertion).
+        let resolver = |prefix: Option<&str>| self.prefix_binding(prefix);
+        match validate_simple_type_in(
+            &effective_value,
+            binding.type_key,
+            schema_set,
+            Some(&resolver),
+        ) {
             Ok(r) => TypedValue::Value(self.resolve_qname_typed_value(r.typed_value)),
             Err(_) => TypedValue::Untyped,
         }
+    }
+
+    /// The is-idrefs property (XDM 1.0 §5.6): set on an element or attribute
+    /// whose typed value holds an `xs:IDREF` (or derived) atomic value, or that
+    /// a host marked (`BufferDocumentBuilder::register_idrefs`); `false` for
+    /// every other node, and for every node of a tree without annotations.
+    fn is_idrefs(&self) -> bool {
+        if self.is_on_namespace() {
+            return false;
+        }
+        matches!(
+            self.node().node_type(),
+            NodeType::Element | NodeType::Attribute
+        ) && self.node().has_flag(Node::IS_IDREFS)
+    }
+
+    /// The nodes with the is-idrefs property whose string value has `id` as a
+    /// token, in document order — scoped as
+    /// [`find_element_by_id`](DomNavigator::find_element_by_id) is: this
+    /// cursor's tree, or the subtree a parentless or asserted node roots.
+    fn find_nodes_by_idref(&self, id: &str) -> Result<Vec<Self>, NavigatorError> {
+        let scope_root = if self.orphan_root != NULL {
+            self.orphan_root
+        } else {
+            self.assertion_fragment_root
+        };
+        let range = if scope_root != NULL {
+            Some((scope_root, self.doc.subtree_end(scope_root)))
+        } else {
+            let tree = self.doc.tree_root_of(self.current);
+            (tree != super::buffer::DOCUMENT_NODE).then(|| (tree, self.doc.subtree_end(tree)))
+        };
+        Ok(self
+            .doc
+            .nodes_by_idref(id, range)
+            .into_iter()
+            .map(|r| {
+                let node = self.doc.nodes.get(r);
+                let mut nav = if node.node_type() == NodeType::Attribute {
+                    BufferDocNavigator::at_attribute(self.doc, r)
+                } else {
+                    BufferDocNavigator::new(self.doc, r)
+                };
+                nav.assertion_absolute_root = self.assertion_absolute_root;
+                nav.assertion_fragment_root = self.assertion_fragment_root;
+                nav.orphan_root = self.orphan_root;
+                nav
+            })
+            .collect())
     }
 
     /// The scope of an id is one tree: the search is anchored on this cursor's
@@ -1986,7 +2075,7 @@ mod tests {
         );
         let result =
             eval(&names, doc.create_navigator(), "string(id(' id3')/title)").expect("evaluates");
-        assert_eq!(result.as_str().as_deref(), Some("Expressions"));
+        assert_eq!(result.to_owned_string().as_deref(), Some("Expressions"));
     }
 
     /// F&O §15.5.2: an is-id node whose value is not a lexical `xs:ID` "will
@@ -2090,7 +2179,7 @@ mod tests {
             "string-join(id('dup'), '|')",
         )
         .expect("evaluates");
-        assert_eq!(result.as_str().as_deref(), Some("first"));
+        assert_eq!(result.to_owned_string().as_deref(), Some("first"));
     }
 
     // ── 13. Virtual parent ───────────────────────────────────────────
@@ -2632,7 +2721,7 @@ mod tests {
             "string(name(id('k')))",
         )
         .expect("evaluates");
-        assert_eq!(result.as_str().as_deref(), Some("leaf"));
+        assert_eq!(result.to_owned_string().as_deref(), Some("leaf"));
     }
 
     /// The same for a parentless node: the orphan's own tree holds `inside`,

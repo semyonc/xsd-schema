@@ -17,7 +17,7 @@ use crate::parser::frames::{AssertResult, ComplexContentResult};
 use crate::parser::location::SourceLocation;
 use crate::schema::SchemaSet;
 use crate::validation::errors::{self, ValidationError};
-use crate::validation::simple::validate_simple_type;
+use crate::validation::simple::validate_simple_type_in;
 use crate::xpath::api::XPathExpr;
 use crate::xpath::functions::{effective_boolean_value, XPathValue};
 use crate::xpath::XPathContext;
@@ -38,9 +38,9 @@ pub(crate) struct AssertionBufferFrame {
     pub element_ref: u32,
     /// ComplexType key whose assertions triggered this frame.
     pub complex_type_key: ComplexTypeKey,
-    /// Element path at the time this frame's element closed (for error reporting).
+    /// This frame's element as a diagnostic subject (error reporting).
     /// Populated when the frame is popped at its own end-element (before deferral).
-    pub element_path: String,
+    pub context: crate::validation::runtime::ErrorContext,
     /// Source location at the time this frame's element closed.
     pub location: Option<SourceLocation>,
     /// Whether a failure of this (deferred, nested) frame makes the outermost
@@ -115,7 +115,7 @@ pub(crate) fn collect_inherited_assertions(
 ///
 /// Takes the **owner** `ComplexTypeKey` (from `collect_inherited_assertions`),
 /// not the derived type, so inherited assertions get the correct type-level default.
-fn resolve_ct_assertion_default_ns(
+pub(crate) fn resolve_ct_assertion_default_ns(
     assertion: &AssertResult,
     owner_ct_key: ComplexTypeKey,
     schema_set: &SchemaSet,
@@ -168,10 +168,6 @@ fn compute_dollar_value<'doc>(
     governing_ct_key: ComplexTypeKey,
     schema_set: &SchemaSet,
 ) -> XPathValue<BufferDocNavigator<'doc>> {
-    use crate::types::value::{XmlAtomicValue, XmlValue, XmlValueKind};
-    use crate::types::XmlTypeCode;
-    use crate::xpath::iterator::XmlItem;
-
     let ct = &schema_set.arenas.complex_types[governing_ct_key];
     if !matches!(ct.content, ComplexContentResult::Simple(_)) {
         return XPathValue::empty();
@@ -182,62 +178,40 @@ fn compute_dollar_value<'doc>(
         return XPathValue::empty();
     }
 
-    match validate_simple_type(&nav.value(), TypeKey::Complex(governing_ct_key), schema_set) {
-        Ok(result) => {
-            // §3.13.4.1 clause 2.3.1.4: when the governing simple-content type's
-            // {variety} = list, `$value` is a sequence of atomic values, one per
-            // list item. The simple-type validator stores list items in
-            // `XmlValueKind::List`; unwrap to a sequence so XPath sees a
-            // multi-item input.
-            //
-            // Each member is typed with the list's item type, as in 0.2.2 —
-            // with one exception. A list of a union stores every member as a
-            // string, whichever member type validated it, and its item type is
-            // that of its last member; a string spelling a decimal beyond
-            // `rust_decimal`'s capacity there may be one the union's
-            // `xs:string` member validated, so it is not handed out as an
-            // `xs:decimal` (arithmetic on it would pass for a capacity error
-            // and skip the assertion, with no capacity warning). Such a member
-            // is an `xs:string`, as `data()` gives it. In a list whose item type
-            // is in the decimal family, a string member is exactly such a
-            // decimal and stays one.
-            if let XmlValueKind::List { item_type, items } = &result.typed_value.value {
-                let item_type_code = *item_type;
-                let item_type_is_union = crate::validation::simple::list_item_type_if_union(
-                    &result.typed_value,
-                    schema_set,
-                )
-                .is_some();
-                let capacity_strings =
-                    crate::types::exact_decimal::list_strings_are_capacity_decimals(
-                        item_type_code,
-                        items,
-                        Some(item_type_is_union),
-                    );
-                let xpath_items: Vec<XmlItem<BufferDocNavigator<'doc>>> = items
-                    .iter()
-                    .cloned()
-                    .map(|atom| {
-                        let type_code = match &atom {
-                            XmlAtomicValue::String(s)
-                                if item_type_code == XmlTypeCode::Decimal
-                                    && !capacity_strings
-                                    && crate::types::exact_decimal::is_capacity_decimal_member(
-                                        s,
-                                    ) =>
-                            {
-                                XmlTypeCode::String
-                            }
-                            _ => item_type_code,
-                        };
-                        XmlItem::Atomic(XmlValue::new(type_code, XmlValueKind::Atomic(atom)))
-                    })
-                    .collect();
-                return XPathValue::from_sequence(xpath_items);
-            }
-            XPathValue::from_atomic(result.typed_value)
-        }
+    // An `xs:QName` / `xs:NOTATION` value is resolved with the element's
+    // in-scope namespaces, as the validation runtime resolves it.
+    let resolver = |prefix: Option<&str>| nav.prefix_binding(prefix);
+    match validate_simple_type_in(
+        &nav.value(),
+        TypeKey::Complex(governing_ct_key),
+        schema_set,
+        Some(&resolver),
+    ) {
+        // §3.13.4.1 clause 2.3.1: "the XDM representation of
+        // E.[schema actual value]". When the governing simple-content type's
+        // {variety} = list (also as the member a union chose), `$value` is a
+        // sequence of atomic values, one per list item, each of the type that
+        // validated it — for a list of a union, the member type that accepted
+        // that item.
+        Ok(result) => result.typed_value.to_xpath_value(),
         Err(_) => XPathValue::empty(),
+    }
+}
+
+/// Hand the warnings an assertion's or a type alternative's expression `test`
+/// raised to the validation run (`expression_warnings`), naming the
+/// expression.
+pub(crate) fn note_expression_warnings(
+    what: &str,
+    test: &str,
+    warnings: Vec<crate::xpath::XPathWarning>,
+) {
+    for warning in warnings {
+        super::expression_warnings::note(
+            warning.code(),
+            || format!("{what} '{test}'"),
+            warning.message().to_string(),
+        );
     }
 }
 
@@ -268,10 +242,19 @@ pub(crate) fn evaluate_complex_type_assertions(
             continue;
         }
 
-        // Build XPath static context with schema-time namespace snapshot
+        // The schema-time check (`schema::validate_assertion_xpath`) compiled
+        // this test with only the built-in components in scope (Structures
+        // §3.13.6.2 clause 2.2.5) and refused the schema for any user-defined
+        // type or declaration it named. Evaluation needs the schema set to
+        // answer questions about the instance's type annotations (a node of
+        // a user type derived from `xs:integer` is an
+        // `element(*, xs:integer)`); `without_schema_casts` is kept as a
+        // second guard. A test that still fails to compile here calls a
+        // function this engine lacks: `cvc-assertion` below.
         let ctx = XPathContext::new(&schema_set.name_table)
             .with_namespaces(assertion.ns_snapshot.clone())
-            .with_schema_set(schema_set);
+            .with_schema_set(schema_set)
+            .without_schema_casts();
 
         // Apply xpathDefaultNamespace cascade
         let ctx = if let Some(default_ns) =
@@ -302,13 +285,17 @@ pub(crate) fn evaluate_complex_type_assertions(
         let nav = BufferDocNavigator::new_assertion(doc, element_ref);
         let value_for_eval = dollar_value.clone();
 
-        let result = match crate::xpath::operators::with_decimal_capacity_marks(|| {
+        let warnings = std::cell::RefCell::new(Vec::new());
+        let outcome = crate::xpath::operators::with_decimal_capacity_marks(|| {
             expr.evaluator(&ctx)
+                .with_warnings(&warnings)
                 .run_with_node_and_setup(Some(nav), |eval| {
                     eval.set_variable_by_name("value", value_for_eval)
                         .expect("$value declared via compile_with_vars");
                 })
-        }) {
+        });
+        note_expression_warnings("assertion", &assertion.test, warnings.into_inner());
+        let result = match outcome {
             Ok(r) => r,
             // Datatypes 1.1 §5.4: an `xs:decimal` beyond this implementation's
             // capacity "must not be treated as invalid". An assertion whose

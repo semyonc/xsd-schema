@@ -54,8 +54,12 @@ use super::context::DynamicContext;
 ///
 /// Each variant corresponds to a built-in XPath 2.0 function.
 /// This enum allows bind-time function resolution without generic type parameters.
+///
+/// The enum is `#[non_exhaustive]`: a later release may add built-in functions,
+/// so a `match` outside this crate needs a wildcard arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u16)]
+#[non_exhaustive]
 pub enum FunctionId {
     // ========== String Functions ==========
     /// fn:concat($arg1, $arg2, ...)
@@ -176,6 +180,8 @@ pub enum FunctionId {
     Id,
     /// fn:collection($arg as xs:string?) as node()*
     Collection,
+    /// fn:idref($arg as xs:string*, $node as node()) as node()*
+    Idref,
 
     // ========== DateTime Functions ==========
     /// fn:dateTime($arg1, $arg2)
@@ -278,6 +284,15 @@ pub enum FunctionId {
     Data,
     /// fn:default-collation()
     DefaultCollation,
+    /// fn:error(), fn:error($error), fn:error($error, $description),
+    /// fn:error($error, $description, $error-object)
+    ///
+    /// One registry entry serves the four arities, so signature introspection
+    /// ([`BuiltinCatalog::get_signature`]) reports the parameters
+    /// `xs:QName?, xs:string, item()*` for each — for arity 1 that is
+    /// `xs:QName?` where F&O declares `xs:QName`. The function itself enforces
+    /// each arity's own types (see [`special::error`]).
+    Error,
 
     // ========== Boolean Functions ==========
     /// fn:true()
@@ -418,18 +433,44 @@ impl<N: DomNavigator> XPathValue<N> {
     // Atomic Value Extraction Methods
     // ========================================================================
 
-    /// Try to extract a string from a single atomic item.
+    /// The string of a single atomic item that holds one — `xs:string`, a
+    /// type derived from it, or `xs:untypedAtomic` — copied into a new
+    /// `String`.
     ///
     /// Returns `None` if:
     /// - The value is empty
     /// - The value is a sequence
     /// - The item is a node (not atomic)
     /// - The atomic value is not a string type
-    pub fn as_str(&self) -> Option<String> {
+    ///
+    /// Nothing is converted: an `xs:integer` gives `None`, not its lexical
+    /// form, and a node is not atomized. For the string value of any atomic
+    /// item use [`XmlValue::to_string_value`] on it (or `fn:string` in the
+    /// expression).
+    ///
+    /// ```
+    /// use xsd_schema::xpath::functions::XPathValue;
+    /// use xsd_schema::xpath::RoXmlNavigator;
+    ///
+    /// type Value = XPathValue<RoXmlNavigator<'static>>;
+    /// assert_eq!(Value::string("hello").to_owned_string().as_deref(), Some("hello"));
+    /// assert_eq!(Value::integer(42).to_owned_string(), None);
+    /// ```
+    pub fn to_owned_string(&self) -> Option<String> {
         match self {
-            Self::Item(XmlItem::Atomic(v)) => v.as_string().map(|s| s.to_string()),
+            Self::Item(XmlItem::Atomic(v)) => v.as_string().map(str::to_owned),
             _ => None,
         }
+    }
+
+    /// The same as [`to_owned_string`](Self::to_owned_string), under a name
+    /// that suggests a borrow: the string is copied.
+    #[deprecated(
+        since = "0.3.0",
+        note = "returns an owned `String`, not a borrow; use `to_owned_string`"
+    )]
+    pub fn as_str(&self) -> Option<String> {
+        self.to_owned_string()
     }
 
     /// Try to extract a boolean from a single atomic item.
@@ -741,6 +782,7 @@ pub fn eval_function<N: DomNavigator>(
         FunctionId::Trace => special::trace(context, args),
         FunctionId::Data => special::data(context, args),
         FunctionId::DefaultCollation => special::default_collation(context, args),
+        FunctionId::Error => special::error(context, args),
 
         // ====================================================================
         // Sequence functions (basic)
@@ -819,6 +861,7 @@ pub fn eval_function<N: DomNavigator>(
         FunctionId::Lang => node::lang(context, args),
         FunctionId::Root => node::root(context, args),
         FunctionId::Id => node::id(context, args),
+        FunctionId::Idref => node::idref(context, args),
         FunctionId::Collection => {
             // fn:collection($arg?) — without a registered default collection
             // or URI handler, both forms return the empty sequence per
@@ -1213,6 +1256,49 @@ mod tests {
         assert!(!value.is_single());
     }
 
+    /// `to_owned_string` copies the string of a single string-typed or
+    /// untyped atomic item, and is `None` for every other value: it does not
+    /// convert an atomic value of another type, nor atomize a node.
+    #[test]
+    fn to_owned_string_copies_the_string_of_a_single_string_item() {
+        type V = XPathValue<RoXmlNavigator<'static>>;
+        assert_eq!(
+            V::string("hello").to_owned_string(),
+            Some("hello".to_string())
+        );
+        assert_eq!(
+            V::from_atomic(XmlValue::untyped("raw")).to_owned_string(),
+            Some("raw".to_string())
+        );
+        assert_eq!(V::integer(42).to_owned_string(), None);
+        assert_eq!(V::boolean(true).to_owned_string(), None);
+        assert_eq!(V::empty().to_owned_string(), None);
+        let two = V::from_sequence(vec![
+            XmlItem::Atomic(XmlValue::string("a")),
+            XmlItem::Atomic(XmlValue::string("b")),
+        ]);
+        assert_eq!(two.to_owned_string(), None);
+
+        let doc = roxmltree::Document::parse("<a>text</a>").unwrap();
+        let node = XPathValue::from_node(RoXmlNavigator::new(&doc));
+        assert_eq!(node.to_owned_string(), None);
+    }
+
+    /// The deprecated `as_str` answers exactly what `to_owned_string` does.
+    #[test]
+    #[allow(deprecated)]
+    fn as_str_is_a_deprecated_alias_of_to_owned_string() {
+        type V = XPathValue<RoXmlNavigator<'static>>;
+        for value in [
+            V::string("hello"),
+            V::from_atomic(XmlValue::untyped("raw")),
+            V::integer(42),
+            V::empty(),
+        ] {
+            assert_eq!(value.as_str(), value.to_owned_string());
+        }
+    }
+
     /// `as_slice` agrees with `len` and `first` for all three shapes; the
     /// single-item shape used to answer with an empty slice.
     #[test]
@@ -1292,7 +1378,7 @@ mod tests {
             DynamicContext::new(&static_ctx, 0);
         let args = vec![XPathValue::integer(42i64)];
         let result = eval_fn_string(&mut ctx, args).unwrap();
-        assert_eq!(result.as_str(), Some("42".to_string()));
+        assert_eq!(result.to_owned_string(), Some("42".to_string()));
     }
 
     #[test]
@@ -1303,7 +1389,7 @@ mod tests {
             DynamicContext::new(&static_ctx, 0);
         let args = vec![XPathValue::string("hello")];
         let result = eval_fn_string(&mut ctx, args).unwrap();
-        assert_eq!(result.as_str(), Some("hello".to_string()));
+        assert_eq!(result.to_owned_string(), Some("hello".to_string()));
     }
 
     #[test]

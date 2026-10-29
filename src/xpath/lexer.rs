@@ -315,6 +315,10 @@ pub struct Lexer<'input> {
     state: LexerState,
     state_stack: Vec<LexerState>,
     token_queue: VecDeque<Spanned>,
+    /// Where an unclosed comment began, once one has been found: XPath 2.0
+    /// §A.2.4 `Comment ::= "(:" (CommentContents | Comment)* ":)"` has no
+    /// other end, so the expression is not well formed (XPST0003).
+    unclosed_comment: Option<usize>,
     finished: bool,
     mode: XPathMode,
 }
@@ -329,6 +333,7 @@ impl<'input> Lexer<'input> {
             state: LexerState::Default,
             state_stack: Vec::new(),
             token_queue: VecDeque::new(),
+            unclosed_comment: None,
             finished: false,
             mode: XPathMode::XPath20,
         }
@@ -343,6 +348,7 @@ impl<'input> Lexer<'input> {
             state: LexerState::Default,
             state_stack: Vec::new(),
             token_queue: VecDeque::new(),
+            unclosed_comment: None,
             finished: false,
             mode,
         }
@@ -509,6 +515,7 @@ impl<'input> Lexer<'input> {
 
             // Check for comment (: ... :)
             if self.peek(0) == Some('(') && self.peek(1) == Some(':') {
+                let start = self.pos;
                 self.advance(2);
                 let mut depth = 1;
                 while depth > 0 {
@@ -524,7 +531,11 @@ impl<'input> Lexer<'input> {
                         (Some(_), _) => {
                             self.advance(1);
                         }
-                        (None, _) => break, // Unclosed comment, let parser handle error
+                        (None, _) => {
+                            // Unclosed: reported by `next` as a lexer error.
+                            self.unclosed_comment.get_or_insert(start);
+                            break;
+                        }
                     }
                 }
                 continue;
@@ -1188,19 +1199,14 @@ impl<'input> Lexer<'input> {
 
         if self.current().map(Self::is_ncname_start).unwrap_or(false) {
             let first = self.consume_ncname();
-            let prefix;
-            let local;
-
-            if self.current() == Some(':')
+            let (prefix, local) = if self.current() == Some(':')
                 && self.peek(1).map(Self::is_ncname_start).unwrap_or(false)
             {
                 self.advance(1);
-                prefix = first;
-                local = self.consume_ncname();
+                (first, self.consume_ncname())
             } else {
-                prefix = String::new();
-                local = first;
-            }
+                (String::new(), first)
+            };
 
             self.enqueue(Token::VarName { prefix, local }, start, self.pos);
             self.state = LexerState::Operator;
@@ -1784,6 +1790,13 @@ impl<'input> Iterator for Lexer<'input> {
         if let Err(e) = self.enter_state() {
             self.finished = true;
             return Some(Err(e));
+        }
+        if let Some(position) = self.unclosed_comment {
+            self.finished = true;
+            return Some(Err(LexerError {
+                message: "Unterminated comment: '(:' without its ':)'".to_string(),
+                position,
+            }));
         }
 
         // Return newly queued token

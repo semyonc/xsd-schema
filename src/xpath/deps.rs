@@ -450,15 +450,14 @@ impl Analyzer<'_, '_> {
 /// | `fn:base-uri()` | context node | `functions/node.rs:229-241` → `get_node_arg` |
 /// | `fn:root()` | context node | `functions/node.rs:362-370` → `get_node_arg` |
 /// | `fn:lang($testlang)` | context node | `functions/node.rs:301-325` (1-arity form falls back to `context.context_item`) |
-/// | `fn:id($arg)` | context node | `functions/node.rs:397-440` (1-arity form takes the reference node from `context.context_item`) |
+/// | `fn:id($arg)` | context node | `functions/node.rs` `id` → `target_document` (1-arity form takes the reference node from `context.context_item`) |
+/// | `fn:idref($arg)` | context node | `functions/node.rs` `idref` → `target_document` (likewise) |
 ///
 /// Functions whose *only* registered form takes the node explicitly are
 /// deliberately absent even though their implementations route through
 /// `get_node_arg`: `fn:node-name`, `fn:nilled` and `fn:document-uri` are
 /// registered with `FunctionSignature::new` (exact arity 1) in
 /// `functions/registry.rs:617,623,645`, so a 0-arity call does not bind.
-/// `fn:idref` is not registered at all, so `idref('x')` fails to compile with
-/// XPST0017 rather than reading the focus.
 ///
 /// A call this function cannot classify — an unbound node, or a custom
 /// function registered through a [`FunctionCatalog`](crate::xpath::functions::FunctionCatalog)
@@ -496,7 +495,7 @@ fn call_focus_use(call: &FunctionCallNode) -> FocusUse {
             | FunctionId::Root,
             0,
         ) => FocusUse::ITEM,
-        (FunctionId::Lang | FunctionId::Id, 1) => FocusUse::ITEM,
+        (FunctionId::Lang | FunctionId::Id | FunctionId::Idref, 1) => FocusUse::ITEM,
         _ => FocusUse::NONE,
     }
 }

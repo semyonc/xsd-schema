@@ -16,9 +16,10 @@ use super::atomize::{self, Atoms};
 use super::collation::CollationRef;
 use super::error::XPathError;
 use super::iterator::{XmlItemRef, XmlNodeIterator};
-use super::operators::eval_binary_collated;
+use super::operators::{eval_binary_collated, is_gregorian_code, is_temporal_type};
 use super::string_ops::is_xml_whitespace;
 use super::{DomNavigator, DomNodeType};
+use crate::types::value::TimezoneOffset;
 
 /// Compares XPath nodes and sequences for deep equality.
 #[derive(Debug, Clone, Default)]
@@ -53,6 +54,9 @@ impl TreeComparer {
     /// To compare items the way `fn:deep-equal` does, including the node kind
     /// and name, use [`deep_equal_iter`](Self::deep_equal_iter) over the two
     /// sequences.
+    ///
+    /// The comparison walks the two trees iteratively, so they may be of any
+    /// depth whatever the thread's stack; it stops at the first difference.
     pub fn deep_equal<N: DomNavigator>(&self, left: &N, right: &N) -> bool {
         NodeComparer::legacy(self.ignore_whitespace).deep_equal(left, right)
     }
@@ -98,7 +102,7 @@ enum ElementContent {
     /// schema set to read the type's content kind from. Its typed value is the
     /// empty sequence whatever that kind is, so the typed value does not tell
     /// simple content from complex content either. It is not a case of the
-    /// rule; [`NodeComparer::element_content_equal`] resolves it against the
+    /// rule; [`NodeComparer::element_content_step`] resolves it against the
     /// other element.
     Unknown,
 }
@@ -132,6 +136,9 @@ pub(crate) struct NodeComparer<'s> {
     /// codepoint collation, which is what a round-trip check wants and what it
     /// has always done.
     collation: CollationRef<'s>,
+    /// The implicit timezone of the dynamic context, for date/time values
+    /// without one (F&O §10.4); the host's offset for [`TreeComparer`].
+    implicit_timezone: TimezoneOffset,
 }
 
 impl NodeComparer<'static> {
@@ -142,6 +149,7 @@ impl NodeComparer<'static> {
             function_rules: false,
             schema_set: None,
             collation: CollationRef::Codepoint,
+            implicit_timezone: super::operators::host_implicit_timezone(),
         }
     }
 }
@@ -163,12 +171,14 @@ impl<'s> NodeComparer<'s> {
     pub(crate) fn deep_equal_function(
         schema_set: Option<&'s SchemaSet>,
         collation: CollationRef<'s>,
+        implicit_timezone: TimezoneOffset,
     ) -> Self {
         Self {
             ignore_whitespace: false,
             function_rules: true,
             schema_set,
             collation,
+            implicit_timezone,
         }
     }
 
@@ -217,6 +227,13 @@ impl<'s> NodeComparer<'s> {
         if self.is_nan_value(left) && self.is_nan_value(right) {
             return true;
         }
+        // Date/time, duration and gregorian values are equal as `eq` says
+        // (F&O §15.3.1), with the implicit timezone — not as the order of the
+        // schema facets, which their own `PartialEq` is (`P400Y` equals
+        // `P146097D` there, a value without a timezone equals none with one).
+        if is_temporal_type(left.type_code) || is_gregorian_code(left.type_code) {
+            return false;
+        }
         left == right
     }
 
@@ -230,9 +247,13 @@ impl<'s> NodeComparer<'s> {
 
         // `eq` under this comparer's collation: a string pair is compared with
         // it, every other pair ignores it.
-        if let Ok(result) =
-            eval_binary_collated(BinaryOpKind::ValueEq, &left, &right, self.collation)
-        {
+        if let Ok(result) = eval_binary_collated(
+            BinaryOpKind::ValueEq,
+            &left,
+            &right,
+            self.collation,
+            self.implicit_timezone,
+        ) {
             return result.as_boolean().unwrap_or(false);
         }
 
@@ -246,42 +267,55 @@ impl<'s> NodeComparer<'s> {
         nav.value().chars().all(is_xml_whitespace)
     }
 
+    /// Deep equality of two nodes, their content included.
     fn node_equal<N: DomNavigator>(&self, left: &N, right: &N) -> bool {
-        if left.node_type() != right.node_type() {
-            return false;
-        }
-
-        match left.node_type() {
-            DomNodeType::Element => self.element_equal(left, right),
-            DomNodeType::Attribute => self.attribute_equal(left, right),
-            DomNodeType::Namespace => self.namespace_equal(left, right),
-            DomNodeType::Text
-            | DomNodeType::Whitespace
-            | DomNodeType::SignificantWhitespace
-            | DomNodeType::Comment => self.text_equal(&left.value(), &right.value()),
-            DomNodeType::ProcessingInstruction => self.processing_instruction_equal(left, right),
-            // Document nodes: their content is their children.
-            _ => self.deep_equal(left, right),
+        match self.node_step(left, right) {
+            Step::Done(equal) => equal,
+            Step::Children(kinds) => self.children_equal(left, right, kinds),
         }
     }
 
-    fn element_equal<N: DomNavigator>(&self, left: &N, right: &N) -> bool {
+    /// The part of [`node_equal`](Self::node_equal) that does not descend:
+    /// the kinds, names, attributes, values and typed values of the two nodes.
+    /// What it leaves undecided is the pair's children.
+    fn node_step<N: DomNavigator>(&self, left: &N, right: &N) -> Step {
+        if left.node_type() != right.node_type() {
+            return Step::Done(false);
+        }
+
+        match left.node_type() {
+            DomNodeType::Element => self.element_step(left, right),
+            DomNodeType::Attribute => Step::Done(self.attribute_equal(left, right)),
+            DomNodeType::Namespace => Step::Done(self.namespace_equal(left, right)),
+            DomNodeType::Text
+            | DomNodeType::Whitespace
+            | DomNodeType::SignificantWhitespace
+            | DomNodeType::Comment => Step::Done(self.text_equal(&left.value(), &right.value())),
+            DomNodeType::ProcessingInstruction => {
+                Step::Done(self.processing_instruction_equal(left, right))
+            }
+            // Document nodes: their content is their children.
+            _ => Step::Children(ChildKinds::Significant),
+        }
+    }
+
+    fn element_step<N: DomNavigator>(&self, left: &N, right: &N) -> Step {
         if left.local_name() != right.local_name() || left.namespace_uri() != right.namespace_uri()
         {
-            return false;
+            return Step::Done(false);
         }
 
         let mut left_nav = left.clone();
         let mut right_nav = right.clone();
         if !self.element_attributes_equal(&mut left_nav, &mut right_nav) {
-            return false;
+            return Step::Done(false);
         }
 
         if !self.function_rules {
-            return self.deep_equal(left, right);
+            return Step::Children(ChildKinds::Significant);
         }
 
-        self.element_content_equal(left, right)
+        self.element_content_step(left, right)
     }
 
     /// Clauses (2) and (4) of the element rule (F&O §15.3.1).
@@ -302,7 +336,7 @@ impl<'s> NodeComparer<'s> {
     /// clause (2): without a schema set a nilled element-only element can
     /// compare equal to a nilled simple-content one — the price of not
     /// knowing.
-    fn element_content_equal<N: DomNavigator>(&self, left: &N, right: &N) -> bool {
+    fn element_content_step<N: DomNavigator>(&self, left: &N, right: &N) -> Step {
         let pair = match (self.element_content(left), self.element_content(right)) {
             (ElementContent::Unknown, ElementContent::Unknown) => {
                 (ElementContent::Mixed, ElementContent::Mixed)
@@ -313,18 +347,20 @@ impl<'s> NodeComparer<'s> {
         match pair {
             // 4(a): compare the typed values.
             (ElementContent::Simple, ElementContent::Simple) => {
-                self.typed_values_equal(left, right)
+                Step::Done(self.typed_values_equal(left, right))
             }
             // 4(b) / 4(d): compare only the child elements.
             (ElementContent::ElementOnly, ElementContent::ElementOnly) => {
-                self.child_elements_equal(left, right)
+                Step::Children(ChildKinds::Elements)
             }
-            // 4(c): compare `(*|text())`, which is what `deep_equal` walks
-            // once comment and PI children are skipped.
-            (ElementContent::Mixed, ElementContent::Mixed) => self.deep_equal(left, right),
+            // 4(c): compare `(*|text())`, which is what the significant
+            // children are once comment and PI children are skipped.
+            (ElementContent::Mixed, ElementContent::Mixed) => {
+                Step::Children(ChildKinds::Significant)
+            }
             // A simple/complex mismatch fails clause (2); an element-only
             // against a mixed element matches no case of clause (4).
-            _ => false,
+            _ => Step::Done(false),
         }
     }
 
@@ -408,28 +444,44 @@ impl<'s> NodeComparer<'s> {
         }
     }
 
-    /// Clause 4(b): each child element of one is deep-equal to the
-    /// corresponding child element of the other. Text children — which in
-    /// element-only content can only be whitespace — are not looked at, and
-    /// neither are comments and PIs.
-    fn child_elements_equal<N: DomNavigator>(&self, left: &N, right: &N) -> bool {
-        let mut left_iter = ChildIter::new(left.clone());
-        let mut right_iter = ChildIter::new(right.clone());
-
-        loop {
-            match (
-                next_child_element(&mut left_iter),
-                next_child_element(&mut right_iter),
-            ) {
-                (None, None) => return true,
+    /// Whether the children of `left` and `right`, paired up as `kinds` says,
+    /// are deep-equal pair by pair, and both run out together.
+    ///
+    /// The walk is iterative: a pair that needs its own children compared
+    /// pushes a frame onto an explicit stack instead of calling, so the depth
+    /// of the two trees costs heap, not Rust stack. Pairs are compared in
+    /// document order, depth first, and the first unequal pair ends the walk —
+    /// the order and the answer of a recursive comparison.
+    fn children_equal<N: DomNavigator>(&self, left: &N, right: &N, kinds: ChildKinds) -> bool {
+        let mut stack = vec![ChildPairs::new(left, right, kinds)];
+        while let Some(frame) = stack.last_mut() {
+            let (left_child, right_child) = match frame.kinds {
+                ChildKinds::Significant => (
+                    self.next_significant_child(&mut frame.left),
+                    self.next_significant_child(&mut frame.right),
+                ),
+                ChildKinds::Elements => (
+                    next_child_element(&mut frame.left),
+                    next_child_element(&mut frame.right),
+                ),
+            };
+            match (left_child, right_child) {
+                (None, None) => {
+                    stack.pop();
+                }
                 (Some(_), None) | (None, Some(_)) => return false,
                 (Some(left_child), Some(right_child)) => {
-                    if !self.node_equal(&left_child, &right_child) {
-                        return false;
+                    match self.node_step(&left_child, &right_child) {
+                        Step::Done(true) => {}
+                        Step::Done(false) => return false,
+                        Step::Children(kinds) => {
+                            stack.push(ChildPairs::new(&left_child, &right_child, kinds));
+                        }
                     }
                 }
             }
         }
+        true
     }
 
     fn element_attributes_equal<N: DomNavigator>(&self, left: &mut N, right: &mut N) -> bool {
@@ -550,23 +602,7 @@ impl<'s> NodeComparer<'s> {
     /// `fn:deep-equal`, whose content is its children; on two elements it is
     /// a *content* comparison.
     fn deep_equal<N: DomNavigator>(&self, left: &N, right: &N) -> bool {
-        let mut left_iter = ChildIter::new(left.clone());
-        let mut right_iter = ChildIter::new(right.clone());
-
-        loop {
-            let left_child = self.next_significant_child(&mut left_iter);
-            let right_child = self.next_significant_child(&mut right_iter);
-
-            match (left_child, right_child) {
-                (None, None) => return true,
-                (Some(_), None) | (None, Some(_)) => return false,
-                (Some(left_node), Some(right_node)) => {
-                    if !self.node_equal(&left_node, &right_node) {
-                        return false;
-                    }
-                }
-            }
-        }
+        self.children_equal(left, right, ChildKinds::Significant)
     }
 
     /// Deep equality for two XPath item iterators.
@@ -617,6 +653,47 @@ impl<'s> NodeComparer<'s> {
             return Some(nav);
         }
         None
+    }
+}
+
+/// What [`NodeComparer::node_step`] leaves to do for a pair of nodes.
+enum Step {
+    /// The pair is decided.
+    Done(bool),
+    /// The pair is deep-equal when its children are, paired up as the
+    /// [`ChildKinds`] say.
+    Children(ChildKinds),
+}
+
+/// Which children of two nodes a content comparison pairs up.
+#[derive(Debug, Clone, Copy)]
+enum ChildKinds {
+    /// Every child but the whitespace-only text the comparer ignores and,
+    /// under the `fn:deep-equal` rules, comments and PIs: a document node's
+    /// content, a mixed element's `(*|text())` (clause 4(c)), and the whole
+    /// content of an element under the published [`TreeComparer`] rules.
+    Significant,
+    /// Child elements only: element-only and empty content (clauses 4(b) and
+    /// 4(d)). Text children — which in element-only content can only be
+    /// whitespace — are not looked at, and neither are comments and PIs.
+    Elements,
+}
+
+/// One level of [`NodeComparer::children_equal`]'s walk: the children of two
+/// nodes still to compare.
+struct ChildPairs<N: DomNavigator> {
+    left: ChildIter<N>,
+    right: ChildIter<N>,
+    kinds: ChildKinds,
+}
+
+impl<N: DomNavigator> ChildPairs<N> {
+    fn new(left: &N, right: &N, kinds: ChildKinds) -> Self {
+        Self {
+            left: ChildIter::new(left.clone()),
+            right: ChildIter::new(right.clone()),
+            kinds,
+        }
     }
 }
 
@@ -742,7 +819,7 @@ mod tests {
     /// entry point the function itself uses.
     fn nodes_deep_equal<N: DomNavigator>(left: N, right: N) -> bool {
         sequences_deep_equal(
-            &NodeComparer::deep_equal_function(None, CollationRef::Codepoint),
+            &NodeComparer::deep_equal_function(None, CollationRef::Codepoint, TimezoneOffset::UTC),
             vec![XmlItem::Node(left)],
             vec![XmlItem::Node(right)],
         )
@@ -1205,7 +1282,11 @@ mod tests {
             right: BufferDocNavigator<'_>,
         ) -> bool {
             sequences_deep_equal(
-                &NodeComparer::deep_equal_function(schema_set, CollationRef::Codepoint),
+                &NodeComparer::deep_equal_function(
+                    schema_set,
+                    CollationRef::Codepoint,
+                    TimezoneOffset::UTC,
+                ),
                 vec![XmlItem::Node(left)],
                 vec![XmlItem::Node(right)],
             )
@@ -1472,8 +1553,15 @@ mod tests {
             left: &BufferDocNavigator<'_>,
             right: &BufferDocNavigator<'_>,
         ) -> bool {
-            NodeComparer::deep_equal_function(schema_set, CollationRef::Codepoint)
-                .element_content_equal(left, right)
+            let comparer = NodeComparer::deep_equal_function(
+                schema_set,
+                CollationRef::Codepoint,
+                TimezoneOffset::UTC,
+            );
+            match comparer.element_content_step(left, right) {
+                Step::Done(equal) => equal,
+                Step::Children(kinds) => comparer.children_equal(left, right, kinds),
+            }
         }
 
         /// Review finding: a nilled element whose complex type has simple

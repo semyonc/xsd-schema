@@ -296,7 +296,12 @@ pub struct AttributeFrameResult {
     pub fixed_value: Option<String>,
     pub use_kind: Option<String>,
     pub form: Option<String>,
-    pub inheritable: bool,
+    /// The `inheritable` \[attribute\] as written (XSD 1.1), `None` when absent.
+    /// The {inheritable} it maps to is the value, if present, otherwise
+    /// `false` for a declaration (§3.2.2.1, §3.2.2.2) and the referenced
+    /// declaration's {inheritable} for an attribute use made by `ref`
+    /// (§3.2.2.3).
+    pub inheritable: Option<bool>,
     pub id: Option<String>,
     pub annotation: Option<Annotation>,
     pub source: Option<SourceRef>,
@@ -307,6 +312,23 @@ pub struct AttributeFrameResult {
 pub struct AttributeUseResult {
     pub attribute: AttributeFrameResult,
     pub use_kind: AttributeUseKind,
+}
+
+impl AttributeUseResult {
+    /// The attribute use's {inheritable} (XSD 1.1), given the declaration a
+    /// `ref` resolved to. §3.2.2.2 (a local declaration's use): "The ·actual
+    /// value· of the inheritable \[attribute\], if present, otherwise false";
+    /// §3.2.2.3 (a reference): "The ·actual value· of the inheritable
+    /// \[attribute\], if present, otherwise {attribute
+    /// declaration}.{inheritable}".
+    pub(crate) fn use_inheritable(
+        &self,
+        referenced: Option<&crate::arenas::AttributeDeclData>,
+    ) -> bool {
+        self.attribute.inheritable.unwrap_or_else(|| {
+            self.attribute.ref_name.is_some() && referenced.is_some_and(|decl| decl.inheritable)
+        })
+    }
 }
 
 /// Attribute use kind
@@ -735,8 +757,11 @@ pub trait Frame {
             };
 
             if !self.allows_attribute(&local_name, name_table) {
+                // The schema for schemas does not declare the attribute on
+                // this element (a schema-document error, located by the
+                // parser at the element).
                 return Err(SchemaError::structural(
-                    "ct-props-correct",
+                    "s4s-att-not-allowed",
                     format!("Attribute '{}' is not allowed here", local_name),
                     None,
                 ));

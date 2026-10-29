@@ -34,7 +34,9 @@ use std::collections::HashMap;
 pub struct NamespaceContext<'a> {
     /// Reference to the name table for string interning
     name_table: &'a mut NameTable,
-    /// Stack of scopes, each mapping prefix NameId -> namespace NameId
+    /// Stack of scopes, each mapping prefix NameId -> namespace NameId.
+    /// A prefix mapped to [`well_known::EMPTY`] is undeclared in that scope
+    /// (Namespaces in XML 1.1 `xmlns:p=""`).
     scopes: Vec<HashMap<NameId, NameId>>,
     /// Default namespace (unprefixed elements)
     default_namespace: Option<NameId>,
@@ -94,21 +96,28 @@ impl<'a> NamespaceContext<'a> {
 
     /// Add a namespace binding to the current scope
     ///
+    /// An empty `uri` undeclares: `xmlns=""` the default namespace, and
+    /// `xmlns:p=""` (Namespaces in XML 1.1 §6.1; not namespace-well-formed in
+    /// XML 1.0) the prefix `p`, which then has no binding in this scope —
+    /// [`lookup_namespace`](Self::lookup_namespace) returns `None` for it and
+    /// [`snapshot`](Self::snapshot) leaves it out, until the scope is popped
+    /// or the prefix is declared again.
+    ///
     /// # Arguments
     ///
     /// * `prefix` - The prefix (empty string for default namespace)
     /// * `uri` - The namespace URI
     pub fn add_namespace(&mut self, prefix: &str, uri: &str) {
-        let uri_id = self.name_table.add(uri);
-
         if prefix.is_empty() {
             // Default namespace
             self.default_namespace = if uri.is_empty() {
                 None // xmlns="" undeclares default namespace
             } else {
-                Some(uri_id)
+                Some(self.name_table.add(uri))
             };
         } else {
+            // `well_known::EMPTY` is "": an undeclared prefix.
+            let uri_id = self.name_table.add(uri);
             let prefix_id = self.name_table.add(prefix);
             if let Some(scope) = self.scopes.last_mut() {
                 scope.insert(prefix_id, uri_id);
@@ -125,12 +134,13 @@ impl<'a> NamespaceContext<'a> {
         }
     }
 
-    /// Look up namespace URI for a prefix NameId
+    /// Look up namespace URI for a prefix NameId (`None` for a prefix that
+    /// is not declared, or undeclared by `xmlns:p=""`)
     pub fn lookup_namespace_by_id(&self, prefix_id: NameId) -> Option<NameId> {
         // Search scopes from innermost to outermost
         for scope in self.scopes.iter().rev() {
             if let Some(&ns_id) = scope.get(&prefix_id) {
-                return Some(ns_id);
+                return (ns_id != well_known::EMPTY).then_some(ns_id);
             }
         }
         None
@@ -175,9 +185,10 @@ impl<'a> NamespaceContext<'a> {
             }
         }
 
-        // Filter based on scope type
+        // Filter based on scope type; an undeclared prefix is not in scope.
         result
             .into_iter()
+            .filter(|&(_, ns_id)| ns_id != well_known::EMPTY)
             .filter(|&(prefix_id, _)| match scope_filter {
                 NamespaceScope::All => true,
                 NamespaceScope::ExcludeXml => {
@@ -312,6 +323,35 @@ mod tests {
 
         ctx.pop_scope();
         assert!(ctx.default_namespace().is_none());
+    }
+
+    #[test]
+    fn test_undeclare_prefix() {
+        let mut table = NameTable::new();
+        let mut ctx = NamespaceContext::new(&mut table);
+
+        ctx.push_scope();
+        ctx.add_namespace("p", "http://outer.com");
+        ctx.push_scope();
+        ctx.add_namespace("p", ""); // Namespaces in XML 1.1: undeclare
+        assert_eq!(ctx.lookup_namespace("p"), None);
+        let p = ctx.name_table().get("p").unwrap();
+        assert!(ctx.snapshot().resolve_prefix(p).is_none());
+        assert!(ctx
+            .get_namespaces_in_scope(NamespaceScope::All)
+            .iter()
+            .all(|&(prefix, _)| prefix != p));
+
+        ctx.push_scope();
+        ctx.add_namespace("p", "http://again.com");
+        let ns = ctx.lookup_namespace("p").unwrap();
+        assert_eq!(ctx.name_table().resolve(ns), "http://again.com");
+        ctx.pop_scope();
+        assert_eq!(ctx.lookup_namespace("p"), None);
+
+        ctx.pop_scope();
+        let ns = ctx.lookup_namespace("p").unwrap();
+        assert_eq!(ctx.name_table().resolve(ns), "http://outer.com");
     }
 
     #[test]

@@ -123,13 +123,16 @@ impl Frame for SimpleTypeFrame {
                 }
                 // The restriction element inside <simpleType> only admits
                 // annotation, an inline simpleType, and facets (§3.16.2 XML
-                // representation). Attribute uses, attribute groups, wildcards
-                // and particles belong to simpleContent/complexContent
+                // representation). Attribute uses, attribute groups, wildcards,
+                // particles, open content and `assert` (its `assertion` facet
+                // is a facet) belong to simpleContent/complexContent
                 // restrictions and are syntax errors here (msData stC029).
                 if res.attribute_wildcard.is_some()
                     || !res.attributes.is_empty()
                     || !res.attribute_groups.is_empty()
                     || res.particle.is_some()
+                    || res.open_content.is_some()
+                    || !res.assertions.is_empty()
                 {
                     return Err(SchemaError::structural(
                         "src-simple-type",
@@ -200,22 +203,198 @@ impl Frame for SimpleTypeFrame {
 }
 
 // ============================================================================
+// Content order of complexType / restriction / extension
+// ============================================================================
+
+/// A child of `<complexType>`, `<restriction>` or `<extension>`, by the place
+/// it takes in the content models of Structures 1.1 §3.4.2 (and §3.16.2 for a
+/// simple type's `<restriction>`, which shares the restriction frame):
+///
+/// - `<complexType>`: (annotation?, (simpleContent | complexContent |
+///   (openContent?, (group | all | choice | sequence)?, ((attribute |
+///   attributeGroup)*, anyAttribute?), assert*)))
+/// - `<simpleContent>` / `<restriction>`: (annotation?, (simpleType?,
+///   (*facets* | assertion)*)?, ((attribute | attributeGroup)*,
+///   anyAttribute?), assert*)
+/// - `<simpleContent>` / `<extension>`: (annotation?, ((attribute |
+///   attributeGroup)*, anyAttribute?), assert*)
+/// - `<complexContent>` / `<restriction>`: (annotation?, openContent?, (group |
+///   all | choice | sequence)?, ((attribute | attributeGroup)*,
+///   anyAttribute?), assert*)
+/// - `<complexContent>` / `<extension>`: (annotation?, openContent?, ((group |
+///   all | choice | sequence)?, ((attribute | attributeGroup)*,
+///   anyAttribute?), assert*))
+///
+/// One `<restriction>` frame serves the three restrictions and one
+/// `<extension>` frame both extensions; what a context forbids outright (a
+/// particle in simple content, a facet in complex content, an `assert` in a
+/// simple type) is refused by the parent when the result is attached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TypeContentChild {
+    Annotation,
+    /// `<simpleContent>` or `<complexContent>` (complexType only).
+    Derivation,
+    OpenContent,
+    /// `<group>`, `<all>`, `<choice>` or `<sequence>`.
+    Particle,
+    /// An inline `<simpleType>` (restriction only).
+    SimpleType,
+    /// A constraining facet, including XSD 1.1 `assertion` and
+    /// `explicitTimezone` (restriction only).
+    Facet,
+    /// `<attribute>` or `<attributeGroup>`.
+    Attribute,
+    /// `<anyAttribute>`.
+    AttributeWildcard,
+    /// `<assert>`.
+    Assert,
+}
+
+impl TypeContentChild {
+    fn of(local_name: &str) -> Option<Self> {
+        Some(match local_name {
+            xsd_names::ANNOTATION => Self::Annotation,
+            xsd_names::SIMPLE_CONTENT | xsd_names::COMPLEX_CONTENT => Self::Derivation,
+            xsd_names::SEQUENCE | xsd_names::CHOICE | xsd_names::ALL | xsd_names::GROUP => {
+                Self::Particle
+            }
+            xsd_names::SIMPLE_TYPE => Self::SimpleType,
+            xsd_names::ENUMERATION
+            | xsd_names::PATTERN
+            | xsd_names::MIN_INCLUSIVE
+            | xsd_names::MAX_INCLUSIVE
+            | xsd_names::MIN_EXCLUSIVE
+            | xsd_names::MAX_EXCLUSIVE
+            | xsd_names::MIN_LENGTH
+            | xsd_names::MAX_LENGTH
+            | xsd_names::LENGTH
+            | xsd_names::TOTAL_DIGITS
+            | xsd_names::FRACTION_DIGITS
+            | xsd_names::WHITE_SPACE => Self::Facet,
+            #[cfg(feature = "xsd11")]
+            xsd_names::ASSERTION | xsd_names::EXPLICIT_TIMEZONE => Self::Facet,
+            xsd_names::ATTRIBUTE | xsd_names::ATTRIBUTE_GROUP => Self::Attribute,
+            xsd_names::ANY_ATTRIBUTE => Self::AttributeWildcard,
+            #[cfg(feature = "xsd11")]
+            xsd_names::OPEN_CONTENT => Self::OpenContent,
+            #[cfg(feature = "xsd11")]
+            xsd_names::ASSERT => Self::Assert,
+            _ => return None,
+        })
+    }
+}
+
+/// How far the content of `<complexType>`, `<restriction>` or `<extension>`
+/// has got: the last kind of child seen (see [`TypeContentChild`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TypeContentPhase {
+    Start,
+    Annotation,
+    /// After `<simpleContent>` / `<complexContent>`: nothing may follow.
+    Done,
+    OpenContent,
+    Particle,
+    SimpleType,
+    Facets,
+    Attributes,
+    AttributeWildcard,
+    Assertions,
+}
+
+impl TypeContentPhase {
+    /// Whether `child` may come next.
+    fn admits(self, child: TypeContentChild) -> bool {
+        use TypeContentChild as C;
+        use TypeContentPhase as P;
+        match child {
+            C::Annotation => self == P::Start,
+            C::Derivation | C::SimpleType | C::OpenContent => {
+                matches!(self, P::Start | P::Annotation)
+            }
+            C::Particle => matches!(self, P::Start | P::Annotation | P::OpenContent),
+            C::Facet => matches!(self, P::Start | P::Annotation | P::SimpleType | P::Facets),
+            C::Attribute | C::AttributeWildcard => matches!(
+                self,
+                P::Start
+                    | P::Annotation
+                    | P::OpenContent
+                    | P::Particle
+                    | P::SimpleType
+                    | P::Facets
+                    | P::Attributes
+            ),
+            C::Assert => self != P::Done,
+        }
+    }
+
+    /// The phase after `child`.
+    fn after(child: TypeContentChild) -> Self {
+        match child {
+            TypeContentChild::Annotation => Self::Annotation,
+            TypeContentChild::Derivation => Self::Done,
+            TypeContentChild::OpenContent => Self::OpenContent,
+            TypeContentChild::Particle => Self::Particle,
+            TypeContentChild::SimpleType => Self::SimpleType,
+            TypeContentChild::Facet => Self::Facets,
+            TypeContentChild::Attribute => Self::Attributes,
+            TypeContentChild::AttributeWildcard => Self::AttributeWildcard,
+            TypeContentChild::Assert => Self::Assertions,
+        }
+    }
+
+    /// `allows` of a frame whose content model has the children `kinds`.
+    fn allows(self, local_name: &str, kinds: &[TypeContentChild]) -> bool {
+        TypeContentChild::of(local_name)
+            .is_some_and(|child| kinds.contains(&child) && self.admits(child))
+    }
+
+    /// `on_child_start`: the phase after `local_name`, or `self` when it is no
+    /// child of the content model (the parser has refused it already).
+    fn advance(self, local_name: &str) -> Self {
+        TypeContentChild::of(local_name).map_or(self, Self::after)
+    }
+}
+
+/// The children of `<restriction>` (any of the three).
+const RESTRICTION_CHILDREN: &[TypeContentChild] = &[
+    TypeContentChild::Annotation,
+    TypeContentChild::OpenContent,
+    TypeContentChild::Particle,
+    TypeContentChild::SimpleType,
+    TypeContentChild::Facet,
+    TypeContentChild::Attribute,
+    TypeContentChild::AttributeWildcard,
+    TypeContentChild::Assert,
+];
+
+/// The children of `<extension>` (either).
+const EXTENSION_CHILDREN: &[TypeContentChild] = &[
+    TypeContentChild::Annotation,
+    TypeContentChild::OpenContent,
+    TypeContentChild::Particle,
+    TypeContentChild::Attribute,
+    TypeContentChild::AttributeWildcard,
+    TypeContentChild::Assert,
+];
+
+/// The children of `<complexType>`.
+const COMPLEX_TYPE_CHILDREN: &[TypeContentChild] = &[
+    TypeContentChild::Annotation,
+    TypeContentChild::Derivation,
+    TypeContentChild::OpenContent,
+    TypeContentChild::Particle,
+    TypeContentChild::Attribute,
+    TypeContentChild::AttributeWildcard,
+    TypeContentChild::Assert,
+];
+
+// ============================================================================
 // Restriction Frame
 // ============================================================================
 
 /// Frame for xs:restriction
-/// Parsing phase for restriction
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RestrictionPhase {
-    Annotation,
-    Content,
-    Facets,
-    Attributes,
-    Done,
-}
-
 pub struct RestrictionFrame {
-    phase: RestrictionPhase,
+    phase: TypeContentPhase,
     base_type: Option<TypeRefResult>,
     facets: FacetSet,
     particle: Option<ParticleResult>,
@@ -249,7 +428,7 @@ impl RestrictionFrame {
             .map(String::from);
 
         Ok(Self {
-            phase: RestrictionPhase::Annotation,
+            phase: TypeContentPhase::Start,
             base_type,
             facets: FacetSet::new(),
             particle: None,
@@ -269,79 +448,7 @@ impl RestrictionFrame {
 
 impl Frame for RestrictionFrame {
     fn allows(&self, local_name: &str, _name_table: &NameTable) -> bool {
-        let is_facet = matches!(
-            local_name,
-            xsd_names::ENUMERATION
-                | xsd_names::PATTERN
-                | xsd_names::MIN_INCLUSIVE
-                | xsd_names::MAX_INCLUSIVE
-                | xsd_names::MIN_EXCLUSIVE
-                | xsd_names::MAX_EXCLUSIVE
-                | xsd_names::MIN_LENGTH
-                | xsd_names::MAX_LENGTH
-                | xsd_names::LENGTH
-                | xsd_names::TOTAL_DIGITS
-                | xsd_names::FRACTION_DIGITS
-                | xsd_names::WHITE_SPACE
-        );
-
-        #[cfg(feature = "xsd11")]
-        let is_xsd11_element = matches!(
-            local_name,
-            xsd_names::OPEN_CONTENT
-                | xsd_names::ASSERT
-                | xsd_names::ASSERTION
-                | xsd_names::EXPLICIT_TIMEZONE
-        );
-        #[cfg(not(feature = "xsd11"))]
-        let is_xsd11_element = false;
-
-        #[cfg(feature = "xsd11")]
-        let is_xsd11_facet = matches!(
-            local_name,
-            xsd_names::ASSERTION | xsd_names::EXPLICIT_TIMEZONE
-        );
-        #[cfg(not(feature = "xsd11"))]
-        let is_xsd11_facet = false;
-
-        match self.phase {
-            RestrictionPhase::Annotation => matches!(
-                local_name,
-                xsd_names::ANNOTATION
-                    | xsd_names::SIMPLE_TYPE
-                    | xsd_names::SEQUENCE
-                    | xsd_names::CHOICE
-                    | xsd_names::ALL
-                    | xsd_names::GROUP
-                    | xsd_names::ATTRIBUTE
-                    | xsd_names::ATTRIBUTE_GROUP
-                    | xsd_names::ANY_ATTRIBUTE
-            ) || is_facet || is_xsd11_element,
-            RestrictionPhase::Content => matches!(
-                local_name,
-                xsd_names::SIMPLE_TYPE
-                    | xsd_names::SEQUENCE
-                    | xsd_names::CHOICE
-                    | xsd_names::ALL
-                    | xsd_names::GROUP
-                    | xsd_names::ATTRIBUTE
-                    | xsd_names::ATTRIBUTE_GROUP
-                    | xsd_names::ANY_ATTRIBUTE
-            ) || is_facet || is_xsd11_element,
-            RestrictionPhase::Facets => is_facet || is_xsd11_facet || matches!(
-                local_name,
-                xsd_names::ATTRIBUTE
-                    | xsd_names::ATTRIBUTE_GROUP
-                    | xsd_names::ANY_ATTRIBUTE
-            ) || matches!(local_name, xsd_names::ASSERT | xsd_names::OPEN_CONTENT if is_xsd11_element),
-            RestrictionPhase::Attributes => matches!(
-                local_name,
-                xsd_names::ATTRIBUTE
-                    | xsd_names::ATTRIBUTE_GROUP
-                    | xsd_names::ANY_ATTRIBUTE
-            ) || is_xsd11_element,
-            RestrictionPhase::Done => false,
-        }
+        self.phase.allows(local_name, RESTRICTION_CHILDREN)
     }
 
     fn allows_attribute(&self, local_name: &str, _name_table: &NameTable) -> bool {
@@ -349,30 +456,7 @@ impl Frame for RestrictionFrame {
     }
 
     fn on_child_start(&mut self, local_name: &str, _name_table: &NameTable) {
-        match local_name {
-            xsd_names::ANNOTATION => {
-                self.phase = RestrictionPhase::Content;
-            }
-            xsd_names::SIMPLE_TYPE => {
-                self.phase = RestrictionPhase::Facets;
-            }
-            xsd_names::SEQUENCE | xsd_names::CHOICE | xsd_names::ALL | xsd_names::GROUP => {
-                self.phase = RestrictionPhase::Attributes;
-            }
-            xsd_names::ENUMERATION | xsd_names::PATTERN | xsd_names::MIN_INCLUSIVE
-            | xsd_names::MAX_INCLUSIVE | xsd_names::MIN_EXCLUSIVE | xsd_names::MAX_EXCLUSIVE
-            | xsd_names::MIN_LENGTH | xsd_names::MAX_LENGTH | xsd_names::LENGTH
-            | xsd_names::TOTAL_DIGITS | xsd_names::FRACTION_DIGITS | xsd_names::WHITE_SPACE => {
-                self.phase = RestrictionPhase::Facets;
-            }
-            xsd_names::ATTRIBUTE | xsd_names::ATTRIBUTE_GROUP => {
-                self.phase = RestrictionPhase::Attributes;
-            }
-            xsd_names::ANY_ATTRIBUTE => {
-                self.phase = RestrictionPhase::Done;
-            }
-            _ => {}
-        }
+        self.phase = self.phase.advance(local_name);
     }
 
     fn attach(&mut self, child: FrameResult) -> SchemaResult<()> {
@@ -475,17 +559,8 @@ impl Frame for RestrictionFrame {
 // ============================================================================
 
 /// Frame for xs:extension
-/// Parsing phase for extension
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ExtensionPhase {
-    Annotation,
-    Content,
-    Attributes,
-    Done,
-}
-
 pub struct ExtensionFrame {
-    phase: ExtensionPhase,
+    phase: TypeContentPhase,
     base_type: Option<TypeRefResult>,
     particle: Option<ParticleResult>,
     open_content: Option<OpenContentResult>,
@@ -517,7 +592,7 @@ impl ExtensionFrame {
             .map(String::from);
 
         Ok(Self {
-            phase: ExtensionPhase::Annotation,
+            phase: TypeContentPhase::Start,
             base_type,
             particle: None,
             open_content: None,
@@ -535,44 +610,7 @@ impl ExtensionFrame {
 
 impl Frame for ExtensionFrame {
     fn allows(&self, local_name: &str, _name_table: &NameTable) -> bool {
-        #[cfg(feature = "xsd11")]
-        let is_xsd11_element = matches!(
-            local_name,
-            xsd_names::OPEN_CONTENT | xsd_names::ASSERT
-        );
-        #[cfg(not(feature = "xsd11"))]
-        let is_xsd11_element = false;
-
-        match self.phase {
-            ExtensionPhase::Annotation => matches!(
-                local_name,
-                xsd_names::ANNOTATION
-                    | xsd_names::SEQUENCE
-                    | xsd_names::CHOICE
-                    | xsd_names::ALL
-                    | xsd_names::GROUP
-                    | xsd_names::ATTRIBUTE
-                    | xsd_names::ATTRIBUTE_GROUP
-                    | xsd_names::ANY_ATTRIBUTE
-            ) || is_xsd11_element,
-            ExtensionPhase::Content => matches!(
-                local_name,
-                xsd_names::SEQUENCE
-                    | xsd_names::CHOICE
-                    | xsd_names::ALL
-                    | xsd_names::GROUP
-                    | xsd_names::ATTRIBUTE
-                    | xsd_names::ATTRIBUTE_GROUP
-                    | xsd_names::ANY_ATTRIBUTE
-            ) || is_xsd11_element,
-            ExtensionPhase::Attributes => matches!(
-                local_name,
-                xsd_names::ATTRIBUTE
-                    | xsd_names::ATTRIBUTE_GROUP
-                    | xsd_names::ANY_ATTRIBUTE
-            ) || is_xsd11_element,
-            ExtensionPhase::Done => false,
-        }
+        self.phase.allows(local_name, EXTENSION_CHILDREN)
     }
 
     fn allows_attribute(&self, local_name: &str, _name_table: &NameTable) -> bool {
@@ -580,21 +618,7 @@ impl Frame for ExtensionFrame {
     }
 
     fn on_child_start(&mut self, local_name: &str, _name_table: &NameTable) {
-        match local_name {
-            xsd_names::ANNOTATION => {
-                self.phase = ExtensionPhase::Content;
-            }
-            xsd_names::SEQUENCE | xsd_names::CHOICE | xsd_names::ALL | xsd_names::GROUP => {
-                self.phase = ExtensionPhase::Attributes;
-            }
-            xsd_names::ATTRIBUTE | xsd_names::ATTRIBUTE_GROUP => {
-                self.phase = ExtensionPhase::Attributes;
-            }
-            xsd_names::ANY_ATTRIBUTE => {
-                self.phase = ExtensionPhase::Done;
-            }
-            _ => {}
-        }
+        self.phase = self.phase.advance(local_name);
     }
 
     fn attach(&mut self, child: FrameResult) -> SchemaResult<()> {
@@ -1120,7 +1144,7 @@ impl Frame for SimpleContentFrame {
 
     fn finish(self: Box<Self>) -> SchemaResult<FrameResult> {
         let base_type = self.base_type.ok_or_else(|| SchemaError::structural(
-            "ct-props-correct",
+            "s4s-att-must-appear",
             "xs:simpleContent requires a base type",
             None,
         ))?;
@@ -1249,6 +1273,15 @@ impl Frame for ComplexContentFrame {
                         None,
                     ));
                 }
+                // Nor an inline <simpleType> (§3.4.2.3: "(annotation?,
+                // openContent?, (group | all | choice | sequence)?, …)").
+                if res.inline_type.is_some() {
+                    return Err(SchemaError::structural(
+                        "src-ct",
+                        "xs:simpleType is not allowed in a complexContent restriction",
+                        None,
+                    ));
+                }
                 self.base_type = res.base_type.clone();
                 self.derivation = Some(DerivationMethod::Restriction);
                 self.particle = res.particle.clone();
@@ -1320,18 +1353,9 @@ impl Frame for ComplexContentFrame {
 // Complex Type Frame
 // ============================================================================
 
-/// Parsing phase for complexType
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ComplexTypePhase {
-    Annotation,
-    Content,
-    Attributes,
-    Done,
-}
-
 /// Frame for xs:complexType element
 pub struct ComplexTypeFrame {
-    phase: ComplexTypePhase,
+    phase: TypeContentPhase,
     name: Option<NameId>,
     base_type: Option<TypeRefResult>,
     derivation_method: Option<DerivationMethod>,
@@ -1395,7 +1419,7 @@ impl ComplexTypeFrame {
             .map(String::from);
 
         Ok(Self {
-            phase: ComplexTypePhase::Annotation,
+            phase: TypeContentPhase::Start,
             name,
             base_type: None,
             derivation_method: None,
@@ -1423,48 +1447,7 @@ impl ComplexTypeFrame {
 
 impl Frame for ComplexTypeFrame {
     fn allows(&self, local_name: &str, _name_table: &NameTable) -> bool {
-        #[cfg(feature = "xsd11")]
-        let is_xsd11_element = matches!(
-            local_name,
-            xsd_names::OPEN_CONTENT | xsd_names::ASSERT
-        );
-        #[cfg(not(feature = "xsd11"))]
-        let is_xsd11_element = false;
-
-        match self.phase {
-            ComplexTypePhase::Annotation => matches!(
-                local_name,
-                xsd_names::ANNOTATION
-                    | xsd_names::SIMPLE_CONTENT
-                    | xsd_names::COMPLEX_CONTENT
-                    | xsd_names::SEQUENCE
-                    | xsd_names::CHOICE
-                    | xsd_names::ALL
-                    | xsd_names::GROUP
-                    | xsd_names::ATTRIBUTE
-                    | xsd_names::ATTRIBUTE_GROUP
-                    | xsd_names::ANY_ATTRIBUTE
-            ) || is_xsd11_element,
-            ComplexTypePhase::Content => matches!(
-                local_name,
-                xsd_names::SIMPLE_CONTENT
-                    | xsd_names::COMPLEX_CONTENT
-                    | xsd_names::SEQUENCE
-                    | xsd_names::CHOICE
-                    | xsd_names::ALL
-                    | xsd_names::GROUP
-                    | xsd_names::ATTRIBUTE
-                    | xsd_names::ATTRIBUTE_GROUP
-                    | xsd_names::ANY_ATTRIBUTE
-            ) || is_xsd11_element,
-            ComplexTypePhase::Attributes => matches!(
-                local_name,
-                xsd_names::ATTRIBUTE
-                    | xsd_names::ATTRIBUTE_GROUP
-                    | xsd_names::ANY_ATTRIBUTE
-            ) || is_xsd11_element,
-            ComplexTypePhase::Done => false,
-        }
+        self.phase.allows(local_name, COMPLEX_TYPE_CHILDREN)
     }
 
     fn allows_attribute(&self, local_name: &str, _name_table: &NameTable) -> bool {
@@ -1485,24 +1468,7 @@ impl Frame for ComplexTypeFrame {
     }
 
     fn on_child_start(&mut self, local_name: &str, _name_table: &NameTable) {
-        match local_name {
-            xsd_names::ANNOTATION => {
-                self.phase = ComplexTypePhase::Content;
-            }
-            xsd_names::SIMPLE_CONTENT | xsd_names::COMPLEX_CONTENT => {
-                self.phase = ComplexTypePhase::Done;
-            }
-            xsd_names::SEQUENCE | xsd_names::CHOICE | xsd_names::ALL | xsd_names::GROUP => {
-                self.phase = ComplexTypePhase::Attributes;
-            }
-            xsd_names::ATTRIBUTE | xsd_names::ATTRIBUTE_GROUP => {
-                self.phase = ComplexTypePhase::Attributes;
-            }
-            xsd_names::ANY_ATTRIBUTE => {
-                self.phase = ComplexTypePhase::Done;
-            }
-            _ => {}
-        }
+        self.phase = self.phase.advance(local_name);
     }
 
     fn attach(&mut self, child: FrameResult) -> SchemaResult<()> {

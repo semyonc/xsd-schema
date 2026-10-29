@@ -57,7 +57,6 @@ fn schema(version: XsdVersion, body: &str) -> SchemaSet {
 }
 
 fn validator(ss: &SchemaSet, flags: ValidationFlags) -> SchemaValidator<'_> {
-    let flags = flags | ValidationFlags::PROCESS_IDENTITY_CONSTRAINTS;
     #[cfg(feature = "xsd11")]
     {
         SchemaValidator::new_fragment_buffer(ss, flags)
@@ -941,18 +940,21 @@ fn list_of_union_members_beyond_capacity_are_reported() {
     }
 }
 
-/// Second follow-up (P1). A list whose item type is a union stores every
-/// member as a string, whichever member type validated it; only a list whose
-/// item type is in the `xs:decimal` family stores (exactly) its members beyond
-/// capacity as strings. The members of a list of a union are typed as in 0.2.2
-/// — `xs:string` in `$value` of a simple type and in `data()` — so that a
-/// number the union's `xs:string` member validated, or a small decimal, can
-/// never pass for an `xs:decimal` beyond capacity (and let an assertion be
-/// skipped without a capacity warning). Expected verdicts are 0.2.2's, on every
-/// driver.
+/// The members of a list whose item type is a union are typed with the member
+/// type that validated each of them (XPath 2.0 §2.5.2: "when the type
+/// annotation of a node is a union type, the typed value of the node will be
+/// an instance of one of the member types of the union"; Structures
+/// §3.13.4.1 clause 2.3.1: `$value` is "the XDM representation of
+/// E.[schema actual value]"), in `$value` of a simple type and in `data()` of
+/// a node, on every driver. A number the union's `xs:string` member validated
+/// is an `xs:string` and can never pass for an `xs:decimal` beyond capacity.
+///
+/// 0.2.2 (and 0.2.3, which kept its typing here) typed every member
+/// `xs:string`; the rows marked "member type" now give the specification's
+/// answer instead: `5` is a value of the union's decimal member.
 #[cfg(feature = "xsd11")]
 #[test]
-fn list_of_union_members_are_typed_as_in_0_2_2() {
+fn list_of_union_members_have_their_member_types() {
     const UNION_LIST: &str = r#"<xs:simpleType name="u"><xs:union>
           <xs:simpleType><xs:restriction base="xs:decimal"><xs:maxInclusive value="10"/></xs:restriction></xs:simpleType>
           <xs:simpleType><xs:restriction base="xs:string"/></xs:simpleType>
@@ -978,19 +980,26 @@ fn list_of_union_members_are_typed_as_in_0_2_2() {
         )
     };
     let huge_string = format!("<d>{HUGE} 5</d>");
-    // (assertion on $value, instance, valid?) — 0.2.2's verdicts.
-    let rows: [(&str, &str, bool); 12] = [
+    // (assertion on $value, instance, valid?)
+    let rows: [(&str, &str, bool); 14] = [
         ("$value[1] + 1 eq 0", "<d>20 5</d>", false),
         ("$value[1] instance of xs:decimal", "<d>20 5</d>", false),
-        ("$value[2] instance of xs:decimal", "<d>20 5</d>", false),
+        // Member type (0.2.2: false).
+        ("$value[2] instance of xs:decimal", "<d>20 5</d>", true),
         ("$value[1] instance of xs:string", "<d>20 5</d>", true),
+        // Member type (0.2.2: true).
+        ("$value[2] instance of xs:string", "<d>20 5</d>", false),
+        // Member type (0.2.2: false, a type error on a string).
+        ("$value[2] + 1 eq 6", "<d>20 5</d>", true),
         ("$value[2] + 1 eq 0", "<d>abc 5</d>", false),
-        ("$value[2] instance of xs:decimal", "<d>abc 5</d>", false),
+        // Member type (0.2.2: false).
+        ("$value[2] instance of xs:decimal", "<d>abc 5</d>", true),
         ("$value[1] instance of xs:string", "<d>abc 5</d>", true),
         ("$value[1] + 1 eq 0", &huge_string, false),
         ("$value[1] instance of xs:decimal", &huge_string, false),
         ("$value[2] + 1 eq 0", &huge_string, false),
-        ("$value[2] instance of xs:string", &huge_string, true),
+        // Member type (0.2.2: true).
+        ("$value[2] instance of xs:string", &huge_string, false),
         ("count($value) eq 2", &huge_string, true),
     ];
     for (test, xml, ok) in rows {
@@ -1011,11 +1020,79 @@ fn list_of_union_members_are_typed_as_in_0_2_2() {
     }
 }
 
+/// A member of a list of a union that the union's `xs:decimal` member
+/// validated beyond capacity is an `xs:decimal` (0.2.2 and 0.2.3 typed it
+/// `xs:string`): it draws the capacity warning, and an assertion that would
+/// compute with it is skipped (Datatypes §5.4) — on `$value` of a simple type,
+/// `data()` of a node and `$value` of a complex type with simple content.
+#[cfg(feature = "xsd11")]
+#[test]
+fn list_of_union_decimal_members_beyond_capacity_are_decimals() {
+    const UNION_LIST: &str = r#"<xs:simpleType name="u"><xs:union memberTypes="xs:decimal xs:boolean"/></xs:simpleType>
+        <xs:simpleType name="l"><xs:list itemType="u"/></xs:simpleType>"#;
+    let schemas = |test: &str| {
+        [
+            schema(
+                XsdVersion::V1_1,
+                &format!(
+                    r#"{UNION_LIST}<xs:element name="d"><xs:simpleType><xs:restriction base="l">
+                         <xs:assertion test="{test}"/></xs:restriction></xs:simpleType></xs:element>"#
+                ),
+            ),
+            schema(
+                XsdVersion::V1_1,
+                &format!(
+                    r#"{UNION_LIST}<xs:element name="d"><xs:complexType><xs:simpleContent>
+                         <xs:extension base="l"><xs:assert test="{test}"/></xs:extension>
+                         </xs:simpleContent></xs:complexType></xs:element>"#
+                ),
+            ),
+        ]
+    };
+    let node = |test: &str| {
+        schema(
+            XsdVersion::V1_1,
+            &format!(
+                r#"{UNION_LIST}<xs:element name="r"><xs:complexType><xs:sequence>
+                     <xs:element name="d" type="l"/></xs:sequence>
+                     <xs:assert test="{}"/></xs:complexType></xs:element>"#,
+                test.replace("$value", "data(d)")
+            ),
+        )
+    };
+    let huge = format!("<d>{HUGE} true</d>");
+    // (assertion, instance, valid?, capacity notices)
+    let rows: [(&str, &str, bool, usize); 5] = [
+        ("$value[1] instance of xs:decimal", &huge, true, 1),
+        ("$value[2] instance of xs:boolean", &huge, true, 1),
+        // Skipped: the outcome is unknown, which must not make it invalid.
+        ("$value[1] + 1 gt 0", &huge, true, 1),
+        // Within capacity the member computes.
+        ("$value[1] + 1 gt 0", "<d>5 true</d>", true, 0),
+        ("$value[1] + 1 lt 0", "<d>5 true</d>", false, 0),
+    ];
+    for (test, xml, ok, notices) in rows {
+        for ss in schemas(test) {
+            if ok {
+                valid(&ss, xml, notices);
+            } else {
+                invalid(&ss, xml, "cvc-assertion");
+            }
+        }
+        let ss = node(test);
+        let xml = format!("<r>{xml}</r>");
+        if ok {
+            valid(&ss, &xml, notices);
+        } else {
+            invalid(&ss, &xml, "cvc-assertion");
+        }
+    }
+}
+
 /// Second follow-up (P1). In `$value` of a complex type with simple content
-/// whose type is a list of a union, members keep 0.2.2's typing (the list's
-/// recorded item type) — except a string spelling a decimal beyond capacity,
-/// which may be a number the union's `xs:string` member validated: it is an
-/// `xs:string`, never a decimal whose arithmetic would skip the assertion.
+/// whose type is a list of a union, a string spelling a decimal beyond
+/// capacity that the union's `xs:string` member validated is an `xs:string`,
+/// never a decimal whose arithmetic would skip the assertion.
 #[cfg(feature = "xsd11")]
 #[test]
 fn complex_simple_content_list_of_union_never_skips() {
@@ -1053,8 +1130,26 @@ fn complex_simple_content_list_of_union_never_skips() {
         "cvc-assertion",
     );
     valid(&complex("$value[1] instance of xs:string"), &huge_string, 0);
-    // A small member typed with the recorded item type, as in 0.2.2, computes.
+    // A small member is a value of the decimal member and computes.
     valid(&complex("$value[2] + 1 eq 6"), "<d>20 5</d>", 0);
+    // B5: each member has its own member type. 0.2.2 and 0.2.3 typed every
+    // member with the recorded (last member's) item type, so `abc` was an
+    // `xs:decimal` holding a string.
+    valid(
+        &complex("$value[1] instance of xs:string"),
+        "<d>abc 5</d>",
+        0,
+    );
+    invalid(
+        &complex("$value[1] instance of xs:decimal"),
+        "<d>abc 5</d>",
+        "cvc-assertion",
+    );
+    valid(
+        &complex("$value[2] instance of xs:decimal"),
+        "<d>abc 5</d>",
+        0,
+    );
 }
 
 /// Second follow-up (P1). A list whose item type is `xs:decimal` itself still

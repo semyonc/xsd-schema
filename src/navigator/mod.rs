@@ -44,9 +44,10 @@ pub enum NavigatorError {
 ///
 /// A list type's typed value is one `Value` of kind
 /// [`XmlValueKind::List`](crate::types::value::XmlValueKind::List), which XPath
-/// atomization sees as one atomic value per member; an element whose complex
-/// type has empty content has an empty list as its `Value` (XDM 1.0 §6.2.4:
-/// the empty sequence).
+/// atomization sees as one atomic value per member, each of the type that
+/// validated it (for a list whose item type is a union, the member type that
+/// accepted that member); an element whose complex type has empty content has
+/// an empty list as its `Value` (XDM 1.0 §6.2.4: the empty sequence).
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypedValue {
     /// Schema-validated typed atomic value.
@@ -233,7 +234,31 @@ pub trait DomNavigator: Clone {
         Cow::Owned(self.value())
     }
 
-    /// Get the base URI of the current node
+    /// The base URI this navigator knows for the current node, **unresolved**.
+    ///
+    /// What a navigator returns:
+    ///
+    /// * at the document node: the base URI of the document entity — the URI
+    ///   the document was retrieved from, or was given when it was built — or
+    ///   `""` when none is known. `xml:base` never changes it;
+    /// * at any other node: either that same document base URI
+    ///   ([`RoXmlNavigator`] reports it for every node), or the value of the
+    ///   `xml:base` attribute in scope at the node, exactly as written
+    ///   (`document::BufferDocNavigator` reports it where there is one) —
+    ///   never a value resolved from the two;
+    /// * at the topmost node of a tree without a document node (a fragment):
+    ///   the document's base URI when the node carries no `xml:base` of its
+    ///   own.
+    ///
+    /// Who resolves: the consumer. `fn:base-uri` takes this value at the
+    /// document node (or at the topmost node of a fragment), resolves every
+    /// `xml:base` from the outermost ancestor-or-self inward against it (XML
+    /// Base; RFC 3986 §5.2, which removes dot segments, §5.2.4), and finally
+    /// resolves the result against the static base URI when it is still
+    /// relative. A navigator does not resolve the `xml:base` chain itself — a
+    /// consumer that does so would apply it twice — and a host that needs the
+    /// base URI of a node (to resolve a relative reference found in it)
+    /// resolves it the same way.
     fn base_uri(&self) -> &str;
 
     // ----- Typed value hooks -----
@@ -278,6 +303,18 @@ pub trait DomNavigator: Clone {
     /// Returns a [`TypedValue`] that distinguishes validated values, untyped
     /// nodes, nilled elements, and element-only complex content.
     fn typed_value(&self) -> TypedValue;
+
+    /// The XDM is-idrefs property of the current node (XDM 1.0 §5.6):
+    /// whether it is an element or attribute whose typed value holds an
+    /// `xs:IDREF` / `xs:IDREFS` (or derived) atomic value (§6.2.4, §6.3.4).
+    ///
+    /// The default implementation returns `false`, which is correct for any
+    /// schema-unaware backend: a node constructed from an infoset without DTD
+    /// attribute types is never is-idrefs. Schema-aware navigators override
+    /// it, together with [`find_nodes_by_idref`](Self::find_nodes_by_idref).
+    fn is_idrefs(&self) -> bool {
+        false
+    }
 
     // ----- Default helper methods -----
 
@@ -345,6 +382,20 @@ pub trait DomNavigator: Clone {
     fn find_element_by_id(&self, id: &str) -> Result<Option<Self>, NavigatorError> {
         let _ = id;
         Ok(None)
+    }
+
+    /// The element and attribute nodes of this node's tree with the
+    /// is-idrefs property whose string value has `id` among its
+    /// whitespace-separated tokens — the nodes `fn:idref` returns for the
+    /// candidate `id` (F&O 1.0 §15.5.3), in document order. `id` is an
+    /// NCName; the function filters its candidates before asking.
+    ///
+    /// The default implementation returns no node, which is correct for a
+    /// backend whose nodes are never is-idrefs (see
+    /// [`is_idrefs`](Self::is_idrefs)).
+    fn find_nodes_by_idref(&self, id: &str) -> Result<Vec<Self>, NavigatorError> {
+        let _ = id;
+        Ok(Vec::new())
     }
 }
 

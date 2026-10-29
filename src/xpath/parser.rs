@@ -22,7 +22,11 @@ lalrpop_util::lalrpop_mod!(
 );
 
 /// Error type for XPath parsing.
+///
+/// `#[non_exhaustive]`: a `match` needs a wildcard arm; later variants are
+/// additive.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum ParseError {
     /// Lexer error (tokenization failed).
     Lexer(LexerError),
@@ -33,6 +37,17 @@ pub enum ParseError {
     },
     /// Unexpected end of input.
     UnexpectedEof,
+    /// The expression nests deeper than
+    /// [`MAX_EXPRESSION_DEPTH`](crate::xpath::depth::MAX_EXPRESSION_DEPTH):
+    /// a limit of this implementation (XPath 2.0 §2.3.1), not a syntax error.
+    /// It converts to [`XPathError::LimitExceeded`].
+    #[non_exhaustive]
+    LimitExceeded {
+        /// The limit, [`MAX_EXPRESSION_DEPTH`](crate::xpath::depth::MAX_EXPRESSION_DEPTH).
+        max: usize,
+        /// The nesting depth of the expression (greater than `max`).
+        found: usize,
+    },
 }
 
 impl fmt::Display for ParseError {
@@ -47,6 +62,11 @@ impl fmt::Display for ParseError {
                 }
             }
             ParseError::UnexpectedEof => write!(f, "Unexpected end of input"),
+            ParseError::LimitExceeded { max, found } => write!(
+                f,
+                "XPath limit xpath::depth::MAX_EXPRESSION_DEPTH exceeded: nesting depth {found}, \
+                 the limit is {max}"
+            ),
         }
     }
 }
@@ -57,6 +77,17 @@ impl From<LexerError> for ParseError {
     fn from(e: LexerError) -> Self {
         ParseError::Lexer(e)
     }
+}
+
+/// Refuse an expression nested deeper than the limit, before anything walks
+/// it recursively (see [`crate::xpath::depth`]).
+fn check_depth(arena: &AstArena, root: AstNodeId) -> Result<(), ParseError> {
+    let max = crate::xpath::depth::MAX_EXPRESSION_DEPTH;
+    let found = crate::xpath::depth::expression_depth(arena, root);
+    if found > max {
+        return Err(ParseError::LimitExceeded { max, found });
+    }
+    Ok(())
 }
 
 /// Map a LALRPOP parse error to our `ParseError` type.
@@ -132,6 +163,7 @@ pub fn parse(input: &str) -> Result<ParsedXPath, ParseError> {
     let root = xpath_grammar::ExprParser::new()
         .parse(&mut arena, lexer)
         .map_err(map_lalrpop_error)?;
+    check_depth(&arena, root)?;
 
     Ok(ParsedXPath {
         arena,
@@ -146,9 +178,11 @@ pub fn parse(input: &str) -> Result<ParsedXPath, ParseError> {
 pub fn parse_expr(input: &str, arena: &mut AstArena) -> Result<AstNodeId, ParseError> {
     let lexer = Lexer::new(input);
 
-    xpath_grammar::ExprParser::new()
+    let root = xpath_grammar::ExprParser::new()
         .parse(arena, lexer)
-        .map_err(map_lalrpop_error)
+        .map_err(map_lalrpop_error)?;
+    check_depth(arena, root)?;
+    Ok(root)
 }
 
 /// Parse an XPath expression with a specific mode (XPath 1.0 or 2.0).
@@ -159,6 +193,7 @@ pub fn parse_with_mode(input: &str, mode: XPathMode) -> Result<ParsedXPath, Pars
     let root = xpath_grammar::ExprParser::new()
         .parse(&mut arena, lexer)
         .map_err(map_lalrpop_error)?;
+    check_depth(&arena, root)?;
 
     Ok(ParsedXPath {
         arena,
@@ -175,9 +210,11 @@ pub fn parse_expr_with_mode(
 ) -> Result<AstNodeId, ParseError> {
     let lexer = Lexer::new_with_mode(input, mode);
 
-    xpath_grammar::ExprParser::new()
+    let root = xpath_grammar::ExprParser::new()
         .parse(arena, lexer)
-        .map_err(map_lalrpop_error)
+        .map_err(map_lalrpop_error)?;
+    check_depth(arena, root)?;
+    Ok(root)
 }
 
 /// Parse an XPath expression with structured options, returning `XPathError` on failure.
