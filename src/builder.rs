@@ -406,7 +406,7 @@ impl SchemaSetBuilder {
     pub fn compile(mut self) -> SchemaResult<CompiledSchemaSet> {
         // Phase 1: Resolve directives for all pending documents, and for
         // every document they read
-        let pending: Vec<_> = self.pending_docs.drain(..).collect();
+        let pending = std::mem::take(&mut self.pending_docs);
         let closure = resolve_directive_closure(&pending, &mut self.resolver, &mut self.schema_set);
         self.finish(closure)
     }
@@ -484,7 +484,7 @@ impl SchemaSetBuilder {
     /// computation phases remain synchronous.
     #[cfg(feature = "async")]
     pub async fn compile_async(mut self) -> SchemaResult<CompiledSchemaSet> {
-        let pending: Vec<_> = self.pending_docs.drain(..).collect();
+        let pending = std::mem::take(&mut self.pending_docs);
         let closure =
             resolve_directive_closure_async(&pending, &mut self.resolver, &mut self.schema_set)
                 .await;

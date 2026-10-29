@@ -1199,19 +1199,14 @@ impl<'input> Lexer<'input> {
 
         if self.current().map(Self::is_ncname_start).unwrap_or(false) {
             let first = self.consume_ncname();
-            let prefix;
-            let local;
-
-            if self.current() == Some(':')
+            let (prefix, local) = if self.current() == Some(':')
                 && self.peek(1).map(Self::is_ncname_start).unwrap_or(false)
             {
                 self.advance(1);
-                prefix = first;
-                local = self.consume_ncname();
+                (first, self.consume_ncname())
             } else {
-                prefix = String::new();
-                local = first;
-            }
+                (String::new(), first)
+            };
 
             self.enqueue(Token::VarName { prefix, local }, start, self.pos);
             self.state = LexerState::Operator;
