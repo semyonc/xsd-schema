@@ -39,6 +39,17 @@ disputes: W3C-queried tests (Bugzilla 4146/4680/4957/6901/29085), tests that
 contradict other accepted tests in the same suite (the `elemM002` /
 `xsd015.e` family vs. Saxon's `Missing` group), or documented waivers.
 
+Beyond the W3C suites, two corpora of published schemas are run locally (their
+files are not part of this repository):
+
+| Corpus | Files | Load (XSD 1.0) | Load (XSD 1.1) | Not loaded, each for a defect of its own |
+| --- | ---: | ---: | ---: | --- |
+| GAEB DA XML 3.3 (2021-05), the German construction data-exchange standard | 32 schemas | 32 | 32 | none |
+| WSDL 1.1 services from 18 public sources (W3C Databinding patterns, Apache CXF, python-zeep, PHP SOAP interop, .NET WCF, ONVIF, IHE ITI, VMware vSphere, EU VIES, and vendor and government services) | 517 WSDL files | 459 | 482 | 35: 24 invalid schemas (each confirmed with Xerces-J), 7 broken references to other files, 3 not well-formed XML, 1 needs a schema the corpus does not hold |
+
+The 23 WSDL files that load only in XSD 1.1 mode (ONVIF) violate XSD 1.0's Unique
+Particle Attribution constraint (`cos-nonambig`), which XSD 1.1 relaxes.
+
 ## Regular-expression engine
 
 With the `xsd11` feature, `xs:pattern` facets and the XPath functions `fn:matches`,
