@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-29
+
+Conformance against 0.2.3: the W3C XSD 1.0 suite passes 39,461 of 39,510 tests
+(was 39,458). Three tests now pass: `reZ001.v` (the regular-expression
+engine), `addB139.i` (a schema document that undeclares a prefix,
+`xmlns:f=""`, is not namespace-well-formed XML 1.0) and `addB065.i` (a nilled
+element whose declaration has a fixed value is invalid); none fails that
+passed. The XSD 1.1 suite (2,313 of 2,319) and the XPath 2.0 tests of XQTS
+(8,047 of 8,047) are unchanged. All 32 GAEB DA XML 3.3 schemas now load in XSD
+1.0 mode (9 were refused by the restriction check before).
+
 ### Breaking changes
 
 See [Upgrading to 0.3](doc/UPGRADING_0_3.md) for every item below with the
@@ -3056,7 +3067,8 @@ Performance-focused release. No breaking changes to the public API.
 Initial release: XML Schema (XSD 1.0/1.1) validator with PSVI and a built-in
 XPath 2.0 engine.
 
-[Unreleased]: https://github.com/semyonc/xsd-schema/compare/v0.2.3...HEAD
+[Unreleased]: https://github.com/semyonc/xsd-schema/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/semyonc/xsd-schema/compare/v0.2.3...v0.3.0
 [0.2.3]: https://github.com/semyonc/xsd-schema/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/semyonc/xsd-schema/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/semyonc/xsd-schema/compare/v0.2.0...v0.2.1
