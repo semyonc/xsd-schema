@@ -173,6 +173,12 @@ See [Upgrading to 0.3](doc/UPGRADING_0_3.md) for every item below with the
   `types::complex::NamespaceConstraint::matches` and
   `schema::wildcard::NamespaceConstraint::allows` no longer take an
   `XsdVersion`: no namespace constraint depends on the version.
+- The `document::namespace` module is private: `NamespaceNode`,
+  `NamespacePageFactory`, `NamespaceChain`, `NsRef` and the `NS_PAGE_*`
+  constants are no longer public (they were also re-exported from `document`).
+  No public API handed one out or took one, so only code that named them is
+  affected; the namespace bindings of a document are read through
+  `BufferDocNavigator` (the namespace axis).
 
 **Behaviour**
 
@@ -1098,6 +1104,12 @@ See [Upgrading to 0.3](doc/UPGRADING_0_3.md) for every item below with the
 - The embedded schema for the XML namespace is the current W3C edition: it
   declares `xml:id` and allows an empty `xml:lang`. `assets/NOTICE.md` records
   its source and the W3C licence that applies to it.
+- The embedded schema for the XLink namespace (`XLINK_XSD`,
+  `embedded://xlink.xsd`) is byte-identical to the W3C original,
+  `http://www.w3.org/XML/2008/06/xlink.xsd`: the shipped copy had LF line ends
+  and three blank lines without their trailing space. Nothing it declares
+  changes. `assets/NOTICE.md` records its source and the W3C licence that
+  applies to it.
 - An attribute that `xs:schema` does not allow (or an invalid value of one it
   does) is reported with its name and location instead of the internal error
   "Root frame did not produce a schema result".
@@ -1126,6 +1138,14 @@ See [Upgrading to 0.3](doc/UPGRADING_0_3.md) for every item below with the
 - A path step with a named kind test (`element(c)`) compares names without
   allocating, about twice as fast; `instance of` / `treat as` resolve their
   type once per expression.
+- A `BufferDocument` finds the namespaces in scope at an element without
+  visiting its ancestors. Validating a deep document (`drive_buffer_document`,
+  `drive_navigator`), serializing it, or reading its `namespace::` axis or
+  `fn:in-scope-prefixes` took time quadratic in its depth, about 9 s each for
+  100,000 levels. Where every element declares the default namespace again, as
+  some generators write, it was cubic: 2,000 levels took 9.5 s. 100,000 levels
+  now take 0.01–0.06 s. Every answer is unchanged. The document keeps 4 more
+  bytes per namespace declaration and up to 16 per element that declares one.
 
 ## [0.2.3] - 2026-10-15
 

@@ -254,7 +254,17 @@ drivers keep their element stack there; the tree-walk drivers
 do `BufferDocumentBuilder::copy_subtree` and the serializer
 (`document::serialize`). A tree of any depth —
 one a host builds with `BufferDocumentBuilder` included, which no parse limit
-covers — is validated and compared on an ordinary 2 MiB thread. A host that
+covers — is validated and compared on an ordinary 2 MiB thread. The time of
+these walks grows linearly with the depth as well: an element of a
+`BufferDocument` finds the namespaces in scope without visiting its ancestors
+(*Namespace scope* in `BUFFER_DOCUMENT_OVERVIEW.md`), so 100,000 nested levels
+are validated in about 0.05 s and serialized in about 0.015 s in an optimized
+build, whether one element declares the namespaces or every element declares
+the default namespace again. Two shapes still cost more. When each level adds
+a prefix, every element has that many namespace nodes, and the walks that read
+them (validation, serialization, the `namespace::` axis) take time quadratic in
+the depth. When the levels rebind two prefixes in turn, the walks are quadratic
+too (20,000 levels, about 1.4 s). A host that
 reads documents of untrusted depth sets `ParseLimits::max_depth` on the runtime
 or the document builder (§4), which bounds the depth of the text it reads and
 so of the trees it builds. The parser of a third-party tree is its own: roxmltree

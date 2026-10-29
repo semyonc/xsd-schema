@@ -83,7 +83,9 @@ Each `xs:pattern` is compiled once; key, unique and keyref tables are indexed
 (no more quadratic time on large documents); the Unique Particle Attribution
 check reuses its storage; extension chains no longer compile in exponential
 time; list values
-of unions are not validated twice. The measurements are in the
+of unions are not validated twice; a deep `BufferDocument` is validated,
+serialized and read for its namespaces in time linear in its depth. The
+measurements are in the
 [CHANGELOG](../CHANGELOG.md).
 
 ## Breaking changes

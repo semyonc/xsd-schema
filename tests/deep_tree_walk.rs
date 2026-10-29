@@ -22,17 +22,10 @@ use xsd_schema::validation::{
 };
 use xsd_schema::{DomNavigator, RoXmlNavigator, SchemaSet};
 
-/// The depth of the trees the comparer tests build.
+/// The depth of the trees the buffer-document tests build: the drives and the
+/// comparers.
 #[cfg(feature = "xsd11")]
 const DEPTH: usize = 100_000;
-
-/// The depth of the trees the buffer-document drive tests build. The walk
-/// itself is linear, but the buffer document's namespace axis visits every
-/// ancestor of an element, so a drive over a deep buffer document takes time
-/// quadratic in the depth (100,000 levels take seconds even in an optimized
-/// build); this depth is still far beyond what a recursive walk survives.
-#[cfg(feature = "xsd11")]
-const DRIVE_DEPTH: usize = 20_000;
 
 /// The depth of the roxmltree documents. roxmltree's own parser recurses once
 /// per element level, so a document must be parsed on a large stack; this
@@ -251,10 +244,10 @@ mod buffer {
             let schema_set = schema();
             for value in ["12", "twelve"] {
                 let arena = Bump::new();
-                let doc = built(&arena, &schema_set.name_table, DRIVE_DEPTH, value);
+                let doc = built(&arena, &schema_set.name_table, DEPTH, value);
                 let outcome = walked(&schema_set, &doc.create_navigator());
-                let text = deep_text(DRIVE_DEPTH, value);
-                assert_same_as_streamed(&schema_set, &text, outcome, DRIVE_DEPTH);
+                let text = deep_text(DEPTH, value);
+                assert_same_as_streamed(&schema_set, &text, outcome, DEPTH);
             }
         });
     }
@@ -274,7 +267,7 @@ mod buffer {
             let schema_set = schema();
             for value in ["12", "twelve"] {
                 let arena = Bump::new();
-                let doc = built(&arena, &schema_set.name_table, DRIVE_DEPTH, value);
+                let doc = built(&arena, &schema_set.name_table, DEPTH, value);
                 let (mut errors, mut warnings) = (Vec::new(), Vec::new());
                 let outcome = {
                     let validator = validator(&schema_set);
@@ -286,8 +279,8 @@ mod buffer {
                 };
                 let errors = errors.iter().map(ToString::to_string).collect();
                 let outcome = (outcome.root_validity, outcome.max_depth, errors);
-                let text = deep_text(DRIVE_DEPTH, value);
-                assert_same_as_streamed(&schema_set, &text, outcome, DRIVE_DEPTH);
+                let text = deep_text(DEPTH, value);
+                assert_same_as_streamed(&schema_set, &text, outcome, DEPTH);
             }
         });
     }

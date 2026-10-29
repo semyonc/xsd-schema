@@ -392,23 +392,15 @@ impl<'a> BufferDocNavigator<'a> {
         self.doc.fragment_base_uri.unwrap_or("")
     }
 
-    /// Finds the NsRef boundary for Local namespace scope on `elem`.
-    ///
-    /// Walks ancestors to find the nearest element with `HAS_NMSP_DECLS`
-    /// and returns its namespace chain head.  Returns `NsRef::NULL` if no
-    /// ancestor has namespace declarations.
+    /// Finds the NsRef boundary for Local namespace scope on `elem`: the
+    /// chain in scope at its parent (the chain head of the nearest ancestor
+    /// with `HAS_NMSP_DECLS`), where `elem`'s own declarations end.  Returns
+    /// `NsRef::NULL` if no ancestor has namespace declarations.
     fn find_local_ns_boundary(&self, elem: u32) -> NsRef {
-        let mut cursor = self.doc.nodes.get(elem).parent;
-        while cursor != NULL {
-            let node = self.doc.nodes.get(cursor);
-            if node.node_type() == NodeType::Element && node.has_flag(Node::HAS_NMSP_DECLS) {
-                if let Some(&head) = self.doc.element_namespaces.get(&cursor) {
-                    return head;
-                }
-            }
-            cursor = node.parent;
+        match self.doc.nodes.get(elem).parent {
+            NULL => NsRef::NULL,
+            parent => self.doc.namespace_scope(parent),
         }
-        NsRef::NULL
     }
 
     /// Collects namespace NsRefs for the given scope.
@@ -418,6 +410,12 @@ impl<'a> BufferDocNavigator<'a> {
     /// - **All**: All in-scope namespaces including inherited, plus the
     ///   implicit `xml:` binding.
     /// - **ExcludeXml**: Like All but without the `xml:` namespace.
+    ///
+    /// `All` and `ExcludeXml` read one chain, the one in scope at `elem`
+    /// (`BufferDocument::namespace_scope`): it holds the declarations of
+    /// `elem` and of every ancestor, innermost first, so the first node of
+    /// each prefix is the binding in force. Finding the chain and walking it
+    /// take the same time at any depth (see `NamespaceScopes`).
     fn collect_namespaces(&self, elem: u32, scope: NamespaceAxisScope) -> Vec<NsRef> {
         match scope {
             NamespaceAxisScope::Local => {
@@ -451,59 +449,32 @@ impl<'a> BufferDocNavigator<'a> {
                 let mut result: Vec<NsRef> = Vec::new();
                 let mut seen_prefixes: Option<HashSet<NameId>> = None;
 
-                let mut cursor = elem;
-                loop {
-                    let node = self.doc.nodes.get(cursor);
-                    if node.node_type() == NodeType::Element && node.has_flag(Node::HAS_NMSP_DECLS)
+                for (ns_ref, ns_node) in self.doc.scope_walk(self.doc.namespace_scope(elem)) {
+                    let seen = seen_prefixes.get_or_insert_with(HashSet::new);
+                    if !seen.insert(ns_node.prefix) {
+                        continue;
+                    }
+                    if scope == NamespaceAxisScope::ExcludeXml
+                        && self.doc.names.resolve_ref(ns_node.prefix) == "xml"
                     {
-                        if let Some(&ns_head) = self.doc.element_namespaces.get(&cursor) {
-                            let mut ns_ref = ns_head;
-                            while !ns_ref.is_null() {
-                                let ns_node = self.doc.namespace_pages.get(ns_ref);
-                                let seen = seen_prefixes.get_or_insert_with(HashSet::new);
-                                if seen.insert(ns_node.prefix) {
-                                    if scope == NamespaceAxisScope::ExcludeXml {
-                                        let prefix_str = self.doc.names.resolve_ref(ns_node.prefix);
-                                        if prefix_str == "xml" {
-                                            ns_ref = ns_node.next;
-                                            continue;
-                                        }
-                                    }
-                                    // A zero-length URI is a namespace
-                                    // *undeclaration* (`xmlns=""`). It cancels
-                                    // an outer binding — it must stay in
-                                    // `seen` so the outer one is shadowed —
-                                    // but it is the absence of a binding, so
-                                    // under `All` (the XDM
-                                    // `dm:namespace-nodes` accessor behind the
-                                    // `namespace::` axis and
-                                    // `fn:in-scope-prefixes`) no namespace
-                                    // node exists for it. `Local` and
-                                    // `ExcludeXml` are views of the
-                                    // *declarations* — serialization, shallow
-                                    // copy and the namespace context that
-                                    // resolves QNames during validation — and
-                                    // must keep it.
-                                    if scope == NamespaceAxisScope::All
-                                        && self
-                                            .doc
-                                            .names
-                                            .resolve_ref(ns_node.namespace_uri)
-                                            .is_empty()
-                                    {
-                                        ns_ref = ns_node.next;
-                                        continue;
-                                    }
-                                    result.push(ns_ref);
-                                }
-                                ns_ref = ns_node.next;
-                            }
-                        }
+                        continue;
                     }
-                    if node.parent == NULL {
-                        break;
+                    // A zero-length URI is a namespace *undeclaration*
+                    // (`xmlns=""`). It cancels an outer binding — it must
+                    // stay in `seen` so the outer one is shadowed — but it
+                    // is the absence of a binding, so under `All` (the XDM
+                    // `dm:namespace-nodes` accessor behind the `namespace::`
+                    // axis and `fn:in-scope-prefixes`) no namespace node
+                    // exists for it. `Local` and `ExcludeXml` are views of
+                    // the *declarations* — serialization, shallow copy and
+                    // the namespace context that resolves QNames during
+                    // validation — and must keep it.
+                    if scope == NamespaceAxisScope::All
+                        && self.doc.names.resolve_ref(ns_node.namespace_uri).is_empty()
+                    {
+                        continue;
                     }
-                    cursor = node.parent;
+                    result.push(ns_ref);
                 }
 
                 // XDM contract: `All` always exposes the implicit `xml:` binding,
@@ -642,8 +613,9 @@ impl<'a> BufferDocNavigator<'a> {
 
     /// Resolve a prefix to its in-scope namespace URI's `NameId`.
     ///
-    /// Walks from the owning element (or current element if not on a virtual
-    /// node) up the ancestor chain. Returns `None` if the prefix is
+    /// Reads the chain in scope at the owning element (or the current node if
+    /// not on a virtual node): its first node of the prefix is the binding in
+    /// force. Returns `None` if the prefix is
     /// undeclared or bound to an empty URI (XML 1.1 namespace undeclaration).
     /// `prefix.is_none()` requests the default namespace; `Some("")` is
     /// equivalent. The implicit `xml` prefix always resolves.
@@ -661,28 +633,13 @@ impl<'a> BufferDocNavigator<'a> {
             self.current
         };
 
-        let mut cursor = start;
-        loop {
-            let node = self.doc.nodes.get(cursor);
-            if node.node_type() == NodeType::Element && node.has_flag(Node::HAS_NMSP_DECLS) {
-                if let Some(&head) = self.doc.element_namespaces.get(&cursor) {
-                    let mut ns_ref = head;
-                    while !ns_ref.is_null() {
-                        let ns_node = self.doc.namespace_pages.get(ns_ref);
-                        if names.resolve_ref(ns_node.prefix) == target_prefix {
-                            if names.resolve_ref(ns_node.namespace_uri).is_empty() {
-                                return None;
-                            }
-                            return Some(ns_node.namespace_uri);
-                        }
-                        ns_ref = ns_node.next;
-                    }
+        for (_, ns_node) in self.doc.scope_walk(self.doc.namespace_scope(start)) {
+            if names.resolve_ref(ns_node.prefix) == target_prefix {
+                if names.resolve_ref(ns_node.namespace_uri).is_empty() {
+                    return None;
                 }
+                return Some(ns_node.namespace_uri);
             }
-            if node.parent == NULL {
-                break;
-            }
-            cursor = node.parent;
         }
 
         None

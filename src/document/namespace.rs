@@ -153,15 +153,17 @@ impl<'a> NamespacePageFactory<'a> {
     }
 
     /// Returns `true` if no namespace nodes have been allocated.
-    #[inline]
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
-    /// Returns an iterator over the chain starting at `head`.
+    /// Returns an iterator over the chain starting at `head` (the raw chain,
+    /// hidden bindings included; tests compare readers with it).
     ///
     /// Yields `(prefix, namespace_uri)` pairs.  An [`NsRef::NULL`] head
     /// produces an empty iterator.
+    #[cfg(test)]
     pub fn iter_chain(&self, head: NsRef) -> NamespaceChain<'_, 'a> {
         NamespaceChain {
             factory: self,
@@ -184,11 +186,13 @@ impl<'a> NamespacePageFactory<'a> {
 // ── NamespaceChain iterator ───────────────────────────────────────────
 
 /// Iterator over a linked chain of namespace bindings.
+#[cfg(test)]
 pub struct NamespaceChain<'f, 'a> {
     factory: &'f NamespacePageFactory<'a>,
     cursor: NsRef,
 }
 
+#[cfg(test)]
 impl Iterator for NamespaceChain<'_, '_> {
     type Item = (NameId, NameId);
 
@@ -199,6 +203,225 @@ impl Iterator for NamespaceChain<'_, '_> {
         let node = self.factory.get(self.cursor);
         self.cursor = node.next;
         Some((node.prefix, node.namespace_uri))
+    }
+}
+
+// ── NamespaceScopes ───────────────────────────────────────────────────
+
+/// Where the namespace bindings in scope at a node of a document start, and
+/// a walk over them that does not revisit what an element hides.
+///
+/// An element that declares namespaces owns a chain head: its own
+/// declarations, last first, followed by the chain in scope at its parent. So
+/// one chain holds everything in scope at an element, each prefix's binding in
+/// force first. This table answers the two questions a reader of that chain
+/// asks, in time that does not grow with the depth of the element:
+///
+/// * **Which chain is in scope at a node** (`changes`). The builder adds nodes
+///   in document order, and the chain in scope changes only where an element
+///   that declares namespaces starts (to its own chain) and right after it
+///   ends (back to its parent's). The chain in scope at a node is the one of
+///   the last change at or before it — found by binary search. A document
+///   without declarations has no entry; a declaring element has two at most.
+/// * **Where to go next in a walk of the bindings in scope** (`walk_next`, one
+///   entry per namespace node). Usually the node's `next`. At an element's
+///   last own declaration — where its chain runs into its parent's — the walk
+///   skips the leading run of the parent's bindings whose prefixes the element
+///   declares itself: they are hidden there, and everywhere below. An element
+///   that declares the default namespace again, as some generators do on
+///   every element, so passes over all its ancestors' redeclarations at once.
+///
+/// A skipped node always has a prefix the walk has met already, so a reader
+/// that keeps the first binding of each prefix (as every reader of the scope
+/// does) sees exactly what it saw on the full chain, in the same order.
+#[derive(Debug, Default)]
+pub(crate) struct NamespaceScopes {
+    /// `(first node, chain head)`, in increasing node order, one entry at most
+    /// per node and no two neighbours with the same head.
+    changes: Vec<(u32, NsRef)>,
+    /// For each namespace node, by index, the node a walk of the bindings in
+    /// scope visits next.
+    walk_next: Vec<NsRef>,
+}
+
+impl NamespaceScopes {
+    /// Records a namespace node the builder has just allocated and chained to
+    /// `next`. Called for every allocation, in allocation order.
+    pub(crate) fn allocated(&mut self, ns_ref: NsRef, next: NsRef) {
+        debug_assert_eq!(ns_ref.0 as usize, self.walk_next.len());
+        self.walk_next.push(next);
+    }
+
+    /// The head of the chain in scope at `node`, or [`NsRef::NULL`] when no
+    /// declaration is in scope there. An attribute, a text node and anything
+    /// else inside an element share the element's scope.
+    #[inline]
+    pub(crate) fn scope_at(&self, node: u32) -> NsRef {
+        match self.changes.partition_point(|&(from, _)| from <= node) {
+            0 => NsRef::NULL,
+            i => self.changes[i - 1].1,
+        }
+    }
+
+    /// The node a walk of the bindings in scope visits after `ns_ref`.
+    #[inline]
+    pub(crate) fn walk_next(&self, ns_ref: NsRef) -> NsRef {
+        self.walk_next[ns_ref.0 as usize]
+    }
+
+    /// From node `from` on, the chain in scope starts at `head`.
+    ///
+    /// `from` is never below an earlier change: nodes are only appended. A
+    /// change at the same node replaces the earlier one (an element that
+    /// starts right after another one ends, an element whose declarations grow
+    /// after it started).
+    pub(crate) fn set_scope(&mut self, from: u32, head: NsRef) {
+        if self.changes.last().is_some_and(|&(at, _)| at == from) {
+            self.changes.pop();
+        }
+        debug_assert!(
+            self.changes.last().is_none_or(|&(at, _)| at < from),
+            "scope changes are recorded in node order"
+        );
+        let current = self.changes.last().map_or(NsRef::NULL, |&(_, h)| h);
+        if current != head {
+            self.changes.push((from, head));
+        }
+    }
+
+    /// Element `elem` declares namespaces: its chain is `head`, whose own
+    /// declarations run up to the one chained to `outer` (the chain in scope
+    /// at its parent). Sets the walk's skip at the end of its own declarations
+    /// and makes `head` the scope from `elem` on.
+    ///
+    /// `own`, when the caller knows it, is the element's first declaration
+    /// (the first namespace node allocated for it) and the [`prefix_bit`]s of
+    /// all its prefixes, which spare the search for the first and, mostly,
+    /// the scan of the declarations for a prefix the element does not declare.
+    ///
+    /// Called again when a declaration is added to an element that has no
+    /// children yet: the skip is computed afresh for the larger set.
+    pub(crate) fn declared(
+        &mut self,
+        pages: &NamespacePageFactory<'_>,
+        elem: u32,
+        outer: NsRef,
+        head: NsRef,
+        own: Option<(NsRef, u64)>,
+    ) {
+        let (last, mask) = match own {
+            Some((first, mask)) => (first, mask),
+            None => (NsRef::NULL, u64::MAX),
+        };
+        let (last, own_len) = if last.is_null() {
+            let (mut at, mut len) = (head, 1usize);
+            loop {
+                let next = pages.get(at).next;
+                if next == outer || next.is_null() {
+                    break (at, len);
+                }
+                at = next;
+                len += 1;
+            }
+        } else {
+            // The builder allocates an element's declarations one after the
+            // other, so they are the nodes `last ..= head`.
+            debug_assert_eq!(pages.get(last).next, outer);
+            (last, (head.0 - last.0) as usize + 1)
+        };
+        // Whether the element declares `prefix` itself. An element rarely
+        // declares more than a handful of prefixes, so a scan of its own
+        // declarations, without allocating, is the common answer; one that
+        // declares very many, and hides some, gets a set.
+        let scan = |prefix: NameId| {
+            let mut at = head;
+            loop {
+                let node = pages.get(at);
+                if node.prefix == prefix {
+                    return true;
+                }
+                if at == last {
+                    return false;
+                }
+                at = node.next;
+            }
+        };
+        let mut set: Option<std::collections::HashSet<NameId>> = None;
+        let mut skip = outer;
+        while !skip.is_null() {
+            let prefix = pages.get(skip).prefix;
+            let hidden = mask & prefix_bit(prefix) != 0
+                && match &set {
+                    Some(set) => set.contains(&prefix),
+                    None => scan(prefix),
+                };
+            if !hidden {
+                break;
+            }
+            if set.is_none() && own_len > 16 {
+                set = Some(
+                    std::iter::successors(Some(head), |&at| {
+                        (at != last).then(|| pages.get(at).next)
+                    })
+                    .map(|at| pages.get(at).prefix)
+                    .collect(),
+                );
+            }
+            skip = self.walk_next(skip);
+        }
+        self.walk_next[last.0 as usize] = skip;
+        self.set_scope(elem, head);
+    }
+
+    /// The recorded scope changes.
+    #[cfg(test)]
+    pub(crate) fn changes_for_test(&self) -> &[(u32, NsRef)] {
+        &self.changes
+    }
+}
+
+/// A prefix's bit in a 64-bit filter of the prefixes an element declares: two
+/// prefixes may share a bit, a prefix whose bit is clear is not among them.
+#[inline]
+pub(crate) fn prefix_bit(prefix: NameId) -> u64 {
+    1 << (prefix.0 & 63)
+}
+
+/// The bindings in scope from a chain head, in walk order (see
+/// [`NamespaceScopes`]): each prefix's binding in force comes before any other
+/// node of that prefix, and some of those others are not visited at all.
+pub(crate) struct ScopeWalk<'d, 'a> {
+    pages: &'d NamespacePageFactory<'a>,
+    scopes: &'d NamespaceScopes,
+    cursor: NsRef,
+}
+
+impl<'d, 'a> ScopeWalk<'d, 'a> {
+    pub(crate) fn new(
+        pages: &'d NamespacePageFactory<'a>,
+        scopes: &'d NamespaceScopes,
+        head: NsRef,
+    ) -> Self {
+        Self {
+            pages,
+            scopes,
+            cursor: head,
+        }
+    }
+}
+
+impl Iterator for ScopeWalk<'_, '_> {
+    type Item = (NsRef, NamespaceNode);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.cursor.is_null() {
+            return None;
+        }
+        let at = self.cursor;
+        let node = self.pages.get(at);
+        self.cursor = self.scopes.walk_next(at);
+        Some((at, node))
     }
 }
 
@@ -341,6 +564,29 @@ mod tests {
         let factory = NamespacePageFactory::new(&arena);
         let items: Vec<_> = factory.iter_chain(NsRef::NULL).collect();
         assert!(items.is_empty());
+    }
+
+    /// One entry per change, the last one at a node winning, none for a
+    /// "change" to the chain already in scope.
+    #[test]
+    fn scope_changes_coalesce() {
+        let mut scopes = NamespaceScopes::default();
+        assert!(scopes.scope_at(0).is_null());
+        scopes.set_scope(5, NsRef(1));
+        scopes.set_scope(9, NsRef::NULL);
+        // An element that starts where another one ended.
+        scopes.set_scope(9, NsRef(2));
+        // Back to the chain already in scope.
+        scopes.set_scope(12, NsRef(2));
+        assert_eq!(scopes.changes, [(5, NsRef(1)), (9, NsRef(2))]);
+        assert!(scopes.scope_at(4).is_null());
+        assert_eq!(scopes.scope_at(5), NsRef(1));
+        assert_eq!(scopes.scope_at(8), NsRef(1));
+        assert_eq!(scopes.scope_at(9), NsRef(2));
+        assert_eq!(scopes.scope_at(1000), NsRef(2));
+        scopes.set_scope(20, NsRef(1));
+        scopes.set_scope(20, NsRef(2));
+        assert_eq!(scopes.changes.len(), 2);
     }
 
     #[test]

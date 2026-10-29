@@ -179,6 +179,7 @@ Kept off the main node array because their access patterns differ:
 | Table | When | Purpose |
 | --- | --- | --- |
 | `NamespacePageFactory` | always | In-scope namespace chains (namespace axis has different semantics) |
+| `NamespaceScopes` | always | Which chain is in scope at each node, and how to walk it (below) |
 | `ElementIndex` | `Full` only | Fast `//name` lookup |
 | `NodeSourceSpans` | `Full` + tracking enabled | Line/column for error reporting |
 | id index (`id_elements`) | `Full` only | `xs:ID` → element node, for `fn:id` and `find_element_by_id`: an element whose typed value is a single `xs:ID` (simple type or simple content), the owner of an ID-typed attribute, or a node a host registered (`register_xml_id`) |
@@ -186,6 +187,33 @@ Kept off the main node array because their access patterns differ:
 
 The shared `NameTable` (from `src/namespace/`) and a per-document
 `QNameTable` / `StringStore` carry the actual string data.
+
+**Namespace scope.** An element that declares namespaces owns a chain: its own
+declarations, last first, followed by the chain in scope at its parent, so one
+chain holds every binding in scope there, each prefix's binding in force first.
+`NamespaceScopes` answers the two questions a reader of the chain asks — the
+namespace axis, `fn:in-scope-prefixes`, the validation drivers' namespace
+context, the serializer's declarations, the typed value of an `xs:QName` — in
+time that does not grow with the element's depth:
+
+- *Which chain is in scope at a node.* The builder adds nodes in document
+  order, and the chain in scope changes only where a declaring element starts
+  and right after it ends. Those changes are recorded in node order (8 bytes
+  each, two at most per declaring element), and a binary search finds the one
+  in force at any node, attributes and text included.
+- *Where a walk of the bindings goes next.* One link per namespace node (4
+  bytes): its `next`, except at an element's last own declaration, where the
+  walk skips the leading run of the parent's bindings whose prefixes the
+  element declares itself — hidden there and below. So an element that
+  declares the default namespace again, as some generators do on every
+  element, does not make the walk revisit every ancestor's declaration. A
+  skipped node always has a prefix the walk has already met, so the bindings
+  read, and their order, are those of the full chain.
+
+A document without declarations has no scope entries; the bench catalogue
+(16 MB, no declarations) gains nothing per node. Each declaration costs 16 bytes
+in all (12 in the chain, 4 for the walk) and each declaring element up to 16
+more.
 
 ---
 

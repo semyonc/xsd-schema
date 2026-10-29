@@ -9,6 +9,7 @@ use bumpalo::Bump;
 use crate::namespace::NameTable;
 use crate::schema::SchemaSet;
 
+use super::namespace::{NamespaceScopes, ScopeWalk};
 use super::{
     BindingRemapTable, BufferDocumentOptions, DocumentKind, ElementIndex, NamespacePageFactory,
     Node, NodePages, NodeSourceSpans, NodeType, NsRef, QNameTable, StringStore, NULL,
@@ -269,6 +270,9 @@ pub struct BufferDocument<'a> {
     pub(crate) namespace_pages: NamespacePageFactory<'a>,
     pub(crate) xml_namespace: NsRef,
     pub(crate) element_namespaces: HashMap<u32, NsRef>,
+    /// Which namespace chain is in scope at each node, and how to walk it
+    /// (see [`NamespaceScopes`]); maintained by the builder.
+    pub(crate) ns_scopes: NamespaceScopes,
     pub(crate) element_index: ElementIndex,
     pub(crate) source_spans: NodeSourceSpans,
     /// The id index: every element that answers to an id value — through an
@@ -302,6 +306,24 @@ impl<'a> BufferDocument<'a> {
     /// typed build), if it had one.
     pub fn xml_declaration(&self) -> Option<&crate::xml::XmlDeclaration> {
         self.xml_declaration.as_ref()
+    }
+
+    // ── Namespace scope ────────────────────────────────────────────────
+
+    /// The head of the namespace chain in scope at `node` — the chain of the
+    /// nearest element at or above it that declares namespaces — or
+    /// [`NsRef::NULL`] when none does. Takes the same time at any depth.
+    #[inline]
+    pub(crate) fn namespace_scope(&self, node: u32) -> NsRef {
+        self.ns_scopes.scope_at(node)
+    }
+
+    /// The bindings of the chain at `head`, in walk order: each prefix's
+    /// binding in force before any other node of that prefix, which the walk
+    /// may leave out. Readers keep the first node of each prefix.
+    #[inline]
+    pub(crate) fn scope_walk(&self, head: NsRef) -> ScopeWalk<'_, 'a> {
+        ScopeWalk::new(&self.namespace_pages, &self.ns_scopes, head)
     }
 
     // ── Accessors ──────────────────────────────────────────────────────
@@ -705,6 +727,18 @@ impl<'a> BufferDocument<'a> {
     /// though the static base URI in the XPath context is set to the
     /// schema document URI.
     pub(crate) fn set_cta_fragment(&mut self, elem_ref: u32, base_uri: Option<&'a str>) {
+        // The namespace scope of a node is that of the nearest declaring
+        // element above it in the tree as built (`namespace_scope`). Cutting
+        // `elem_ref` loose keeps that answer only if nothing above it declares
+        // a namespace — true for the one caller, whose element is a child of
+        // the document node.
+        debug_assert!(
+            {
+                let parent = self.nodes.get(elem_ref).parent;
+                parent == NULL || self.namespace_scope(parent).is_null()
+            },
+            "the new root is in the scope of a declaration above it"
+        );
         self.kind = DocumentKind::Fragment;
         self.root = elem_ref;
         self.nodes.update(elem_ref, |n| n.parent = NULL);
@@ -770,6 +804,7 @@ mod tests {
             namespace_pages: NamespacePageFactory::new(arena),
             xml_namespace: NsRef::NULL,
             element_namespaces: HashMap::new(),
+            ns_scopes: NamespaceScopes::default(),
             element_index: ElementIndex::new(),
             source_spans: NodeSourceSpans::new(),
             id_elements: HashMap::new(),

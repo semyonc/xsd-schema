@@ -13,7 +13,7 @@ pub mod builder;
 pub mod copy;
 pub mod element_index;
 pub mod error;
-pub mod namespace;
+pub(crate) mod namespace;
 pub mod navigator;
 pub mod node;
 pub mod page;
@@ -29,10 +29,7 @@ pub use builder::BufferDocumentBuilder;
 pub use copy::{Annotations, CopyError, CopyNamespaces, CopyOptions, CopySource, NamespaceFixup};
 pub use element_index::ElementIndex;
 pub use error::BufferDocumentError;
-pub use namespace::{
-    NamespaceChain, NamespaceNode, NamespacePageFactory, NsRef, NS_PAGE_MASK, NS_PAGE_SHIFT,
-    NS_PAGE_SIZE,
-};
+pub(crate) use namespace::{NamespaceNode, NamespacePageFactory, NsRef};
 pub use navigator::BufferDocNavigator;
 pub use node::{
     node_ref_from, page_of, slot_of, Node, NodeType, NULL, PAGE_MASK, PAGE_SHIFT, PAGE_SIZE,

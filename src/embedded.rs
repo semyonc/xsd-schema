@@ -14,7 +14,12 @@
 pub const XML_XSD: &[u8] = include_bytes!("../assets/xml.xsd");
 
 /// Embedded xlink.xsd schema defining XLink attributes (xlink:type, xlink:href, etc.).
-/// Source: <http://www.w3.org/XML/2008/06/xlink.xsd>
+///
+/// The XLink 1.1 schema document, as served at
+/// <http://www.w3.org/XML/2008/06/xlink.xsd>, unmodified (its CRLF line ends
+/// included). It is a W3C document under the W3C Software and Document License
+/// (2023); see `assets/NOTICE.md` and `assets/W3C-SOFTWARE-DOC-LICENSE-2023.txt`
+/// in the package.
 pub const XLINK_XSD: &[u8] = include_bytes!("../assets/xlink.xsd");
 
 /// Well-known namespace URI for the xml: prefix

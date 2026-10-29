@@ -30,6 +30,7 @@ use super::buffer::{
     IdSlot,
 };
 use super::error::BufferDocumentError;
+use super::namespace::{prefix_bit, NamespaceScopes};
 use super::{
     BindingRemapTable, BufferDocumentOptions, DocumentKind, ElementIndex, NamespaceNode,
     NamespacePageFactory, Node, NodePages, NodeSchemaBinding, NodeSourceSpans, NodeType, NsRef,
@@ -152,6 +153,9 @@ impl<'a> BufferDocumentBuilder<'a> {
         root_node.next_sibling = NULL;
         nodes.set(root_ref, root_node);
 
+        let mut ns_scopes = NamespaceScopes::default();
+        ns_scopes.allocated(xml_ns_ref, NsRef::NULL);
+
         let doc = BufferDocument {
             arena,
             serial: next_document_serial(),
@@ -167,6 +171,7 @@ impl<'a> BufferDocumentBuilder<'a> {
             namespace_pages,
             xml_namespace: xml_ns_ref,
             element_namespaces: HashMap::new(),
+            ns_scopes,
             element_index: ElementIndex::new(),
             source_spans: NodeSourceSpans::new(),
             id_elements: HashMap::new(),
@@ -231,10 +236,15 @@ impl<'a> BufferDocumentBuilder<'a> {
 
         // Save previous namespace head
         let prev_namespace = self.current_namespace;
+        // The namespace node this element's first declaration gets, if any,
+        // and a filter of the prefixes it declares.
+        let first_declaration = NsRef(self.doc.namespace_pages.len());
+        let mut own_prefixes = 0u64;
 
         // Process namespace declarations
         for &(ns_prefix, ns_uri_decl) in ns_declarations {
-            self.handle_namespace_decl(ns_prefix, ns_uri_decl)?;
+            let prefix = self.handle_namespace_decl(ns_prefix, ns_uri_decl)?;
+            own_prefixes |= prefix_bit(prefix);
         }
 
         // Intern names
@@ -305,6 +315,13 @@ impl<'a> BufferDocumentBuilder<'a> {
             self.doc
                 .element_namespaces
                 .insert(elem_ref, self.current_namespace);
+            self.doc.ns_scopes.declared(
+                &self.doc.namespace_pages,
+                elem_ref,
+                prev_namespace,
+                self.current_namespace,
+                Some((first_declaration, own_prefixes)),
+            );
         }
 
         // Push element state, descend
@@ -492,9 +509,7 @@ impl<'a> BufferDocumentBuilder<'a> {
         let names = self.doc.names;
         let uri_id = names.get(uri)?;
         let mut seen: Vec<NameId> = Vec::new();
-        let mut ns_ref = self.current_namespace;
-        while !ns_ref.is_null() {
-            let ns = self.doc.namespace_pages.get(ns_ref);
+        for (_, ns) in self.doc.scope_walk(self.current_namespace) {
             let prefix = names.resolve_ref(ns.prefix);
             if !prefix.is_empty() && !seen.contains(&ns.prefix) {
                 if ns.namespace_uri == uri_id {
@@ -502,7 +517,6 @@ impl<'a> BufferDocumentBuilder<'a> {
                 }
                 seen.push(ns.prefix);
             }
-            ns_ref = ns.next;
         }
         None
     }
@@ -515,14 +529,11 @@ impl<'a> BufferDocumentBuilder<'a> {
             return Some(XML_NAMESPACE);
         }
         let names = self.doc.names;
-        let mut ns_ref = self.current_namespace;
-        while !ns_ref.is_null() {
-            let ns = self.doc.namespace_pages.get(ns_ref);
+        for (_, ns) in self.doc.scope_walk(self.current_namespace) {
             if names.resolve_ref(ns.prefix) == prefix {
                 let uri = names.resolve_ref(ns.namespace_uri);
                 return (!uri.is_empty()).then_some(uri);
             }
-            ns_ref = ns.next;
         }
         None
     }
@@ -531,14 +542,11 @@ impl<'a> BufferDocumentBuilder<'a> {
     /// when there is none (or it is undeclared).
     pub(crate) fn default_namespace_in_scope(&self) -> Option<&'a str> {
         let names = self.doc.names;
-        let mut ns_ref = self.current_namespace;
-        while !ns_ref.is_null() {
-            let ns = self.doc.namespace_pages.get(ns_ref);
+        for (_, ns) in self.doc.scope_walk(self.current_namespace) {
             if names.resolve_ref(ns.prefix).is_empty() {
                 let uri = names.resolve_ref(ns.namespace_uri);
                 return (!uri.is_empty()).then_some(uri);
             }
-            ns_ref = ns.next;
         }
         None
     }
@@ -552,15 +560,9 @@ impl<'a> BufferDocumentBuilder<'a> {
         let Some(prefix_id) = self.doc.names.get(prefix) else {
             return false;
         };
-        let mut ns_ref = self.current_namespace;
-        while !ns_ref.is_null() {
-            let ns = self.doc.namespace_pages.get(ns_ref);
-            if ns.prefix == prefix_id {
-                return true;
-            }
-            ns_ref = ns.next;
-        }
-        false
+        self.doc
+            .scope_walk(self.current_namespace)
+            .any(|(_, ns)| ns.prefix == prefix_id)
     }
 
     /// The value of the attribute node `attr_ref`.
@@ -653,6 +655,8 @@ impl<'a> BufferDocumentBuilder<'a> {
         if elem_node.has_flag(Node::HAS_NMSP_DECLS) {
             if let Some((_elem_ref, prev_ns)) = self.namespace_stack.pop() {
                 self.current_namespace = prev_ns;
+                // Whatever comes next is in the parent's scope again.
+                self.doc.ns_scopes.set_scope(self.doc.nodes.len(), prev_ns);
             }
         }
 
@@ -983,9 +987,7 @@ impl<'a> BufferDocumentBuilder<'a> {
     /// implicit `xml` binding is not included: it needs no declaration.
     pub(crate) fn in_scope_bindings(&self) -> Vec<(String, String)> {
         let mut bindings: Vec<(String, String)> = Vec::new();
-        let mut ns_ref = self.current_namespace;
-        while !ns_ref.is_null() {
-            let ns_node = self.doc.namespace_pages.get(ns_ref);
+        for (_, ns_node) in self.doc.scope_walk(self.current_namespace) {
             let prefix = self.doc.names.resolve_ref(ns_node.prefix);
             if !bindings.iter().any(|(p, _)| p == prefix) {
                 bindings.push((
@@ -996,7 +998,6 @@ impl<'a> BufferDocumentBuilder<'a> {
                         .to_string(),
                 ));
             }
-            ns_ref = ns_node.next;
         }
         bindings
     }
@@ -1023,7 +1024,7 @@ impl<'a> BufferDocumentBuilder<'a> {
         let elem_ref = self.parent;
         let previously_declared = self.doc.nodes.get(elem_ref).has_flag(Node::HAS_NMSP_DECLS);
         let prev_namespace = self.current_namespace;
-        self.handle_namespace_decl(prefix, uri)?;
+        let _ = self.handle_namespace_decl(prefix, uri)?;
         if !previously_declared {
             // First declaration on this element: it now owns a scope, which
             // `end_element` has to restore.
@@ -1035,6 +1036,19 @@ impl<'a> BufferDocumentBuilder<'a> {
         self.doc
             .element_namespaces
             .insert(elem_ref, self.current_namespace);
+        // The chain in scope at the parent, which the element's own
+        // declarations run into.
+        let outer = match self.namespace_stack.last() {
+            Some(&(owner, outer)) if owner == elem_ref => outer,
+            _ => prev_namespace,
+        };
+        self.doc.ns_scopes.declared(
+            &self.doc.namespace_pages,
+            elem_ref,
+            outer,
+            self.current_namespace,
+            None,
+        );
         Ok(())
     }
 
@@ -1507,12 +1521,13 @@ impl<'a> BufferDocumentBuilder<'a> {
         Ok(node_ref)
     }
 
-    /// Allocates a namespace node and chains it to `current_namespace`.
+    /// Allocates a namespace node and chains it to `current_namespace`;
+    /// returns the declared prefix.
     fn handle_namespace_decl(
         &mut self,
         prefix: &str,
         uri: &str,
-    ) -> Result<(), BufferDocumentError> {
+    ) -> Result<NameId, BufferDocumentError> {
         let prefix_id = self.doc.names.add(prefix);
         let uri_id = self.doc.names.add(uri);
 
@@ -1525,9 +1540,10 @@ impl<'a> BufferDocumentBuilder<'a> {
             ns_ref,
             NamespaceNode::new(prefix_id, uri_id, self.current_namespace),
         );
+        self.doc.ns_scopes.allocated(ns_ref, self.current_namespace);
         self.current_namespace = ns_ref;
 
-        Ok(())
+        Ok(prefix_id)
     }
 
     // ── quick-xml adapter ─────────────────────────────────────────────
@@ -2037,8 +2053,7 @@ fn typed_is_idrefs(
 /// QNames) can fail where validation accepted it, and a later `xs:ID` /
 /// `xs:IDREF` member win.
 struct InScope<'d, 'a> {
-    names: &'a NameTable,
-    pages: &'d super::NamespacePageFactory<'a>,
+    doc: &'d BufferDocument<'a>,
     /// The chain of the nearest element at or above the node that declares
     /// namespaces.
     head: NsRef,
@@ -2047,22 +2062,9 @@ struct InScope<'d, 'a> {
 impl<'d, 'a> InScope<'d, 'a> {
     /// The bindings in scope at `node` (an attribute's are its element's).
     fn at(doc: &'d BufferDocument<'a>, node: u32) -> Self {
-        let mut head = NsRef::NULL;
-        let mut cursor = node;
-        while cursor != NULL {
-            let n = doc.nodes.get(cursor);
-            if n.node_type() == NodeType::Element && n.has_flag(Node::HAS_NMSP_DECLS) {
-                if let Some(&found) = doc.element_namespaces.get(&cursor) {
-                    head = found;
-                    break;
-                }
-            }
-            cursor = n.parent;
-        }
         Self {
-            names: doc.names,
-            pages: &doc.namespace_pages,
-            head,
+            doc,
+            head: doc.namespace_scope(node),
         }
     }
 
@@ -2071,21 +2073,19 @@ impl<'d, 'a> InScope<'d, 'a> {
     /// one). The `xml` prefix is always bound.
     fn binding(&self, prefix: Option<&str>) -> Option<Option<NameId>> {
         let target = prefix.unwrap_or("");
+        let names = self.doc.names;
         if target == "xml" {
-            return Some(Some(self.names.add(XML_NAMESPACE)));
+            return Some(Some(names.add(XML_NAMESPACE)));
         }
-        let mut ns_ref = self.head;
-        while !ns_ref.is_null() {
-            let ns = self.pages.get(ns_ref);
-            if self.names.resolve_ref(ns.prefix) == target {
-                let bound = !self.names.resolve_ref(ns.namespace_uri).is_empty();
+        for (_, ns) in self.doc.scope_walk(self.head) {
+            if names.resolve_ref(ns.prefix) == target {
+                let bound = !names.resolve_ref(ns.namespace_uri).is_empty();
                 return if target.is_empty() {
                     Some(bound.then_some(ns.namespace_uri))
                 } else {
                     bound.then_some(Some(ns.namespace_uri))
                 };
             }
-            ns_ref = ns.next;
         }
         target.is_empty().then_some(None)
     }
@@ -2446,6 +2446,85 @@ mod tests {
         assert!(doc.nodes.get(1).has_flag(Node::HAS_NMSP_DECLS));
         // Inner element at index 2
         assert!(doc.nodes.get(2).has_flag(Node::HAS_NMSP_DECLS));
+    }
+
+    /// The scope table records where the chain in scope changes: at an
+    /// element that declares, and right after it ends; nothing for a
+    /// document that declares nothing.
+    #[test]
+    fn namespace_scope_changes_at_declaring_elements() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let plain = BufferDocument::from_reader_default(
+            b"<a><b><c/></b><d/></a>".as_slice(),
+            &arena,
+            &names,
+        )
+        .unwrap();
+        assert!(plain.ns_scopes.changes_for_test().is_empty());
+        for node in 0..plain.nodes.len() {
+            assert!(plain.namespace_scope(node).is_null());
+        }
+
+        // a=1, b=2, c=3 (declares), x=4 (attribute pair 4, 5), e=6, d=7.
+        let doc = BufferDocument::from_reader_default(
+            br#"<a><b><c xmlns:p="urn:p" x="1"><e/></c></b><d/></a>"#.as_slice(),
+            &arena,
+            &names,
+        )
+        .unwrap();
+        let c_head = doc.element_namespaces[&3];
+        assert_eq!(
+            doc.ns_scopes.changes_for_test(),
+            &[(3, c_head), (7, NsRef::NULL)],
+            "the scope of c from c on, nothing again from d on"
+        );
+        let scopes: Vec<bool> = (0..8).map(|n| doc.namespace_scope(n) == c_head).collect();
+        assert_eq!(
+            scopes,
+            [false, false, false, true, true, true, true, false],
+            "c, its attribute (name and value node) and its child e are in c's scope"
+        );
+    }
+
+    /// An element that declares again a prefix its ancestors declared makes
+    /// the walk of its scope skip their declarations of it: the walk from the
+    /// innermost element visits three nodes however deep the chain — its own
+    /// default namespace, then the outermost element's two declarations (the
+    /// skip passes over leading runs only; a reader drops the hidden default
+    /// namespace, whose prefix it has met).
+    #[test]
+    fn scope_walk_skips_hidden_redeclarations() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let mut text = String::from(r#"<e xmlns="urn:d" xmlns:p="urn:p">"#);
+        for _ in 0..100 {
+            text.push_str(r#"<e xmlns="urn:d">"#);
+        }
+        for _ in 0..101 {
+            text.push_str("</e>");
+        }
+        let doc = BufferDocument::from_reader_default(text.as_bytes(), &arena, &names).unwrap();
+        let innermost = doc.element_namespaces[&101];
+        let walked: Vec<(String, String)> = doc
+            .scope_walk(innermost)
+            .map(|(_, ns)| {
+                (
+                    names.resolve_ref(ns.prefix).to_string(),
+                    names.resolve_ref(ns.namespace_uri).to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            walked,
+            [
+                (String::new(), "urn:d".to_string()),
+                ("p".to_string(), "urn:p".to_string()),
+                (String::new(), "urn:d".to_string()),
+            ]
+        );
+        // The chain itself still holds every declaration, for the local axis.
+        assert_eq!(doc.namespace_pages.iter_chain(innermost).count(), 102);
     }
 
     #[test]

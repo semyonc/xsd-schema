@@ -292,6 +292,11 @@ fn truncated(err: &DriveError) -> bool {
   `itemType`, `memberTypes` or type alternative naming it is `src-resolve`,
   and `get_built_in_type_by_qname` no longer finds it in a 1.1 set. A host
   reaches it with `SchemaSet::xpath_type(XmlTypeCode::UntypedAtomic)`.
+- `xsd_schema::document::{NamespaceNode, NamespacePageFactory, NamespaceChain,
+  NsRef}` and the `NS_PAGE_*` constants are no longer public: no public API
+  produced or accepted them. Read a document's namespace bindings through the
+  navigator's namespace axis (`DomNavigator::move_to_first_namespace` /
+  `move_to_next_namespace`) instead.
 
 ```rust,ignore
 // 0.2.x
