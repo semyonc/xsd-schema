@@ -27,7 +27,7 @@ use crate::regex_convert::lenient_ms_preprocess;
 use crate::regex_convert::rewrite_xsd10_category_escapes;
 use crate::regex_convert::validate_xml_pattern_syntax;
 #[cfg(not(feature = "xsd11"))]
-use crate::regex_convert::{convert_xml_pattern, ConvertOptions};
+use crate::regex_convert::{convert_xml_pattern, try_convert_xml_pattern, ConvertOptions};
 use crate::schema::model::{RegexCompat, XsdVersion};
 #[cfg(not(feature = "xsd11"))]
 use regex::Regex;
@@ -240,9 +240,9 @@ impl PatternFacet {
     ///
     /// `xsd_version` controls the `\p{X}` category escape semantics: under
     /// `V1_0` recognized general-category names are expanded to Unicode 3.0
-    /// ranges; `V1_1` passes them through to the backend unchanged, and (with
-    /// the `xsd11` feature) a block escape with an unrecognized block name
-    /// denotes every character (XSD 1.1 Part 2 §G.4.2.4).
+    /// ranges; `V1_1` passes them through to the backend unchanged, and a
+    /// block escape with an unrecognized block name denotes every character
+    /// (XSD 1.1 Part 2 §G.4.2.4).
     ///
     /// `regex_compat` controls grammar leniency: `Strict` enforces XSD
     /// Part 2 §F/§G; `LenientMs` first applies [`lenient_ms_preprocess`]
@@ -296,7 +296,12 @@ impl PatternFacet {
                 XsdVersion::V1_0 => ConvertOptions::xsd_v1_0(),
                 XsdVersion::V1_1 => ConvertOptions::xsd(),
             };
-            let rust_pattern = convert_xml_pattern(&effective, opts);
+            let rust_pattern = try_convert_xml_pattern(&effective, opts).map_err(|message| {
+                FacetError::InvalidPattern {
+                    pattern: self.value.clone(),
+                    message,
+                }
+            })?;
             let compiled = Regex::new(&rust_pattern).map_err(|e| FacetError::InvalidPattern {
                 pattern: self.value.clone(),
                 message: e.to_string(),
@@ -2949,7 +2954,6 @@ mod tests {
         assert!(!pattern.matches("abc"));
     }
 
-    #[cfg(feature = "xsd11")]
     fn facet(value: &str, version: XsdVersion, compat: RegexCompat) -> FacetResult<PatternFacet> {
         PatternFacet::new(value.to_string(), None, version, compat)
     }
@@ -3013,8 +3017,8 @@ mod tests {
     /// "\p{IsX}" and "\P{IsX}" each denote the set of all characters." IsBlock
     /// is `'Is' [a-zA-Z0-9#x2D]+`; a name outside it is still an error, and
     /// XSD 1.0, which lists "the recognized block names", keeps every unknown
-    /// block an error.
-    #[cfg(feature = "xsd11")]
+    /// block an error. Both builds: `regexml` with the `xsd11` feature, the
+    /// translation for the `regex` crate without it.
     #[test]
     fn test_unknown_block_names_denote_every_character_in_xsd11() {
         let v11 = |value: &str| facet(value, XsdVersion::V1_1, RegexCompat::Strict);

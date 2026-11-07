@@ -12,6 +12,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - XSD 1.1 (`xsd11`): the XPath tests of `xs:assert`, the `assertion` facet and
   `xs:alternative` are compiled once per schema set instead of at every evaluation.
 
+### Fixed
+
+- Without the `xsd11` feature, block escapes (`\p{IsBasicLatin}`,
+  `\P{IsLatin-1Supplement}`, `[\p{IsGreek}0-9]`, …) are written out as the
+  code-point ranges of the block, standalone and inside character classes,
+  from the block table of the `xsd11` build (Unicode 15.1, plus the Unicode 3.1
+  names `Greek`, `CombiningMarksforSymbols` and `PrivateUse`). The `regex`
+  crate knows no block names: a schema using one failed to load ("Unicode
+  property not found"), and a block named like a script (`IsGreek`, `IsArabic`,
+  `IsCyrillic`, …) matched the script instead. An unrecognized block name
+  denotes every character under XSD 1.1 (Part 2 §G.4.2.4), as with the
+  `xsd11` feature, and is an error that names it under XSD 1.0.
+- Without the `xsd11` feature, a character class subtraction (`[a-z-[aeiou]]`,
+  `[^a-z-[0-9]]`) subtracts; the `regex` crate read it as a union, so `a` and
+  `-` matched `[a-z-[aeiou]]`.
+
 ## [0.3.0] - 2026-10-29
 
 Conformance against 0.2.3: the W3C XSD 1.0 suite passes 39,461 of 39,510 tests

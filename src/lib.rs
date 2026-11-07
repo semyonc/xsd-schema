@@ -191,6 +191,7 @@ pub mod builder;
 
 // Regex pattern conversion (shared between XSD and XPath)
 pub mod regex_convert;
+pub(crate) mod regex_xsd_blocks;
 pub(crate) mod regex_xsd_unicode;
 
 /// Resolution of XML general references (`&amp;`, `&#65;`) from the event stream.
