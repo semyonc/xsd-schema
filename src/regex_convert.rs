@@ -14,6 +14,7 @@
 //! the MS `msData/regex/reJ*` conformance tests were authored against. See
 //! `regex_xsd_unicode` for the motivation.
 
+use crate::regex_xsd_blocks::{block_ranges, push_ranges_body};
 use crate::regex_xsd_unicode::{
     expand_xsd_category_body, xsd10_non_digit_neg_body, xsd10_non_word_char_body,
     xsd10_private_use_block_body, xsd10_word_char_body,
@@ -172,17 +173,64 @@ fn strip_inline_comments(pattern: &str) -> String {
 /// - `\c` -> `[A-Za-z0-9._:\-]` (XML name character)
 /// - `\C` -> `[^A-Za-z0-9._:\-]` (not name character)
 ///
+/// Block escapes `\p{IsX}` / `\P{IsX}` are written out as the code-point
+/// ranges of block `X`, which the `regex` crate cannot name, and a character
+/// class subtraction `[G-[C]]` as the `regex` set difference `[G--[C]]`.
 /// Under `XsdVersion::V1_0`, category escapes `\p{X}` and `\P{X}` for
-/// recognized general-category names are expanded to Unicode-3.0 ranges;
-/// block escapes `\p{Is...}` and unknown names are passed through.
+/// recognized general-category names are expanded to Unicode-3.0 ranges.
+/// Under `XsdVersion::V1_1` a block escape whose name is an IsBlock name
+/// (`'Is' [a-zA-Z0-9-]+`) but no recognized block denotes every character
+/// (XSD 1.1 Part 2 §G.4.2.4). Other unknown names, an unrecognized block
+/// name under `V1_0` included, are passed through verbatim for the regex
+/// engine to judge.
 ///
 /// # Arguments
 /// - `pattern`: The XSD/XPath regex pattern
 /// - `options`: Conversion options (anchoring, XSD version)
 ///
 /// # Returns
-/// A regex pattern string compatible with both the `regex` crate and `regexml`.
+/// A pattern in the syntax of the `regex` crate.
 pub fn convert_xml_pattern(pattern: &str, options: ConvertOptions) -> String {
+    convert(pattern, options).0
+}
+
+/// [`convert_xml_pattern`], with two kinds of mistake reported as errors
+/// rather than passed through. A block escape whose block name is not
+/// recognized under XSD 1.0, which lists the recognized block names
+/// (Appendix F), or that is no IsBlock name (`'Is' [a-zA-Z0-9-]+`) at all;
+/// under XSD 1.1 an unrecognized IsBlock name denotes every character
+/// (§G.4.2.4), as in [`convert_xml_pattern`]. And a
+/// character class that the class translation would otherwise turn into a
+/// valid `regex` class: an empty one (`[]`, `[^]`) or a subtraction with
+/// nothing before its `-` (`[-[a]]`); a character group holds at least one
+/// member in both versions of the grammar.
+// The pattern facets of the build without `xsd11` use it; that build alone
+// runs patterns on the `regex` crate.
+#[cfg_attr(feature = "xsd11", allow(dead_code))]
+pub(crate) fn try_convert_xml_pattern(
+    pattern: &str,
+    options: ConvertOptions,
+) -> Result<String, String> {
+    match convert(pattern, options) {
+        (converted, None) => Ok(converted),
+        (_, Some(error)) => Err(error),
+    }
+}
+
+/// A character class of the pattern being converted that is still open.
+struct OpenClass {
+    /// Where its `[` is in the output.
+    start: usize,
+    /// Where its first member is (or will be) in the output, after `[` or `[^`.
+    content_start: usize,
+    /// Whether it is a negative character group (`[^…]`).
+    negated: bool,
+}
+
+/// [`convert_xml_pattern`], also returning the first mistake
+/// [`try_convert_xml_pattern`] reports (the converted text carries it as
+/// written).
+fn convert(pattern: &str, options: ConvertOptions) -> (String, Option<String>) {
     let extra_capacity = if options.anchor { 4 } else { 0 };
     // Under V1_0, `\d` / `\D` / `\w` / `\W` and `\p{X}` expand to multi-KB
     // explicit ranges; over-allocate to avoid repeated reallocations
@@ -197,9 +245,13 @@ pub fn convert_xml_pattern(pattern: &str, options: ConvertOptions) -> String {
         result.push('^');
     }
 
-    let mut in_class = false;
+    let mut error = None;
+    // The character classes open at this point, innermost last: the
+    // subtrahend of a class subtraction is a class inside the class.
+    let mut classes: Vec<OpenClass> = Vec::new();
     let mut chars = pattern.chars().peekable();
     while let Some(ch) = chars.next() {
+        let in_class = !classes.is_empty();
         if ch == '\\' {
             let Some(&next) = chars.peek() else {
                 result.push('\\');
@@ -247,12 +299,13 @@ pub fn convert_xml_pattern(pattern: &str, options: ConvertOptions) -> String {
                 'p' | 'P' => {
                     let negated = next == 'P';
                     chars.next();
-                    handle_category_escape(
+                    convert_property_escape(
                         &mut result,
                         &mut chars,
                         negated,
                         in_class,
-                        options.xsd_version == XsdVersion::V1_0,
+                        options.xsd_version,
+                        &mut error,
                     );
                 }
                 // Other escapes - pass through
@@ -262,12 +315,26 @@ pub fn convert_xml_pattern(pattern: &str, options: ConvertOptions) -> String {
                     chars.next();
                 }
             }
-        } else {
-            if ch == '[' {
-                in_class = true;
-            } else if ch == ']' {
-                in_class = false;
+        } else if ch == '[' {
+            let negated = chars.next_if_eq(&'^').is_some();
+            let start = result.len();
+            result.push_str(if negated { "[^" } else { "[" });
+            classes.push(OpenClass {
+                start,
+                content_start: result.len(),
+                negated,
+            });
+        } else if ch == ']' {
+            if classes
+                .pop()
+                .is_some_and(|open| result.len() == open.content_start)
+            {
+                error.get_or_insert_with(|| "empty character class".to_string());
             }
+            result.push(']');
+        } else if ch == '-' && in_class {
+            push_class_hyphen(&mut result, &mut classes, &chars, &mut error);
+        } else {
             result.push(ch);
         }
     }
@@ -275,7 +342,52 @@ pub fn convert_xml_pattern(pattern: &str, options: ConvertOptions) -> String {
     if options.anchor {
         result.push('$');
     }
-    result
+    (result, error)
+}
+
+/// Convert a `-` inside a character class.
+///
+/// XSD 1.1 §G.4.2 \[76\]: "A '-' character is recognized as a subtraction
+/// operator (and hence, as terminating the posCharGroup or negCharGroup) if
+/// it is immediately followed by a '[' character." The `regex` crate reads
+/// `[G-[C]]` as the union of `G`, `-` and `C`; its set difference is
+/// `[G--[C]]`. In `[^G--[C]]` the `^` would negate the difference, while XSD
+/// subtracts `C` from the negative group, so `[^G-[C]]` becomes
+/// `[[^G]--[C]]`. A literal hyphen just before the operator (`[a--[b]]`, `a`
+/// and `-` minus `b`) is escaped, since `regex` reads `---` otherwise. Any
+/// other hyphen is copied. A `-[` with no member before it is an `error`
+/// (the group before a subtraction is not empty, and a `[` is no member);
+/// its hyphen is copied.
+fn push_class_hyphen(
+    out: &mut String,
+    classes: &mut [OpenClass],
+    rest: &std::iter::Peekable<std::str::Chars<'_>>,
+    error: &mut Option<String>,
+) {
+    let mut ahead = rest.clone();
+    match (ahead.next(), ahead.next()) {
+        (Some('['), _)
+            if classes
+                .last()
+                .is_some_and(|open| out.len() == open.content_start) =>
+        {
+            error.get_or_insert_with(|| {
+                "a character class subtraction needs a character group before its '-'".to_string()
+            });
+            out.push('-');
+        }
+        (Some('['), _) => {
+            if let Some(open) = classes.last_mut().filter(|open| open.negated) {
+                out.insert(open.start, '[');
+                out.push(']');
+                // The class is now the positive wrapper `[[^G]--[C]]`.
+                open.negated = false;
+            }
+            out.push_str("--");
+        }
+        (Some('-'), Some('[')) => out.push_str(r"\-"),
+        _ => out.push('-'),
+    }
 }
 
 /// Rewrite XSD 1.0 general-category escapes `\p{X}` / `\P{X}` to explicit
@@ -630,28 +742,121 @@ fn handle_category_escape(
     try_expand: bool,
 ) {
     let marker = if negated { 'P' } else { 'p' };
-    if chars.peek() != Some(&'{') {
+    let Some((name, closed)) = read_property_name(chars) else {
         out.push('\\');
         out.push(marker);
         return;
-    }
-    chars.next();
-    let mut name = String::new();
-    let mut closed = false;
-    for c in chars.by_ref() {
-        if c == '}' {
-            closed = true;
-            break;
-        }
-        name.push(c);
-    }
+    };
     if try_expand && closed && try_expand_category(out, &name, negated, in_class) {
         return;
     }
+    push_verbatim_property(out, marker, &name, closed);
+}
+
+/// [`handle_category_escape`] for [`convert_xml_pattern`]: a block escape
+/// `\p{IsX}` / `\P{IsX}` becomes the ranges of block `X` (see
+/// [`push_block`]) under both XSD versions, since the `regex` crate knows no
+/// block names. An unrecognized block name denotes every character under
+/// XSD 1.1, as the `xsd11` build has it; under XSD 1.0, or when the name is
+/// not an IsBlock name at all, the escape is copied verbatim and reported in
+/// `error` (unless an earlier mistake is). Category escapes are handled as
+/// in [`handle_category_escape`], expanded under XSD 1.0 only.
+fn convert_property_escape(
+    out: &mut String,
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    negated: bool,
+    in_class: bool,
+    xsd_version: XsdVersion,
+    error: &mut Option<String>,
+) {
+    let marker = if negated { 'P' } else { 'p' };
+    let Some((name, closed)) = read_property_name(chars) else {
+        out.push('\\');
+        out.push(marker);
+        return;
+    };
+    if closed {
+        if let Some(block) = name.strip_prefix("Is").filter(|block| !block.is_empty()) {
+            if let Some(ranges) = block_ranges(block, xsd_version) {
+                push_block(out, ranges, negated, in_class);
+                return;
+            }
+            let is_block_name = block.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+            if xsd_version == XsdVersion::V1_1 && is_block_name {
+                // XSD 1.1 §G.4.2.4: "If a string "IsX" matches the
+                // non-terminal IsBlock but X is not a recognized block name,
+                // then the expressions "\p{IsX}" and "\P{IsX}" each denote
+                // the set of all characters."
+                push_block(out, &[(0, 0x10FFFF)], false, in_class);
+                return;
+            }
+            error.get_or_insert_with(|| {
+                if is_block_name {
+                    format!(
+                        "\\{marker}{{{name}}}: \"{block}\" is not a recognized Unicode block name"
+                    )
+                } else {
+                    format!(
+                        "\\{marker}{{{name}}}: \"{block}\" is not a block name \
+                         ('Is' followed by ASCII letters, digits and hyphens)"
+                    )
+                }
+            });
+        } else if xsd_version == XsdVersion::V1_0
+            && try_expand_category(out, &name, negated, in_class)
+        {
+            return;
+        }
+    }
+    push_verbatim_property(out, marker, &name, closed);
+}
+
+/// Write the block escape with the code-point ranges `ranges` out as a
+/// class: `[ranges]` or `[^ranges]`; inside a class the bare ranges, or a
+/// nested `[^ranges]` for `\P{IsX}`, which the `regex` crate unions into the
+/// enclosing class. A block of surrogates holds no character a string can
+/// have, so its `\p{IsX}` is written as the complement of every character
+/// and its `\P{IsX}` as every character.
+fn push_block(out: &mut String, ranges: &[(u32, u32)], negated: bool, in_class: bool) {
+    let mut body = String::new();
+    let negated = if push_ranges_body(&mut body, ranges) {
+        negated
+    } else {
+        push_ranges_body(&mut body, &[(0, 0x10FFFF)]);
+        !negated
+    };
+    if in_class && !negated {
+        out.push_str(&body);
+        return;
+    }
+    out.push_str(if negated { "[^" } else { "[" });
+    out.push_str(&body);
+    out.push(']');
+}
+
+/// Read the `{name}` of a `\p{…}` / `\P{…}` escape, the `\` and `p`/`P`
+/// consumed. `None` if no `{` follows; otherwise the name and whether its
+/// closing `}` was found.
+fn read_property_name(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> Option<(String, bool)> {
+    chars.next_if_eq(&'{')?;
+    let mut name = String::new();
+    for c in chars.by_ref() {
+        if c == '}' {
+            return Some((name, true));
+        }
+        name.push(c);
+    }
+    Some((name, false))
+}
+
+/// Copy a `\p{name}` / `\P{name}` escape as written.
+fn push_verbatim_property(out: &mut String, marker: char, name: &str, closed: bool) {
     out.push('\\');
     out.push(marker);
     out.push('{');
-    out.push_str(&name);
+    out.push_str(name);
     if closed {
         out.push('}');
     }
@@ -764,11 +969,265 @@ mod tests {
         assert!(!regex.is_match("123"));
     }
 
+    /// Convert an XSD pattern under both versions and compile it with the
+    /// `regex` crate, as the pattern facets of the build without `xsd11` do.
+    fn both_versions(pattern: &str) -> [Regex; 2] {
+        [ConvertOptions::xsd_v1_0(), ConvertOptions::xsd()].map(|options| {
+            let converted = try_convert_xml_pattern(pattern, options)
+                .unwrap_or_else(|e| panic!("{pattern}: {e}"));
+            Regex::new(&converted).unwrap_or_else(|e| panic!("{pattern}: {e}"))
+        })
+    }
+
     #[test]
-    fn test_v1_0_passes_through_block_escape() {
-        let result = convert_xml_pattern(r"\p{IsBasicLatin}*", ConvertOptions::xsd_v1_0());
-        // Block escapes are not expanded — left for the regex engine.
-        assert!(result.contains(r"\p{IsBasicLatin}"));
+    fn test_block_escape() {
+        for regex in both_versions(r"\p{IsBasicLatin}+") {
+            assert!(regex.is_match("abc ~\u{0}\u{7F}"));
+            assert!(!regex.is_match("abcé"));
+            assert!(!regex.is_match(""));
+        }
+        // FatturaPA's string types.
+        for regex in both_versions(r"[\p{IsBasicLatin}\p{IsLatin-1Supplement}]{1,10}") {
+            assert!(regex.is_match("Società"));
+            assert!(!regex.is_match("Società€"));
+            assert!(!regex.is_match("01234567890"));
+        }
+        // Names are taken as written: no case folding, hyphen kept.
+        for regex in both_versions(r"\p{IsLatinExtended-A}") {
+            assert!(regex.is_match("\u{100}") && regex.is_match("\u{17F}"));
+            assert!(!regex.is_match("\u{FF}") && !regex.is_match("\u{180}"));
+        }
+        // The Unicode 3.1 names superseded since.
+        for regex in both_versions(r"\p{IsGreek}\p{IsCombiningMarksforSymbols}") {
+            assert!(regex.is_match("α\u{20D0}"));
+            assert!(!regex.is_match("a\u{20D0}"));
+        }
+        // A block, not the script of the same name, which the `regex` crate
+        // would take `IsGreek` for: Coptic letters are in the Greek block,
+        // Greek Extended is not.
+        for regex in both_versions(r"\p{IsGreek}") {
+            assert!(regex.is_match("\u{3E2}"));
+            assert!(!regex.is_match("\u{1F00}"));
+        }
+    }
+
+    #[test]
+    fn test_negated_block_escape() {
+        for regex in both_versions(r"\P{IsBasicLatin}+") {
+            assert!(regex.is_match("éß€\u{10000}"));
+            assert!(!regex.is_match("éa"));
+        }
+    }
+
+    #[test]
+    fn test_block_escape_in_class() {
+        for regex in both_versions(r"[\p{IsGreek}0-9]+") {
+            assert!(regex.is_match("αβ12"));
+            assert!(!regex.is_match("αb"));
+        }
+        // A negated block inside a class, and a negative group of a block.
+        for regex in both_versions(r"[\P{IsBasicLatin}x]+") {
+            assert!(regex.is_match("éxß"));
+            assert!(!regex.is_match("éy"));
+        }
+        for regex in both_versions(r"[^\p{IsBasicLatin}]+") {
+            assert!(regex.is_match("éß"));
+            assert!(!regex.is_match("éa"));
+        }
+        for regex in both_versions(r"[^\P{IsBasicLatin}]+") {
+            assert!(regex.is_match("ab"));
+            assert!(!regex.is_match("aé"));
+        }
+    }
+
+    #[test]
+    fn test_block_escape_with_subtraction() {
+        for regex in both_versions(r"[\p{IsBasicLatin}-[a-z]]+") {
+            assert!(regex.is_match("ABC 123"));
+            assert!(!regex.is_match("ABc"));
+            assert!(!regex.is_match("ABÉ"));
+        }
+        for regex in both_versions(r"[\P{IsBasicLatin}-[é]]+") {
+            assert!(regex.is_match("àü"));
+            assert!(!regex.is_match("àé"));
+            assert!(!regex.is_match("àa"));
+        }
+        for regex in both_versions(r"[a-z-[\p{IsBasicLatin}]]") {
+            assert!(!regex.is_match("a"));
+        }
+    }
+
+    /// `[G-[C]]` is a subtraction, which the `regex` crate reads as a union
+    /// unless written `[G--[C]]`.
+    #[test]
+    fn test_class_subtraction() {
+        for regex in both_versions(r"[a-z-[aeiou]]+") {
+            assert!(regex.is_match("xyz"));
+            assert!(!regex.is_match("xa"));
+            assert!(!regex.is_match("x-"));
+        }
+        // From a negative group: (not a-z) minus the digits.
+        for regex in both_versions(r"[^a-z-[0-9]]+") {
+            assert!(regex.is_match("AB_"));
+            assert!(!regex.is_match("Ab"));
+            assert!(!regex.is_match("A1"));
+        }
+        // Nested: a-z minus (b-y minus c).
+        for regex in both_versions(r"[a-z-[b-y-[c]]]+") {
+            assert!(regex.is_match("acz"));
+            assert!(!regex.is_match("ab"));
+        }
+        // A literal hyphen before the operator: a and - minus b.
+        for regex in both_versions(r"[a--[b]]+") {
+            assert!(regex.is_match("a-a"));
+            assert!(!regex.is_match("ab"));
+        }
+        // Hyphens that are not the operator are untouched.
+        for regex in both_versions(r"[-a-c\-]+") {
+            assert!(regex.is_match("-abc-"));
+            assert!(!regex.is_match("d"));
+        }
+    }
+
+    /// A class the translation would turn into a valid `regex` class, but
+    /// which no XSD grammar derives, is an error: a character group has at
+    /// least one member, so neither an empty class nor a subtraction with
+    /// nothing before its `-` is a class. (`regex` reads `[]a]` as `]` and
+    /// `a`, and `[-[a]]` as a union.)
+    #[test]
+    fn test_malformed_classes_are_errors() {
+        let empty = "empty character class";
+        let subtraction = "a character class subtraction needs a character group before its '-'";
+        for options in [ConvertOptions::xsd_v1_0(), ConvertOptions::xsd()] {
+            for (pattern, error) in [
+                // W3C msData/regex RegexTest_448..451, expected invalid.
+                (r"[ab\-\[cd-[-[]]]]", subtraction),
+                (r"[-[a]]", subtraction),
+                (r"[^-[a]]", subtraction),
+                ("[]", empty),
+                ("[^]", empty),
+                ("[a-[]]", empty),
+            ] {
+                assert_eq!(
+                    try_convert_xml_pattern(pattern, options),
+                    Err(error.to_string()),
+                    "{pattern}"
+                );
+            }
+        }
+        // Leading and trailing hyphens are members.
+        for regex in both_versions(r"[-a]+[a-]+[^-]") {
+            assert!(regex.is_match("-a-ab"));
+            assert!(!regex.is_match("-a-a-"));
+        }
+    }
+
+    /// The surrogate blocks hold no character a string can have.
+    #[test]
+    fn test_surrogate_block_escape() {
+        for regex in both_versions(r"a\p{IsHighSurrogates}?") {
+            assert!(regex.is_match("a"));
+            assert!(!regex.is_match("a\u{D7FF}"));
+        }
+        for regex in both_versions(r"[a\p{IsLowSurrogates}]") {
+            assert!(regex.is_match("a") && !regex.is_match("b"));
+        }
+        for regex in both_versions(r"\P{IsHighPrivateUseSurrogates}") {
+            assert!(regex.is_match("a") && regex.is_match("\u{10FFFF}"));
+        }
+        for regex in both_versions(r"[^\P{IsLowSurrogates}]?") {
+            assert!(regex.is_match("") && !regex.is_match("a"));
+        }
+    }
+
+    /// `IsPrivateUse` is the BMP area under XSD 1.0 and adds the planes 15 and
+    /// 16 areas under XSD 1.1, as in the `xsd11` build.
+    #[test]
+    fn test_private_use_block() {
+        let [v10, v11] = both_versions(r"\p{IsPrivateUse}");
+        for regex in [&v10, &v11] {
+            assert!(regex.is_match("\u{E000}") && regex.is_match("\u{F8FF}"));
+            assert!(!regex.is_match("a"));
+        }
+        assert!(!v10.is_match("\u{F0000}") && !v10.is_match("\u{10FFFD}"));
+        assert!(v11.is_match("\u{F0000}") && v11.is_match("\u{10FFFD}"));
+    }
+
+    /// Under XSD 1.0 an unrecognized block name is rejected, never matched
+    /// silently: Appendix F lists the recognized names.
+    #[test]
+    fn test_unknown_block_name_is_an_error_in_xsd10() {
+        let options = ConvertOptions::xsd_v1_0();
+        for (pattern, escape, name) in [
+            (r"\p{IsNoSuchBlock}", r"\p{IsNoSuchBlock}", "NoSuchBlock"),
+            (r"a[\P{Isbasiclatin}]", r"\P{Isbasiclatin}", "basiclatin"),
+            (
+                r"\p{IsBasicLatin}\p{IsLatin1Supplement}",
+                r"\p{IsLatin1Supplement}",
+                "Latin1Supplement",
+            ),
+        ] {
+            let error = try_convert_xml_pattern(pattern, options).unwrap_err();
+            assert_eq!(
+                error,
+                format!("{escape}: \"{name}\" is not a recognized Unicode block name")
+            );
+            // Passed through by the infallible form, so the engine refuses it too.
+            assert!(
+                Regex::new(&convert_xml_pattern(pattern, options)).is_err(),
+                "{pattern}"
+            );
+        }
+        // A property of the `regex` crate, which reads `\p{IsAlphabetic}` as
+        // `\p{Alphabetic}`, but no block.
+        assert_eq!(
+            try_convert_xml_pattern(r"\p{IsAlphabetic}", options).unwrap_err(),
+            r#"\p{IsAlphabetic}: "Alphabetic" is not a recognized Unicode block name"#
+        );
+    }
+
+    /// XSD 1.1 §G.4.2.4: an unrecognized IsBlock name denotes every
+    /// character, for `\p` and `\P` alike, as in the `xsd11` build; a name
+    /// that is no IsBlock name (`'Is' [a-zA-Z0-9-]+`) stays an error.
+    #[test]
+    fn test_unknown_block_name_is_every_character_in_xsd11() {
+        let options = ConvertOptions::xsd();
+        let compile = |pattern: &str| {
+            let converted = try_convert_xml_pattern(pattern, options)
+                .unwrap_or_else(|e| panic!("{pattern}: {e}"));
+            Regex::new(&converted).unwrap_or_else(|e| panic!("{pattern}: {e}"))
+        };
+        for pattern in [
+            r"\p{IsNoSuchBlock}",
+            r"\P{IsNoSuchBlock}",
+            r"[\p{IsNo-Such-9}]",
+            r"[\P{Isbasiclatin}]",
+            r"\p{IsAlphabetic}",
+        ] {
+            let regex = compile(pattern);
+            for input in ["a", "\u{10FFFF}", "\n", "\u{D7FF}", "\u{E000}"] {
+                assert!(regex.is_match(input), "{pattern} on {input:?}");
+            }
+            assert!(!regex.is_match("ab"), "{pattern}");
+        }
+        // The complement of every character is no character.
+        let regex = compile(r"[^\P{IsNoSuchBlock}]?");
+        assert!(regex.is_match("") && !regex.is_match("a"));
+        // Known and unknown blocks together.
+        let regex = compile(r"\p{IsFooBar}+[\P{IsBazQux}\p{IsBasicLatin}]\p{IsGreek}");
+        assert!(regex.is_match("xyzα") && !regex.is_match("xyzq"));
+        for (pattern, escape, name) in [
+            (r"\p{IsNo_Such}", r"\p{IsNo_Such}", "No_Such"),
+            (r"[\P{IsNo Such}]", r"\P{IsNo Such}", "No Such"),
+        ] {
+            assert_eq!(
+                try_convert_xml_pattern(pattern, options).unwrap_err(),
+                format!(
+                    "{escape}: \"{name}\" is not a block name \
+                     ('Is' followed by ASCII letters, digits and hyphens)"
+                )
+            );
+        }
     }
 
     #[test]
@@ -809,10 +1268,13 @@ mod tests {
         assert!(!result.contains(r"\p{"));
     }
 
+    /// The rewrite for `regexml`, which knows the blocks, leaves them alone.
     #[test]
     fn test_rewrite_xsd10_passes_block_escapes() {
         let result = rewrite_xsd10_category_escapes(r"\p{IsBasicLatin}+");
         assert_eq!(result, r"\p{IsBasicLatin}+");
+        let result = rewrite_xsd10_category_escapes(r"[\P{IsGreek}a-z-[aeiou]]");
+        assert_eq!(result, r"[\P{IsGreek}a-z-[aeiou]]");
     }
 
     #[test]
