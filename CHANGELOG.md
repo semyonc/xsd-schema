@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+
+- XSD 1.1 (`xsd11`): the XPath tests of `xs:assert`, the `assertion` facet and
+  `xs:alternative` are compiled once per schema set instead of at every evaluation.
+
 ## [0.3.0] - 2026-10-29
 
 Conformance against 0.2.3: the W3C XSD 1.0 suite passes 39,461 of 39,510 tests

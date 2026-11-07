@@ -17,9 +17,7 @@ use crate::ids::{ElementKey, NameId, TypeKey};
 use crate::namespace::context::NamespaceContextSnapshot;
 use crate::parser::frames::AlternativeResult;
 use crate::schema::SchemaSet;
-use crate::xpath::api::XPathExpr;
 use crate::xpath::functions::effective_boolean_value;
-use crate::xpath::XPathContext;
 
 // ---------------------------------------------------------------------------
 // resolve_alternative_default_ns — xpathDefaultNamespace cascade
@@ -165,46 +163,28 @@ pub(crate) fn evaluate_type_alternatives(
         .map(|s| &*arena.alloc_str(s));
     doc.set_cta_fragment(elem_ref, fragment_base_uri);
 
-    // Evaluate each alternative
-    for alt in alternatives {
-        if let Some(ref test_expr) = alt.test {
-            // Build XPath context with the alternative's namespace snapshot.
-            // The schema-time check (`schema::validate_cta_xpath`) refused any
-            // test naming a user-defined component (only the built-in ones
-            // are in its static context, Structures §3.12.6, §3.13.6.2); the
-            // schema set serves the evaluation (type annotations of nodes).
-            let ctx = XPathContext::new(&schema_set.name_table)
-                .with_namespaces(alt.ns_snapshot.clone())
-                .with_schema_set(schema_set);
-
-            // §3.12.4: the static base URI of the CTA XPath context is
-            // the URI of the schema document containing the
-            // `xs:alternative` element. This lets `fn:static-base-uri()`
-            // identify the schema document rather than the instance.
-            let ctx = if let Some(schema_uri) = alt
-                .source
-                .as_ref()
-                .and_then(|s| schema_set.documents.get(s.doc_id as usize))
-                .map(|d| d.base_uri.as_str())
-                .filter(|u| !u.is_empty())
-            {
-                ctx.with_base_uri(schema_uri.to_string())
-            } else {
-                ctx
+    // Evaluate each alternative, compiled once per schema set
+    // (`CompiledXPathCache`).
+    let alternatives = schema_set
+        .arenas
+        .compiled_xpath()
+        .alternatives(elem_key, schema_set);
+    for alt in alternatives.iter() {
+        if let Some(compiled) = &alt.test {
+            // The XPath context of the alternative: its namespace snapshot,
+            // the xpathDefaultNamespace cascade's result, and (§3.12.4) the
+            // URI of the schema document containing the `xs:alternative` as
+            // the static base URI, so `fn:static-base-uri()` identifies the
+            // schema document rather than the instance. The schema-time check
+            // (`schema::validate_cta_xpath`) refused any test naming a
+            // user-defined component (only the built-in ones are in its
+            // static context, Structures §3.12.6, §3.13.6.2); the schema set
+            // serves the evaluation (type annotations of nodes).
+            let ctx = compiled.context(schema_set);
+            let Ok(expr) = &compiled.expr else {
+                continue;
             };
-
-            let ctx = if let Some(default_ns) =
-                resolve_alternative_default_ns(alt, elem_key, schema_set)
-            {
-                ctx.with_default_element_ns(default_ns)
-            } else {
-                ctx
-            };
-
-            let expr = match XPathExpr::compile(test_expr, &ctx) {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
+            let test_expr = &compiled.test;
 
             let nav = BufferDocNavigator::new(&doc, elem_ref);
             let warnings = std::cell::RefCell::new(Vec::new());

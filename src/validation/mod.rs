@@ -28,6 +28,8 @@ pub mod alternatives;
 #[cfg(feature = "xsd11")]
 pub mod assertions;
 pub mod asttree;
+#[cfg(feature = "xsd11")]
+pub(crate) mod compiled_xpath;
 pub mod content;
 pub mod context;
 pub mod errors;

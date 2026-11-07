@@ -325,7 +325,13 @@ fn converted_decimal_conforms(
     // value to them: annotated with the type.
     let mut typed = result.clone();
     typed.schema_type = Some(key);
-    crate::validation::simple::evaluate_assertion_facets(&typed, &value_facets, schema_set).is_ok()
+    crate::validation::simple::evaluate_assertion_facets(
+        &typed,
+        &value_facets,
+        crate::validation::compiled_xpath::AssertionFacetsOwner::Simple(key),
+        schema_set,
+    )
+    .is_ok()
 }
 
 /// F&O §17.5: "If SV is an instance of xs:string or xs:untypedAtomic".

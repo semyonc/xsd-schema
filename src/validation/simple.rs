@@ -17,6 +17,8 @@ use crate::types::XmlTypeCode;
 use rust_decimal::Decimal;
 
 use super::errors::{self, ValidationError};
+#[cfg(feature = "xsd11")]
+use crate::validation::compiled_xpath::AssertionFacetsOwner;
 
 /// Result of simple type validation
 #[derive(Debug)]
@@ -1331,6 +1333,13 @@ fn validate_simple_type_inner(
                 if !sc.facets.is_empty() {
                     let lex = result.normalized_value.as_deref().unwrap_or(value);
                     check_simple_content_facets(lex, &result.typed_value, &sc.facets, schema_set)?;
+                    #[cfg(feature = "xsd11")]
+                    evaluate_assertion_facets(
+                        &result.typed_value,
+                        &sc.facets,
+                        AssertionFacetsOwner::SimpleContent(ck),
+                        schema_set,
+                    )?;
                 }
             }
             Ok(result)
@@ -1508,9 +1517,9 @@ pub(crate) fn schema_normalized(
 /// are checked as a simple type's are: an atomic value by its datatype's
 /// validator (bounds and enumeration in its order and equality, digits,
 /// patterns on the lexical form), a list value by its items, a union value by
-/// the member type that validated it, and the XSD 1.1 assertions on the
-/// value. A value without a datatype (`xs:anySimpleType` content) is checked
-/// as a string.
+/// the member type that validated it. A value without a datatype
+/// (`xs:anySimpleType` content) is checked as a string. The XSD 1.1
+/// assertions on the value are evaluated by the caller, after these checks.
 fn check_simple_content_facets(
     lex: &str,
     typed: &XmlValue,
@@ -1577,8 +1586,6 @@ fn check_simple_content_facets(
         },
         _ => facets.validate_string(lex).map_err(facet_error)?,
     }
-    #[cfg(feature = "xsd11")]
-    evaluate_assertion_facets(typed, facets, schema_set)?;
     Ok(())
 }
 
@@ -1859,7 +1866,7 @@ fn validate_atomic_type(
             }
             // XSD 1.1: evaluate assertion facets
             #[cfg(feature = "xsd11")]
-            evaluate_assertion_facets(&val, &facets, schema_set)?;
+            evaluate_assertion_facets(&val, &facets, AssertionFacetsOwner::Simple(sk), schema_set)?;
             Ok(SimpleTypeResult {
                 typed_value: val,
                 member_type: None,
@@ -1917,7 +1924,12 @@ fn validate_resolved_qname(
     };
     let typed_value = XmlValue::with_schema_type(type_code, sk, XmlValueKind::Atomic(atom));
     #[cfg(feature = "xsd11")]
-    evaluate_assertion_facets(&typed_value, facets, schema_set)?;
+    evaluate_assertion_facets(
+        &typed_value,
+        facets,
+        AssertionFacetsOwner::Simple(sk),
+        schema_set,
+    )?;
     Ok(Some(SimpleTypeResult {
         typed_value,
         member_type: None,
@@ -2067,7 +2079,12 @@ fn validate_list_type(
 
     // XSD 1.1: evaluate assertion facets ($value is the sequence of list items)
     #[cfg(feature = "xsd11")]
-    evaluate_assertion_facets(&typed_value, &facets, schema_set)?;
+    evaluate_assertion_facets(
+        &typed_value,
+        &facets,
+        AssertionFacetsOwner::Simple(sk),
+        schema_set,
+    )?;
 
     Ok(SimpleTypeResult {
         typed_value,
@@ -2435,7 +2452,12 @@ fn union_member_result(
 
     // XSD 1.1: evaluate assertion facets ($value is the member-validated value)
     #[cfg(feature = "xsd11")]
-    evaluate_assertion_facets(&inner, &facets, schema_set)?;
+    evaluate_assertion_facets(
+        &inner,
+        &facets,
+        AssertionFacetsOwner::Simple(sk),
+        schema_set,
+    )?;
 
     Ok(SimpleTypeResult {
         normalized_value: result.normalized_value,
@@ -2487,60 +2509,44 @@ pub(crate) fn resolve_assertion_default_ns(
 pub(crate) fn evaluate_assertion_facets(
     typed_value: &XmlValue,
     facets: &FacetSet,
+    owner: AssertionFacetsOwner,
     schema_set: &SchemaSet,
 ) -> Result<(), ValidationError> {
-    use crate::xpath::api::XPathExpr;
     use crate::xpath::functions::effective_boolean_value;
-    use crate::xpath::{RoXmlNavigator, XPathContext};
+    use crate::xpath::RoXmlNavigator;
 
     if facets.assertions.is_empty() {
         return Ok(());
     }
 
-    for assertion in &facets.assertions {
-        if assertion.test.is_empty() {
-            continue;
-        }
+    // Compiled once per schema set (`CompiledXPathCache`), keyed by `owner`,
+    // whose facets `facets` are.
+    let assertions = schema_set
+        .arenas
+        .compiled_xpath()
+        .assertion_facets(owner, facets, schema_set);
 
-        // Resolve assertion source location for error reporting
-        let location = assertion
-            .source
-            .as_ref()
-            .and_then(|s| schema_set.source_maps.locate(s));
+    for assertion in assertions.iter() {
+        // Source location of the facet, for error reporting.
+        let location = assertion.location.clone();
 
         // Static context: the schema-time check
         // (`schema::validate_assertion_xpath`) refused every user-defined name
         // in the built-ins-only context of XPath Valid; the schema set serves
         // the evaluation, and `without_schema_casts` stays as a second guard.
-        let ctx = XPathContext::new(&schema_set.name_table)
-            .with_namespaces(assertion.ns_snapshot.clone())
-            .with_schema_set(schema_set)
-            .without_schema_casts();
-
-        // Set default element namespace from xpathDefaultNamespace cascade
-        let ctx = if let Some(default_ns) = resolve_assertion_default_ns(
-            assertion.xpath_default_namespace.as_deref(),
-            assertion.source.as_ref(),
-            &assertion.ns_snapshot,
-            schema_set,
-        ) {
-            ctx.with_default_element_ns(default_ns)
-        } else {
-            ctx
-        };
-
-        // Compile the XPath expression with $value declared
-        let expr =
-            XPathExpr::compile_with_vars(&assertion.test, &ctx, &["value"]).map_err(|e| {
-                errors::error(
-                    "cvc-assertion",
-                    format!(
-                        "Failed to compile assertion test '{}': {}",
-                        assertion.test, e
-                    ),
-                    location.clone(),
-                )
-            })?;
+        // The default element namespace is the xpathDefaultNamespace
+        // cascade's, and `$value` is declared.
+        let ctx = assertion.context(schema_set);
+        let expr = assertion.expr.as_ref().map_err(|e| {
+            errors::error(
+                "cvc-assertion",
+                format!(
+                    "Failed to compile assertion test '{}': {}",
+                    assertion.test, e
+                ),
+                location.clone(),
+            )
+        })?;
 
         // Convert typed value to XPathValue: a list gives its members, each
         // with the type that validated it.
