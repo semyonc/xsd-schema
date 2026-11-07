@@ -477,6 +477,13 @@ pub struct ArenasGuard {
     /// (QName / NOTATION types), built on first use from the effective facets
     /// and invalidated with them by [`entries_mut`](Self::entries_mut).
     enumeration_index_cache: RwLock<SecondaryMap<SimpleTypeKey, Arc<EnumerationIndex>>>,
+    /// XSD 1.1: the `xs:assert`, `assertion` facet and `xs:alternative` tests
+    /// (Structures §3.13.4.1, §3.12.4), each compiled on first use and kept,
+    /// so evaluation per element or value no longer parses and binds the
+    /// expression. Invalidated with the caches above by
+    /// [`entries_mut`](Self::entries_mut).
+    #[cfg(feature = "xsd11")]
+    compiled_xpath: crate::validation::compiled_xpath::CompiledXPathCache,
 }
 
 impl ArenasGuard {
@@ -494,6 +501,8 @@ impl ArenasGuard {
         // `&mut self` already guarantees exclusivity, so `get_mut` needs no lock.
         self.effective_facets_cache.get_mut().unwrap().clear();
         self.enumeration_index_cache.get_mut().unwrap().clear();
+        #[cfg(feature = "xsd11")]
+        self.compiled_xpath.clear();
         &mut self.inner
     }
 
@@ -574,6 +583,14 @@ impl ArenasGuard {
             .unwrap()
             .insert(sk, Arc::clone(&built));
         built
+    }
+
+    /// XSD 1.1: the compiled XPath tests of the schema set's assertions and
+    /// type alternatives, filled on demand and wiped by
+    /// [`entries_mut`](Self::entries_mut).
+    #[cfg(feature = "xsd11")]
+    pub(crate) fn compiled_xpath(&self) -> &crate::validation::compiled_xpath::CompiledXPathCache {
+        &self.compiled_xpath
     }
 
     /// Compute the effective (base-chain-merged) facet set for one simple type.

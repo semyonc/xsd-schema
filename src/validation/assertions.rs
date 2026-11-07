@@ -18,9 +18,7 @@ use crate::parser::location::SourceLocation;
 use crate::schema::SchemaSet;
 use crate::validation::errors::{self, ValidationError};
 use crate::validation::simple::validate_simple_type_in;
-use crate::xpath::api::XPathExpr;
 use crate::xpath::functions::{effective_boolean_value, XPathValue};
-use crate::xpath::XPathContext;
 
 use crate::arenas::SchemaArenas;
 
@@ -229,7 +227,11 @@ pub(crate) fn evaluate_complex_type_assertions(
     ct_key: ComplexTypeKey,
     schema_set: &SchemaSet,
 ) -> Vec<ValidationError> {
-    let assertions = collect_inherited_assertions(ct_key, &schema_set.arenas);
+    // Compiled once per schema set (`CompiledXPathCache`), base first.
+    let assertions = schema_set
+        .arenas
+        .compiled_xpath()
+        .complex_type_assertions(ct_key, schema_set);
     let mut errors = Vec::new();
 
     // §3.13.4.1 clause 2.3 ties `$value` to E's governing type
@@ -237,11 +239,7 @@ pub(crate) fn evaluate_complex_type_assertions(
     // inherited assertions. Compute once and clone per evaluation.
     let dollar_value = compute_dollar_value(doc, element_ref, ct_key, schema_set);
 
-    for (assertion, owner_key) in assertions {
-        if assertion.test.is_empty() {
-            continue;
-        }
-
+    for assertion in assertions.iter() {
         // The schema-time check (`schema::validate_assertion_xpath`) compiled
         // this test with only the built-in components in scope (Structures
         // §3.13.6.2 clause 2.2.5) and refused the schema for any user-defined
@@ -249,25 +247,12 @@ pub(crate) fn evaluate_complex_type_assertions(
         // answer questions about the instance's type annotations (a node of
         // a user type derived from `xs:integer` is an
         // `element(*, xs:integer)`); `without_schema_casts` is kept as a
-        // second guard. A test that still fails to compile here calls a
-        // function this engine lacks: `cvc-assertion` below.
-        let ctx = XPathContext::new(&schema_set.name_table)
-            .with_namespaces(assertion.ns_snapshot.clone())
-            .with_schema_set(schema_set)
-            .without_schema_casts();
-
-        // Apply xpathDefaultNamespace cascade
-        let ctx = if let Some(default_ns) =
-            resolve_ct_assertion_default_ns(assertion, owner_key, schema_set)
-        {
-            ctx.with_default_element_ns(default_ns)
-        } else {
-            ctx
-        };
-
-        // §3.13.4.1 clause 2.2: `$value` is in scope for every assertion.
-        // Declared unconditionally so XPath that references it compiles.
-        let expr = match XPathExpr::compile_with_vars(&assertion.test, &ctx, &["value"]) {
+        // second guard. The context carries the xpathDefaultNamespace
+        // cascade's result and declares `$value` (§3.13.4.1 clause 2.2).
+        // A test that still fails to compile calls a function this engine
+        // lacks: `cvc-assertion` below.
+        let ctx = assertion.context(schema_set);
+        let expr = match &assertion.expr {
             Ok(e) => e,
             Err(e) => {
                 errors.push(errors::error(
