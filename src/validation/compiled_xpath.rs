@@ -191,7 +191,9 @@ impl CompiledXPathTest {
     /// unchanged, so the entry still describes the test as it would be
     /// compiled now.
     fn is_current(&self, schema_set: &SchemaSet) -> bool {
-        self.documents.iter().all(|stamp| stamp.is_current(schema_set))
+        self.documents
+            .iter()
+            .all(|stamp| stamp.is_current(schema_set))
     }
 
     /// The static context the test was compiled in, rebuilt for an evaluation.
@@ -533,7 +535,10 @@ mod tests {
         let local = schema_set.name_table.add("doc");
         // The two alternatives' types (`xs:string`, then `xs:int`).
         let (string, int) = {
-            let alts = schema_set.arenas.compiled_xpath().alternatives(elem, &schema_set);
+            let alts = schema_set
+                .arenas
+                .compiled_xpath()
+                .alternatives(elem, &schema_set);
             (alts[0].resolved_type, alts[1].resolved_type)
         };
         assert!(string.is_some() && int.is_some() && string != int);
