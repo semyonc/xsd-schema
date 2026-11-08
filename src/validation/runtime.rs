@@ -49,7 +49,9 @@ use crate::types::complex::ProcessContents as TypesProcessContents;
 use super::assertions::{
     evaluate_complex_type_assertions, has_inherited_assertions, AssertionBufferFrame,
 };
-use super::expression_warnings::{self, ExpressionWarning};
+#[cfg(feature = "xsd11")]
+use super::expression_warnings;
+use super::expression_warnings::ExpressionWarning;
 #[cfg(feature = "xsd11")]
 use super::validator::AssertionSource;
 use super::validator::{ValidationSink, ValidationWarning};
@@ -519,14 +521,18 @@ pub struct ValidationRuntime<'a, S: ValidationSink> {
     pub(crate) flags: ValidationFlags,
     /// Sink for errors and warnings
     pub sink: S,
-    /// Stack of per-element validation states
-    validation_stack: Vec<ElementValidationState>,
+    /// Stack of per-element validation states. Boxed: the state is several
+    /// hundred bytes and travels pool → stack → completion → pool once per
+    /// element, so each hop moves a pointer instead of copying the struct.
+    #[allow(clippy::vec_box)] // the boxes are moved between vectors, not the vectors
+    validation_stack: Vec<Box<ElementValidationState>>,
     /// Free-list of `ElementValidationState` shells recycled on element close,
     /// so a child element reuses the retained collection capacity
     /// (`text_content`, `seen_attributes`, …) of a closed sibling/ancestor
     /// instead of allocating fresh. Depth-bounded by the element nesting depth;
     /// no cap needed. See `acquire_state` / the recycle in `validate_end_element`.
-    state_pool: Vec<ElementValidationState>,
+    #[allow(clippy::vec_box)] // boxed for the same reason as `validation_stack`
+    state_pool: Vec<Box<ElementValidationState>>,
     /// Current state machine state
     current_state: ValidatorState,
     /// Current source location (updated by caller)
@@ -668,6 +674,14 @@ pub struct ValidationRuntime<'a, S: ValidationSink> {
     /// any XSD 1.1 schema without an `inheritable="true"` attribute).
     #[cfg(feature = "xsd11")]
     has_inheritable_attributes: bool,
+    /// Whether the schema set has any XPath expression the validation of an
+    /// instance can evaluate: a complex type's `xs:assert`, an `xs:assertion`
+    /// facet, or an element's type alternatives
+    /// ([`schema_has_xpath_expressions`]). When `false`, no expression
+    /// warning can be noted, so [`collect_expression_warnings`](Self::collect_expression_warnings)
+    /// skips the collection around each value it validates.
+    #[cfg(feature = "xsd11")]
+    has_xpath_expressions: bool,
     /// The serial of the element whose start reported its `xsi:type` as
     /// resolving to no type (`cvc-elt.4.1`), so that its `xsi:type`
     /// attribute, invalid by XSD 1.1 §3.2.4.1 clause 5, is not reported a
@@ -675,6 +689,54 @@ pub struct ValidationRuntime<'a, S: ValidationSink> {
     xsi_type_unresolved_reported: Option<u64>,
     /// `!Send + !Sync` marker
     _not_thread_safe: PhantomData<*const ()>,
+}
+
+/// Facts about a schema set that the runtime reads to skip work no instance
+/// of it can need, computed once per [`SchemaValidator`](super::SchemaValidator)
+/// and copied into each run, so a run does not scan the arenas again.
+#[cfg(feature = "xsd11")]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PreparedSchemaFacts {
+    /// [`schema_has_inheritable_attributes`].
+    pub(crate) has_inheritable_attributes: bool,
+    /// [`schema_has_xpath_expressions`].
+    pub(crate) has_xpath_expressions: bool,
+}
+
+#[cfg(feature = "xsd11")]
+impl PreparedSchemaFacts {
+    pub(crate) fn of(schema_set: &SchemaSet) -> Self {
+        PreparedSchemaFacts {
+            has_inheritable_attributes: schema_has_inheritable_attributes(schema_set),
+            has_xpath_expressions: schema_has_xpath_expressions(schema_set),
+        }
+    }
+}
+
+/// Whether the schema set holds any XPath expression that validating an
+/// instance evaluates: the `xs:assert` of a complex type (own; an inherited
+/// one is some base type's own), an `xs:assertion` facet of a simple type or
+/// of a complex type's simple content, or an element declaration's type
+/// alternatives. These are the only sources of expression warnings
+/// (`expression_warnings::note` is reached only from
+/// `assertions::note_expression_warnings`, which only their evaluations call),
+/// so `false` guarantees that no value's validation notes one.
+#[cfg(feature = "xsd11")]
+fn schema_has_xpath_expressions(schema_set: &SchemaSet) -> bool {
+    let arenas = &schema_set.arenas;
+    arenas
+        .simple_types
+        .values()
+        .any(|st| !st.facets.assertions.is_empty())
+        || arenas.complex_types.values().any(|ct| {
+            !ct.assertions.is_empty()
+                || matches!(
+                    &ct.content,
+                    crate::parser::frames::ComplexContentResult::Simple(sc)
+                        if !sc.facets.assertions.is_empty()
+                )
+        })
+        || arenas.elements.values().any(|e| !e.alternatives.is_empty())
 }
 
 /// Whether the schema declares any attribute with `{inheritable}` = true
@@ -715,9 +777,9 @@ pub(crate) type ContentModelMap =
 /// state, plus (under XSD 1.1) the assertion outcome the value-returning
 /// end-element path folds into the `SchemaInfo`.
 #[cfg(feature = "xsd11")]
-type FinishedElement = (ElementValidationState, Option<AssertionOutcome>);
+type FinishedElement = (Box<ElementValidationState>, Option<AssertionOutcome>);
 #[cfg(not(feature = "xsd11"))]
-type FinishedElement = ElementValidationState;
+type FinishedElement = Box<ElementValidationState>;
 
 /// Scalar outcome of the element-start step (`start_element_by_id`), shared by
 /// the value-returning and value-free entry points. `Start` carries exactly
@@ -1134,14 +1196,13 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         flags: ValidationFlags,
         sink: S,
         #[cfg(feature = "xsd11")] assertion_source: AssertionSource,
+        #[cfg(feature = "xsd11")] facts: PreparedSchemaFacts,
     ) -> Self {
         let cached_xsd10_id_key = if schema_set.is_xsd10() {
             schema_set.builtin_types().get_by_type_code(XmlTypeCode::Id)
         } else {
             None
         };
-        #[cfg(feature = "xsd11")]
-        let has_inheritable_attributes = schema_has_inheritable_attributes(schema_set);
         ValidationRuntime {
             schema_set,
             subst_groups,
@@ -1193,7 +1254,9 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             cta_unlisted_attributes: Vec::new(),
             cached_xsd10_id_key,
             #[cfg(feature = "xsd11")]
-            has_inheritable_attributes,
+            has_inheritable_attributes: facts.has_inheritable_attributes,
+            #[cfg(feature = "xsd11")]
+            has_xpath_expressions: facts.has_xpath_expressions,
             xsi_type_unresolved_reported: None,
             _not_thread_safe: PhantomData,
         }
@@ -4448,7 +4511,11 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     /// outcome the value path folds into the `SchemaInfo`), or `None` if the
     /// call was out of sequence / the stack was empty (the caller then returns
     /// its own invalid sentinel, matching the previous inline behaviour).
-    fn finish_top_element(&mut self) -> Option<FinishedElement> {
+    ///
+    /// `keep_normalized`: whether the element's `[schema normalized value]`
+    /// is kept for its `SchemaInfo`. Only the value path reads it; the
+    /// verdict path passes `false` and skips copying each value for it.
+    fn finish_top_element(&mut self, keep_normalized: bool) -> Option<FinishedElement> {
         if self.operational_failure.is_some() {
             return None;
         }
@@ -4478,7 +4545,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         self.finish_content_model(&mut ev_state);
 
         // 2. Simple-content / text validation (typed value, fixed/default)
-        self.finish_simple_content(&mut ev_state);
+        self.finish_simple_content(&mut ev_state, keep_normalized);
 
         // 2c. Assertion evaluation (XSD 1.1)
         #[cfg(feature = "xsd11")]
@@ -4507,7 +4574,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
 
     /// Validate an element end event, returning the element's [`SchemaInfo`].
     pub fn validate_end_element(&mut self) -> SchemaInfo {
-        let finished = match self.finish_top_element() {
+        let finished = match self.finish_top_element(true) {
             Some(f) => f,
             None => return SchemaInfo::invalid(),
         };
@@ -4543,7 +4610,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     /// what the streaming driver hands its handler
     /// ([`EndElementInfo`](super::EndElementInfo)).
     pub(crate) fn validate_end_element_verdict(&mut self) -> (SchemaValidity, ValidationAttempted) {
-        let finished = match self.finish_top_element() {
+        let finished = match self.finish_top_element(false) {
             Some(f) => f,
             None => return (SchemaValidity::Invalid, ValidationAttempted::None),
         };
@@ -4754,7 +4821,11 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     /// run simple-type validation, perform the QName/NOTATION prefix-binding
     /// check, and verify any fixed value (cvc-elt.5.2.2). Also enforces the
     /// mixed-content fixed-value rules (cvc-elt.5.2.2.1 / 5.2.2.2.1).
-    fn finish_simple_content(&mut self, ev_state: &mut ElementValidationState) {
+    fn finish_simple_content(
+        &mut self,
+        ev_state: &mut ElementValidationState,
+        keep_normalized: bool,
+    ) {
         // Clause 5.1.1 for a governing type without simple content.
         self.check_default_for_complex_override(ev_state);
         // 2. For TextOnly: validate text content against simple type
@@ -4830,14 +4901,24 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     let names = &self.schema_set.name_table;
                     let resolver = qname_ctx.map(|ns| super::simple::snapshot_prefixes(ns, names));
                     let (outcome, raised) = self.collect_expression_warnings(|| {
-                        super::simple::validate_simple_type_in(
-                            &ev_state.text_content,
-                            schema_type,
-                            self.schema_set,
-                            resolver
-                                .as_ref()
-                                .map(|r| r as super::simple::PrefixResolver<'_>),
-                        )
+                        let resolver = resolver
+                            .as_ref()
+                            .map(|r| r as super::simple::PrefixResolver<'_>);
+                        if keep_normalized {
+                            super::simple::validate_simple_type_in(
+                                &ev_state.text_content,
+                                schema_type,
+                                self.schema_set,
+                                resolver,
+                            )
+                        } else {
+                            super::simple::validate_simple_type_in_without_normalized(
+                                &ev_state.text_content,
+                                schema_type,
+                                self.schema_set,
+                                resolver,
+                            )
+                        }
                     });
                     match outcome {
                         Ok(result) => {
@@ -4852,7 +4933,9 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                             // above under another type, else the attribute
                             // normalized for the declared type (as written for
                             // `xs:anySimpleType`, which normalizes nothing).
-                            ev_state.normalized_value = if overridden {
+                            ev_state.normalized_value = if !keep_normalized {
+                                None
+                            } else if overridden {
                                 Some(ev_state.text_content.clone())
                             } else if ev_state.is_default {
                                 result
@@ -5758,18 +5841,18 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         &mut self,
         local_name: NameId,
         namespace: Option<NameId>,
-    ) -> ElementValidationState {
+    ) -> Box<ElementValidationState> {
         match self.state_pool.pop() {
             Some(mut state) => {
                 state.reset(local_name, namespace);
                 state
             }
-            None => ElementValidationState::new(local_name, namespace),
+            None => Box::new(ElementValidationState::new(local_name, namespace)),
         }
     }
 
     /// Push a new element onto the validation stack and update the element path
-    fn push_element(&mut self, mut ev_state: ElementValidationState) {
+    fn push_element(&mut self, mut ev_state: Box<ElementValidationState>) {
         // Assign a unique serial for ID/IDREF owner-element binding (§3.17.5.2)
         ev_state.element_serial = self.next_element_serial;
         self.next_element_serial += 1;
@@ -6139,16 +6222,23 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         &self,
         validate: impl FnOnce() -> R,
     ) -> (R, Vec<ExpressionWarning>) {
-        if cfg!(feature = "xsd11") && self.flags.contains(ValidationFlags::REPORT_WARNINGS) {
-            expression_warnings::collecting(validate)
-        } else {
-            (validate(), Vec::new())
+        #[cfg(feature = "xsd11")]
+        if self.has_xpath_expressions && self.flags.contains(ValidationFlags::REPORT_WARNINGS) {
+            return expression_warnings::collecting(validate);
         }
+        (validate(), Vec::new())
     }
 
     /// Report the warnings [`collect_expression_warnings`](Self::collect_expression_warnings)
-    /// collected, about the current item.
+    /// collected, about the current item. Inlined: almost every call has none.
+    #[inline]
     fn report_expression_warnings(&mut self, warnings: Vec<ExpressionWarning>) {
+        if !warnings.is_empty() {
+            self.report_expression_warnings_nonempty(warnings);
+        }
+    }
+
+    fn report_expression_warnings_nonempty(&mut self, warnings: Vec<ExpressionWarning>) {
         for ExpressionWarning {
             code,
             source,
@@ -7900,7 +7990,15 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     }
 
     /// Emit deferred xsi:type errors (collected by [`resolve_xsi_type`]).
+    /// Inlined: on almost every element there are none.
+    #[inline]
     fn emit_deferred_xsi_type_errors(&mut self, errors: Vec<(&'static str, String)>) {
+        if !errors.is_empty() {
+            self.emit_deferred_xsi_type_errors_nonempty(errors);
+        }
+    }
+
+    fn emit_deferred_xsi_type_errors_nonempty(&mut self, errors: Vec<(&'static str, String)>) {
         for (constraint, message) in errors {
             if constraint == "cvc-elt.4.1" {
                 self.xsi_type_unresolved_reported =

@@ -31,6 +31,7 @@ thread_local! {
 /// Run `evaluate`, and return what it returned with the warnings the
 /// expressions it evaluated raised, in order. A collection inside another
 /// collects its own; the outer one resumes afterwards (also on unwind).
+#[cfg_attr(not(feature = "xsd11"), allow(dead_code))]
 pub(crate) fn collecting<R>(evaluate: impl FnOnce() -> R) -> (R, Vec<ExpressionWarning>) {
     struct Restore(Option<Option<Vec<ExpressionWarning>>>);
     impl Drop for Restore {
