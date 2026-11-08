@@ -29,6 +29,7 @@ use std::fmt;
 use num_bigint::BigInt;
 use rust_decimal::Decimal;
 
+use super::validators::is_valid_xsd_decimal_lexical;
 use super::value::{XmlAtomicValue, XmlValue, XmlValueKind};
 use super::XmlTypeCode;
 
@@ -358,12 +359,15 @@ fn digit_count(lexical: &str) -> usize {
 /// [`ExactDecimal`], so `1.000…0` with forty zeros still becomes `1`, and
 /// `0.1234…` with 29 significant digits is `TooPrecise`.
 ///
-/// `lexical` must already be collapsed; it is not checked against the
-/// lexical space beyond what [`ExactDecimal::parse`] requires, so callers
-/// that need the strict gate apply
-/// [`is_valid_xsd_decimal_lexical`](super::validators::is_valid_xsd_decimal_lexical)
-/// first.
+/// `lexical` must already be collapsed. A form outside the lexical space
+/// ([`is_valid_xsd_decimal_lexical`]) is `Invalid` whatever the `rust_decimal`
+/// version: its parser accepts more than `xs:decimal` does (`1_0` digit
+/// separators, and since 1.42 scientific notation such as `1e5`), so the fast
+/// path must not decide what is a decimal.
 pub(crate) fn parse_decimal_exact(lexical: &str) -> Result<Decimal, DecimalParseError> {
+    if !is_valid_xsd_decimal_lexical(lexical) {
+        return Err(DecimalParseError::Invalid);
+    }
     if digit_count(lexical) <= EXACT_DIGITS {
         if let Ok(d) = lexical.parse::<Decimal>() {
             return Ok(d);
@@ -601,7 +605,15 @@ mod tests {
             parse_decimal_exact("79228162514264337593543950336"),
             Err(DecimalParseError::TooLarge)
         );
-        assert_eq!(parse_decimal_exact("1e5"), Err(DecimalParseError::Invalid));
+        // Spellings `rust_decimal`'s parser accepts (`1_0` in every version,
+        // scientific notation since 1.42) but `xs:decimal` does not.
+        for bad in ["1e5", "1E5", "-1.5e-3", "1_0", "1_000.5"] {
+            assert_eq!(
+                parse_decimal_exact(bad),
+                Err(DecimalParseError::Invalid),
+                "{bad:?}"
+            );
+        }
     }
 
     #[test]

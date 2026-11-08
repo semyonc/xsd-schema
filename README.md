@@ -84,7 +84,7 @@ over 10 iterations, and the schema is compiled **once, off the clock**.
 
 Re-measured 2026-11-07 with Rust 1.99.1 (eight runs per strategy, medians,
 spread under 3 %), after the per-element and per-value work listed under
-*Unreleased* in the changelog; the streaming row again on 2026-11-08, after
+0.3.1 in the changelog; the streaming row again on 2026-11-08, after
 the streaming driver stopped copying element names (eight runs alternating
 with the previous build, which measured 258 ms in the same session; spread
 under 8 %). The DOM rows do not go through that driver. The 0.3.0 table

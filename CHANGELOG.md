@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-11-08
+
+This release removes no public item and changes no signature. It is faster
+(streaming validation of the README benchmark corpus: 322 → 231 ms) and uses
+far less memory per small `BufferDocument`.
+
+Conformance is unchanged against 0.3.0: the W3C XSD 1.0 suite passes 39,461
+of 39,510 tests, the XSD 1.1 suite 2,313 of 2,319 and the XPath 2.0 tests of
+XQTS 8,047 of 8,047, with the same failures by name; the GAEB DA XML 3.3 and
+WSDL corpora give the same results. Built without the `xsd11` feature, the XSD
+1.0 suite passes 39,149 tests instead of 38,698 (the regular-expression fixes
+below); none fails that passed.
+
+### Changed
+
+- `document::PAGE_SHIFT`, `PAGE_SIZE` and `PAGE_MASK` are 8, 256 and `0xFF`
+  (were 12, 4,096 and `0xFFF`); see *Performance*. Which page and slot a node
+  index denotes changes with them. Code that goes through the constants or
+  `page_of`, `slot_of` and `node_ref_from` is unaffected; code that assumed
+  4,096 nodes per page is not.
+- The repository's `Cargo.lock` moves to current releases of the dependencies
+  within their existing requirements (`rust_decimal` 1.43, `futures` 0.3.34,
+  `bytes`, `smallvec`, `zerocopy`, `once_cell`, …), which clears the RustSec
+  and GitHub advisories reported against the old lock; `rkyv` and `pin-utils`
+  are no longer in it. `Cargo.toml` is unchanged, and a crate that depends on
+  `xsd-schema` resolves its own versions. The crate is tested against
+  `rust_decimal` 1.43, the version a new build resolves, whose parser accepts
+  scientific notation; `xs:decimal` lexical forms are checked by the crate
+  itself, as before.
+
+### Fixed
+
+- Without the `xsd11` feature, block escapes (`\p{IsBasicLatin}`,
+  `\P{IsLatin-1Supplement}`, `[\p{IsGreek}0-9]`, …) are written out as the
+  code-point ranges of the block, standalone and inside character classes,
+  from the block table of the `xsd11` build (Unicode 15.1, plus the Unicode 3.1
+  names `Greek`, `CombiningMarksforSymbols` and `PrivateUse`). The `regex`
+  crate knows no block names: a schema using one failed to load ("Unicode
+  property not found"), and a block named like a script (`IsGreek`, `IsArabic`,
+  `IsCyrillic`, …) matched the script instead. An unrecognized block name
+  denotes every character under XSD 1.1 (Part 2 §G.4.2.4), as with the
+  `xsd11` feature, and is an error that names it under XSD 1.0.
+- Without the `xsd11` feature, a character class subtraction (`[a-z-[aeiou]]`,
+  `[^a-z-[0-9]]`) subtracts; the `regex` crate read it as a union, so `a` and
+  `-` matched `[a-z-[aeiou]]`.
+
 ### Performance
 
 - `BufferDocument` pages are 256 nodes (4 KB) and 64 namespace bindings
@@ -16,9 +62,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one arena paid that per tree (10,000 trivial documents: 1.2 GB). A trivial
   document now reserves about 9 KB in a fresh arena, a 2,000-element document
   58 KB instead of 160 KB, a 5,000-element one 124 KB instead of 373 KB, and
-  large documents the same or less (chunk rounding). Node references and the
-  shift-and-mask addressing are unchanged; building and validating a 16 MB
-  document is within measurement noise of before (about 1 %).
+  large documents the same or less (chunk rounding). Node indices are still
+  addressed by shift and mask (only the page size changes, see *Changed*);
+  building and validating a 16 MB document is within measurement noise of
+  before (about 1 %).
 - XSD 1.1 (`xsd11`): the XPath tests of `xs:assert`, the `assertion` facet and
   `xs:alternative` are compiled once per schema set instead of at every evaluation.
 - Streaming validation does less work per element and per value; no verdict,
@@ -42,22 +89,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     bindings in scope instead of copying them, and rebuild the namespace
     context they hand the runtime only when an element declares namespaces
     or the scope of one that did closes.
-
-### Fixed
-
-- Without the `xsd11` feature, block escapes (`\p{IsBasicLatin}`,
-  `\P{IsLatin-1Supplement}`, `[\p{IsGreek}0-9]`, …) are written out as the
-  code-point ranges of the block, standalone and inside character classes,
-  from the block table of the `xsd11` build (Unicode 15.1, plus the Unicode 3.1
-  names `Greek`, `CombiningMarksforSymbols` and `PrivateUse`). The `regex`
-  crate knows no block names: a schema using one failed to load ("Unicode
-  property not found"), and a block named like a script (`IsGreek`, `IsArabic`,
-  `IsCyrillic`, …) matched the script instead. An unrecognized block name
-  denotes every character under XSD 1.1 (Part 2 §G.4.2.4), as with the
-  `xsd11` feature, and is an error that names it under XSD 1.0.
-- Without the `xsd11` feature, a character class subtraction (`[a-z-[aeiou]]`,
-  `[^a-z-[0-9]]`) subtracts; the `regex` crate read it as a union, so `a` and
-  `-` matched `[a-z-[aeiou]]`.
 
 ## [0.3.0] - 2026-10-29
 
@@ -3119,7 +3150,8 @@ Performance-focused release. No breaking changes to the public API.
 Initial release: XML Schema (XSD 1.0/1.1) validator with PSVI and a built-in
 XPath 2.0 engine.
 
-[Unreleased]: https://github.com/semyonc/xsd-schema/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/semyonc/xsd-schema/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/semyonc/xsd-schema/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/semyonc/xsd-schema/compare/v0.2.3...v0.3.0
 [0.2.3]: https://github.com/semyonc/xsd-schema/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/semyonc/xsd-schema/compare/v0.2.1...v0.2.2
