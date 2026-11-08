@@ -88,7 +88,10 @@ all three cases.
 
 A node reference is a plain `u32` index into a flat array of fixed-size pages:
 
-- Page size: 4096 nodes (`PAGE_SHIFT = 12`), so each page is 64 KB.
+- Page size: 256 nodes (`PAGE_SHIFT = 8`), so each page is 4 KB and a small
+  document costs one page; namespace bindings use pages of 64 (768 bytes).
+  Pages were 4,096 slots before 0.3.1, which reserved about 115 KB of arena
+  for every document however small.
 - Page/slot decoding is a bitshift / mask — no bit-packed addressing.
 - `NULL = u32::MAX`; `Nul` node type marks end-of-document for forward scans.
 - First child of `parent` is always `parent + 1` (when `HAS_CHILDREN`).

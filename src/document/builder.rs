@@ -2617,6 +2617,93 @@ mod tests {
         builder.build(xml.as_bytes()).unwrap()
     }
 
+    /// Arena bytes a fresh arena reserves for one document, with the page
+    /// payload those documents need. Pages were 4,096 slots before (64 KB of
+    /// nodes + 48 KB of namespace bindings per document, whatever its size);
+    /// these bounds hold only with the small pages and would fail on the old
+    /// sizes, chunk rounding included.
+    fn arena_for(xml: &str) -> (usize, u32) {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let doc = BufferDocumentBuilder::new(&arena, &names, None, BufferDocumentOptions::full())
+            .unwrap()
+            .build(xml.as_bytes())
+            .unwrap();
+        (arena.allocated_bytes(), doc.nodes.len())
+    }
+
+    #[test]
+    fn small_document_reserves_little_arena() {
+        let (bytes, nodes) = arena_for(r#"<r xmlns:a="urn:a"><e a="1">text</e><e>more</e></r>"#);
+        assert_eq!(nodes, 9); // root, r, e, a, value, text, e, text, nul
+        assert!(
+            bytes < 16 * 1024,
+            "small document reserved {bytes} bytes of arena"
+        );
+    }
+
+    #[test]
+    fn medium_document_reserves_proportional_arena() {
+        // 2,049 children: 2,052 nodes = 9 node pages (36 KB). Before: 64 KB of
+        // nodes + 48 KB of namespace bindings before chunk rounding.
+        let mut xml = String::from("<r>");
+        for _ in 0..2049 {
+            xml.push_str("<e/>");
+        }
+        xml.push_str("</r>");
+        let (bytes, nodes) = arena_for(&xml);
+        assert_eq!(nodes, 2052);
+        assert!(
+            bytes < 96 * 1024,
+            "2,049-element document reserved {bytes} bytes"
+        );
+    }
+
+    #[test]
+    fn repeated_namespace_declarations_reserve_proportional_arena() {
+        // One binding per declaration (the builder does not dedup against the
+        // parent), so 3,001 bindings = 47 namespace pages (35 KB) plus 3,003
+        // nodes = 12 node pages (47 KB). Before: a 48 KB namespace page plus
+        // 64 KB of nodes for the same document.
+        let mut xml = String::from("<r>");
+        for _ in 0..3000 {
+            xml.push_str("<e xmlns:p='urn:p'/>");
+        }
+        xml.push_str("</r>");
+        let (bytes, nodes) = arena_for(&xml);
+        assert_eq!(nodes, 3003);
+        assert!(
+            bytes < 160 * 1024,
+            "3,000 repeated declarations reserved {bytes} bytes"
+        );
+    }
+
+    #[test]
+    fn document_spanning_many_pages_reads_back_whole() {
+        let names = NameTable::new();
+        let arena = Bump::new();
+        let mut xml = String::from("<r>");
+        for i in 0..5000 {
+            xml.push_str(&format!("<e>{i}</e>"));
+        }
+        xml.push_str("</r>");
+        let doc = BufferDocumentBuilder::new(&arena, &names, None, BufferDocumentOptions::full())
+            .unwrap()
+            .build(xml.as_bytes())
+            .unwrap();
+        // 5,000 elements + 5,000 texts + root, r, nul = 10,003 nodes, 40 pages.
+        assert_eq!(doc.nodes.len(), 10_003);
+        let mut texts = Vec::new();
+        for i in 0..doc.nodes.len() {
+            let n = doc.nodes.get(i);
+            if n.node_type() == NodeType::Text {
+                texts.push(doc.strings.get(n.value).to_string());
+            }
+        }
+        let expected: Vec<String> = (0..5000).map(|i| i.to_string()).collect();
+        assert_eq!(texts, expected);
+    }
+
     #[test]
     fn test_build_simple() {
         let doc = build_from_str("<root/>");

@@ -37,14 +37,20 @@ impl NsRef {
 
 // ── Page-addressing constants ─────────────────────────────────────────
 
-/// Page size exponent: 2^12 = 4096 namespace nodes per page.
-pub const NS_PAGE_SHIFT: u32 = 12;
+/// Page size exponent: 2^6 = 64 namespace nodes per page.
+///
+/// The first page is what every document pays (64 × 12 bytes = 768 bytes);
+/// most documents declare a handful of namespaces, and the builder allocates
+/// one node per declaration, so a document that repeats `xmlns` on every
+/// element simply takes more pages. Pages were 4,096 nodes (48 KB) before;
+/// see [`PAGE_SHIFT`](super::node::PAGE_SHIFT).
+pub const NS_PAGE_SHIFT: u32 = 6;
 
-/// Namespace nodes per page (4096).
+/// Namespace nodes per page (64).
 pub const NS_PAGE_SIZE: u32 = 1 << NS_PAGE_SHIFT;
 
 /// Bitmask for extracting the slot within a page.
-pub const NS_PAGE_MASK: u32 = NS_PAGE_SIZE - 1; // 0xFFF
+pub const NS_PAGE_MASK: u32 = NS_PAGE_SIZE - 1; // 0x3F
 
 // ── NamespaceNode ─────────────────────────────────────────────────────
 
