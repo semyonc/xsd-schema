@@ -45,6 +45,11 @@ use crate::xml::reader::{AttrKind, AttrSpan, Recheck, WfError, WfReader};
 use crate::xml::{LimitExceeded, NotWellFormed};
 use crate::xml_entity::resolve_general_ref;
 
+/// The in-scope namespace bindings while streaming: prefix bytes → stack of
+/// URIs (top = current binding). Keyed `ahash` — prefixes come from the
+/// instance, and the lookup runs for every prefixed name.
+type PrefixMap = HashMap<Vec<u8>, Vec<String>, ahash::RandomState>;
+
 // ── Public types ──────────────────────────────────────────────────────────
 
 /// Final outcome of a successful drive call.
@@ -457,7 +462,7 @@ where
     let mut xml_reader = WfReader::new(reader, runtime.parse_limits(), false);
 
     // prefix bytes -> stack of URI strings (top-of-stack = current binding)
-    let mut prefix_map: HashMap<Vec<u8>, Vec<String>> = HashMap::new();
+    let mut prefix_map = PrefixMap::default();
     // Always-in-scope xml prefix (XML Namespaces §3).
     prefix_map
         .entry(b"xml".to_vec())
@@ -471,6 +476,9 @@ where
 
     // Per-element list of prefixes that need popping at end-of-element.
     let mut scope_stack: Vec<Vec<Vec<u8>>> = Vec::new();
+    // The bindings in scope as the runtime's snapshot; `None` once a scope
+    // that declares namespaces is pushed or popped (`build_ns_context`).
+    let mut ns_snapshot: Option<NamespaceContextSnapshot> = None;
 
     let mut depth: usize = 0;
     let mut max_depth: usize = 0;
@@ -522,6 +530,7 @@ where
                     handler,
                     &mut prefix_map,
                     &mut scope_stack,
+                    &mut ns_snapshot,
                     &mut depth,
                     &mut max_depth,
                     &mut root_validity,
@@ -538,6 +547,7 @@ where
                     handler,
                     &mut prefix_map,
                     &mut scope_stack,
+                    &mut ns_snapshot,
                     &mut depth,
                     &mut max_depth,
                     &mut root_validity,
@@ -562,7 +572,7 @@ where
                 if depth == 1 {
                     root_validity = Some(end_validity);
                 }
-                pop_xmlns_scope(&mut prefix_map, &mut scope_stack);
+                pop_xmlns_scope(&mut prefix_map, &mut scope_stack, &mut ns_snapshot);
                 depth = depth.saturating_sub(1);
             }
             Ok(Event::CData(ref e)) if depth > 0 => {
@@ -683,8 +693,9 @@ fn handle_start_or_empty<R, S, H>(
     runtime: &mut ValidationRuntime<'_, S>,
     schema_set: &SchemaSet,
     handler: &mut H,
-    prefix_map: &mut HashMap<Vec<u8>, Vec<String>>,
+    prefix_map: &mut PrefixMap,
     scope_stack: &mut Vec<Vec<Vec<u8>>>,
+    ns_snapshot: &mut Option<NamespaceContextSnapshot>,
     depth: &mut usize,
     max_depth: &mut usize,
     root_validity: &mut Option<SchemaValidity>,
@@ -716,16 +727,21 @@ where
             return Err(err);
         }
     };
+    if !ns_decls_owned.is_empty() {
+        *ns_snapshot = None;
+    }
     let ns_decls: Vec<(&str, &str)> = ns_decls_owned
         .iter()
         .map(|(p, u)| (p.as_str(), u.as_str()))
         .collect();
 
     // 2. Resolve element name + scan xsi:type / xsi:nil.
+    // 2. Resolve element name (borrowed from the tag and the bindings) + scan
+    // xsi:type / xsi:nil.
     let (local_name, namespace_uri, elem_prefix) = match resolve_element_qname(e, at, prefix_map) {
         Ok(v) => v,
         Err(err) => {
-            pop_xmlns_scope(prefix_map, scope_stack);
+            pop_xmlns_scope(prefix_map, scope_stack, ns_snapshot);
             *depth -= 1;
             return Err(err);
         }
@@ -733,44 +749,46 @@ where
     let (xsi_type, xsi_nil) = match scan_xsi_attributes(tag, spans, version, at, prefix_map) {
         Ok(v) => v,
         Err(err) => {
-            pop_xmlns_scope(prefix_map, scope_stack);
+            pop_xmlns_scope(prefix_map, scope_stack, ns_snapshot);
             *depth -= 1;
             return Err(err);
         }
     };
-
-    let ns_ctx = build_ns_context(prefix_map, schema_set);
+    if ns_snapshot.is_none() {
+        *ns_snapshot = Some(build_ns_context(prefix_map, schema_set));
+    }
+    let ns_ctx = ns_snapshot.as_ref().expect("built above");
 
     let view = ElementStartView {
-        local_name: &local_name,
-        namespace_uri: &namespace_uri,
-        prefix: &elem_prefix,
+        local_name,
+        namespace_uri,
+        prefix: elem_prefix,
         xsi_type: xsi_type.as_deref(),
         xsi_nil: xsi_nil.as_deref(),
-        ns_context: &ns_ctx,
+        ns_context: ns_ctx,
         namespace_decls: &ns_decls,
         is_empty,
     };
 
     // 3. Spans + before_element.
     if let Err(err) = handler.on_element_start_offset(event_start) {
-        pop_xmlns_scope(prefix_map, scope_stack);
+        pop_xmlns_scope(prefix_map, scope_stack, ns_snapshot);
         *depth -= 1;
         return Err(DriveWithError::Hook(err));
     }
     if let Err(err) = handler.before_element(view) {
-        pop_xmlns_scope(prefix_map, scope_stack);
+        pop_xmlns_scope(prefix_map, scope_stack, ns_snapshot);
         *depth -= 1;
         return Err(DriveWithError::Hook(err));
     }
 
     // 4. Element validation + after_element.
     let info = runtime.validate_element(
-        &local_name,
-        &namespace_uri,
+        local_name,
+        namespace_uri,
         xsi_type.as_deref(),
         xsi_nil.as_deref(),
-        &ns_ctx,
+        ns_ctx,
     );
     handler
         .after_element(view, &info)
@@ -785,11 +803,11 @@ where
         let utf8 = |_| drive_error(at.utf8());
         let attr_local = std::str::from_utf8(span.local(tag)).map_err(utf8)?;
         let attr_prefix = std::str::from_utf8(prefix_bytes).map_err(utf8)?;
-        let attr_ns = if prefix_bytes.is_empty() {
-            String::new()
+        let attr_ns: &str = if prefix_bytes.is_empty() {
+            ""
         } else {
             match prefix_map.get(prefix_bytes).and_then(|stack| stack.last()) {
-                Some(uri) if !uri.is_empty() => uri.clone(),
+                Some(uri) if !uri.is_empty() => uri,
                 _ => return Err(drive_error(at.unbound(prefix_bytes))),
             }
         };
@@ -799,7 +817,7 @@ where
 
         let av = AttributeView {
             local_name: attr_local,
-            namespace_uri: &attr_ns,
+            namespace_uri: attr_ns,
             prefix: attr_prefix,
             value: value.as_ref(),
         };
@@ -807,9 +825,9 @@ where
         let skip =
             attr_ns != XSI_NAMESPACE && handler.skip_attribute(av).map_err(DriveWithError::Hook)?;
         let attr_info = if skip {
-            runtime.skip_attribute(attr_local, &attr_ns, value.as_ref())
+            runtime.skip_attribute(attr_local, attr_ns, value.as_ref())
         } else {
-            runtime.validate_attribute(attr_local, &attr_ns, value.as_ref())
+            runtime.validate_attribute(attr_local, attr_ns, value.as_ref())
         };
         handler
             .after_attribute(av, &attr_info)
@@ -851,7 +869,7 @@ where
         if *depth == 1 {
             *root_validity = Some(end_validity);
         }
-        pop_xmlns_scope(prefix_map, scope_stack);
+        pop_xmlns_scope(prefix_map, scope_stack, ns_snapshot);
         *depth -= 1;
     }
 
@@ -865,7 +883,7 @@ fn push_xmlns_scope<E>(
     spans: &[AttrSpan],
     version: quick_xml::XmlVersion,
     at: Recheck,
-    prefix_map: &mut HashMap<Vec<u8>, Vec<String>>,
+    prefix_map: &mut PrefixMap,
     scope_stack: &mut Vec<Vec<Vec<u8>>>,
 ) -> Result<Vec<(String, String)>, DriveWithError<E>> {
     let mut declared: Vec<Vec<u8>> = Vec::new();
@@ -895,11 +913,17 @@ fn push_xmlns_scope<E>(
     Ok(decls_owned)
 }
 
+/// Pop the bindings the innermost scope declared; a scope that declared any
+/// leaves `ns_snapshot` stale (`None`).
 fn pop_xmlns_scope(
-    prefix_map: &mut HashMap<Vec<u8>, Vec<String>>,
+    prefix_map: &mut PrefixMap,
     scope_stack: &mut Vec<Vec<Vec<u8>>>,
+    ns_snapshot: &mut Option<NamespaceContextSnapshot>,
 ) {
     if let Some(declared) = scope_stack.pop() {
+        if !declared.is_empty() {
+            *ns_snapshot = None;
+        }
         for prefix in declared {
             if let Some(stack) = prefix_map.get_mut(&prefix) {
                 stack.pop();
@@ -911,28 +935,24 @@ fn pop_xmlns_scope(
     }
 }
 
-fn resolve_element_qname<E>(
-    e: &BytesStart<'_>,
+/// The element's local name, namespace URI and prefix, borrowed from the tag
+/// and the bindings in scope.
+fn resolve_element_qname<'a, E>(
+    e: &'a BytesStart<'_>,
     at: Recheck,
-    prefix_map: &HashMap<Vec<u8>, Vec<String>>,
-) -> Result<(String, String, String), DriveWithError<E>> {
-    let name = e.name();
-    let (prefix_bytes, local_bytes) = split_prefix_local(name.as_ref());
-    let local = std::str::from_utf8(local_bytes)
-        .map_err(|_| drive_error(at.utf8()))?
-        .to_string();
-    let prefix = std::str::from_utf8(prefix_bytes)
-        .map_err(|_| drive_error(at.utf8()))?
-        .to_string();
+    prefix_map: &'a PrefixMap,
+) -> Result<(&'a str, &'a str, &'a str), DriveWithError<E>> {
+    let (prefix_bytes, local_bytes) = split_prefix_local(e.name().0);
+    let local = std::str::from_utf8(local_bytes).map_err(|_| drive_error(at.utf8()))?;
+    let prefix = std::str::from_utf8(prefix_bytes).map_err(|_| drive_error(at.utf8()))?;
     let namespace = if prefix_bytes.is_empty() {
         prefix_map
             .get(prefix_bytes)
             .and_then(|stack| stack.last())
-            .cloned()
-            .unwrap_or_default()
+            .map_or("", String::as_str)
     } else {
         match prefix_map.get(prefix_bytes).and_then(|stack| stack.last()) {
-            Some(uri) if !uri.is_empty() => uri.clone(),
+            Some(uri) if !uri.is_empty() => uri.as_str(),
             _ => return Err(drive_error(at.unbound(prefix_bytes))),
         }
     };
@@ -944,7 +964,7 @@ fn scan_xsi_attributes<E>(
     spans: &[AttrSpan],
     version: quick_xml::XmlVersion,
     at: Recheck,
-    prefix_map: &HashMap<Vec<u8>, Vec<String>>,
+    prefix_map: &PrefixMap,
 ) -> Result<(Option<String>, Option<String>), DriveWithError<E>> {
     let mut xsi_type: Option<String> = None;
     let mut xsi_nil: Option<String> = None;
@@ -985,10 +1005,7 @@ fn scan_xsi_attributes<E>(
     Ok((xsi_type, xsi_nil))
 }
 
-fn build_ns_context(
-    prefix_map: &HashMap<Vec<u8>, Vec<String>>,
-    schema_set: &SchemaSet,
-) -> NamespaceContextSnapshot {
+fn build_ns_context(prefix_map: &PrefixMap, schema_set: &SchemaSet) -> NamespaceContextSnapshot {
     let mut snapshot = NamespaceContextSnapshot::default();
 
     for (prefix_bytes, stack) in prefix_map {
@@ -1077,6 +1094,41 @@ mod tests {
         assert!(errors.is_empty(), "expected no errors, got {errors:?}");
         assert!(matches!(outcome.root_validity, Some(SchemaValidity::Valid)));
         assert_eq!(outcome.max_depth, 1);
+    }
+
+    /// The namespace snapshot is rebuilt only when a scope that declares
+    /// bindings is pushed or popped: a binding is seen inside the element
+    /// that declares it and not by the siblings after it, whether the
+    /// declaring element closes with an end tag or is empty.
+    #[test]
+    fn a_binding_does_not_outlive_the_element_that_declares_it() {
+        let (outcome, errors) = run(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="r">
+                    <xs:complexType>
+                        <xs:choice maxOccurs="unbounded">
+                            <xs:element name="q" type="xs:QName"/>
+                            <xs:element name="e"><xs:complexType/></xs:element>
+                        </xs:choice>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+            r#"<r><q xmlns:p="urn:x">p:v</q><q>p:v</q><e xmlns:p="urn:y"/><q>p:v</q><q xmlns:p="urn:z">p:v</q></r>"#,
+        );
+        let undeclared: Vec<&String> = errors
+            .iter()
+            .filter(|e| e.contains("undeclared prefix 'p'"))
+            .collect();
+        assert_eq!(
+            undeclared.len(),
+            2,
+            "the second and third q see no binding of p: {errors:?}"
+        );
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        assert!(matches!(
+            outcome.root_validity,
+            Some(SchemaValidity::Invalid)
+        ));
     }
 
     #[test]

@@ -78,16 +78,19 @@ over 10 iterations, and the schema is compiled **once, off the clock**.
 
 | Strategy | Parser | Time | Throughput | RSS delta |
 | --- | --- | ---: | ---: | ---: | 
-| streaming | quick-xml | 254 ms | 61.2 MB/s | **672 KB** |
+| streaming | quick-xml | 231 ms | 67.5 MB/s | **736 KB** |
 | DOM (roxmltree) | roxmltree | 212 ms | 73.3 MB/s | 88.5 MB |
 | DOM (BufferDoc) | quick-xml | 291 ms | 53.4 MB/s | 61.6 MB |
 
 Re-measured 2026-11-07 with Rust 1.99.1 (eight runs per strategy, medians,
 spread under 3 %), after the per-element and per-value work listed under
-*Unreleased* in the changelog. The 0.3.0 table (2026-10-29) read
-322 / 279 / 357 ms, and on the same machine and toolchain 0.2.3 measures
-296 / 252 / 325 ms: the cost the exact value-space facet checks of 0.3.0 added
-on this facet-heavy corpus is won back.
+*Unreleased* in the changelog; the streaming row again on 2026-11-08, after
+the streaming driver stopped copying element names (eight runs alternating
+with the previous build, which measured 258 ms in the same session; spread
+under 8 %). The DOM rows do not go through that driver. The 0.3.0 table
+(2026-10-29) read 322 / 279 / 357 ms, and on the same machine and toolchain
+0.2.3 measures 296 / 252 / 325 ms: the cost the exact value-space facet checks
+of 0.3.0 added on this facet-heavy corpus is won back.
 
 
 

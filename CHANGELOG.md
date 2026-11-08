@@ -26,7 +26,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     value]` it discards;
   - content models with bounded repetitions (`maxOccurs` other than 1 or
     `unbounded`) step with a faster working set and without cloning each
-    configuration.
+    configuration;
+  - the streaming drivers (`drive_quick_xml`, `drive_quick_xml_with`) borrow
+    each element's name, prefix and namespace URI from the tag and the
+    bindings in scope instead of copying them, and rebuild the namespace
+    context they hand the runtime only when an element declares namespaces
+    or the scope of one that did closes.
 
 ### Fixed
 
