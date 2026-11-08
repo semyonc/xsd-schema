@@ -11,6 +11,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - XSD 1.1 (`xsd11`): the XPath tests of `xs:assert`, the `assertion` facet and
   `xs:alternative` are compiled once per schema set instead of at every evaluation.
+- Streaming validation does less work per element and per value; no verdict,
+  error or `SchemaInfo` changes:
+  - the per-element validation state is boxed, so opening and closing an
+    element moves a pointer instead of copying the state;
+  - XSD 1.0 mode no longer copies a type's facet set for every value it checks
+    (the NaN and negative-year adjustments are built only when they apply);
+  - expression warnings are collected around a value's validation only when
+    the schema set has an assertion, an `assertion` facet or a type
+    alternative, which is checked once per `SchemaValidator` instead of per
+    run (so is whether any attribute is inheritable);
+  - the value-free end-element path (`drive_quick_xml`, the streaming
+    drivers) no longer copies each atomic value for the `[schema normalized
+    value]` it discards;
+  - content models with bounded repetitions (`maxOccurs` other than 1 or
+    `unbounded`) step with a faster working set and without cloning each
+    configuration.
 
 ### Fixed
 

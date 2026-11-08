@@ -5,13 +5,21 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::BuildHasherDefault;
 use std::sync::OnceLock;
+
+use ahash::AHasher;
 
 use super::substitution::SubstitutionGroupMap;
 use crate::ids::{ElementKey, NameId, TypeKey};
 use crate::parser::location::SourceRef;
 use crate::schema::model::XsdVersion;
 use crate::types::complex::{not_qnames_exclude, NamespaceConstraint, ProcessContents};
+
+/// The working set of the counted closure (`ActiveStates::try_epsilon_closure`):
+/// local to one call, so it takes a fast hasher; the public `ActiveStates`
+/// variants keep `std`'s.
+type FastHashSet<T> = HashSet<T, BuildHasherDefault<AHasher>>;
 
 /// Unique identifier for NFA states within a table
 pub type StateId = u32;
@@ -200,22 +208,26 @@ fn check_config_limit(observed: usize) -> Result<(), ContentModelLimitExceeded> 
 /// configuration per way of partitioning the input into iterations —
 /// O(k²) after k children — although all but a bounded few are dominated.
 /// The former 10 000 cutoff hid this by turning such bounds into stars.
-fn prune_dominated(configs: HashSet<ActiveConfig>, defs: &[CounterDef]) -> HashSet<ActiveConfig> {
+fn prune_dominated(
+    configs: FastHashSet<ActiveConfig>,
+    defs: &[CounterDef],
+) -> HashSet<ActiveConfig> {
     if configs.len() < 2 {
-        return configs;
+        return configs.into_iter().collect();
     }
-    let mut by_state: HashMap<StateId, Vec<ActiveConfig>> = HashMap::new();
-    for cfg in configs {
-        by_state.entry(cfg.state_id).or_default().push(cfg);
-    }
-    let mut out = HashSet::with_capacity(by_state.len());
-    for (_, group) in by_state {
-        if group.len() == 1 {
-            out.extend(group);
-            continue;
-        }
-        let mut keep: Vec<ActiveConfig> = Vec::with_capacity(group.len());
-        'next: for cfg in group {
+    // Group by state with one sort instead of a map of per-state vectors.
+    // What is kept of a group is its undominated configurations, whatever
+    // order the group is scanned in (dominance is a strict partial order), so
+    // the grouping order does not change the result.
+    let mut all: Vec<ActiveConfig> = configs.into_iter().collect();
+    all.sort_unstable_by_key(|cfg| cfg.state_id);
+    let mut out = HashSet::with_capacity(all.len());
+    let mut keep: Vec<ActiveConfig> = Vec::new();
+    let mut rest = all.into_iter().peekable();
+    while let Some(first) = rest.next() {
+        let state = first.state_id;
+        keep.push(first);
+        'next: while let Some(cfg) = rest.next_if(|cfg| cfg.state_id == state) {
             for k in &keep {
                 if dominates(&k.counters, &cfg.counters, defs) {
                     continue 'next;
@@ -224,7 +236,14 @@ fn prune_dominated(configs: HashSet<ActiveConfig>, defs: &[CounterDef]) -> HashS
             keep.retain(|k| !dominates(&cfg.counters, &k.counters, defs));
             keep.push(cfg);
         }
-        out.extend(keep);
+        out.extend(keep.drain(..));
+    }
+    // Sized for what survived: an initial frontier is cloned for every
+    // element that opens its model, and a clone copies the whole table, so
+    // a table sized for the unpruned closure is shrunk once pruning has
+    // removed much of it.
+    if out.capacity() > 2 * out.len() + 8 {
+        out.shrink_to_fit();
     }
     out
 }
@@ -1909,17 +1928,24 @@ impl ActiveStates {
                 configs,
                 num_counters,
             } => {
-                let mut result: HashSet<ActiveConfig> = HashSet::new();
+                // Working set under a fast hasher, converted to the public
+                // `HashSet` once at the end (`prune_dominated`). A popped
+                // configuration is moved into the set after its successors
+                // are computed (into `succ`), not cloned before: the same
+                // configurations are explored, pushed in the same order and
+                // counted against the same limits.
+                let mut result: FastHashSet<ActiveConfig> = FastHashSet::default();
                 let mut stack: Vec<ActiveConfig> = configs.into_iter().collect();
+                let mut succ: Vec<ActiveConfig> = Vec::new();
                 let mut work: usize = 0;
 
                 while let Some(config) = stack.pop() {
                     work += 1;
                     check_work_limit(work)?;
-                    if !result.insert(config.clone()) {
+                    if result.contains(&config) {
                         continue;
                     }
-                    check_config_limit(result.len())?;
+                    succ.clear();
                     if let Some(state) = nfa.get_state(config.state_id) {
                         for trans in &state.transitions {
                             let next = match trans.kind {
@@ -1952,11 +1978,14 @@ impl ActiveStates {
                                 }
                                 TransitionKind::Consume => None,
                             };
-                            if let Some(next_config) = next {
-                                if !result.contains(&next_config) {
-                                    stack.push(next_config);
-                                }
-                            }
+                            succ.extend(next);
+                        }
+                    }
+                    result.insert(config);
+                    check_config_limit(result.len())?;
+                    for next_config in succ.drain(..) {
+                        if !result.contains(&next_config) {
+                            stack.push(next_config);
                         }
                     }
                 }
@@ -3910,6 +3939,50 @@ mod exact_bounds_tests {
         active
             .try_advance(nfa, A, None, None, None, XsdVersion::V1_0)
             .expect("no execution limit expected")
+    }
+
+    /// `prune_dominated` sizes its result for the configurations it keeps.
+    /// The initial frontier is cloned for every element that opens the
+    /// model, so a table sized for the unpruned closure made every clone pay
+    /// for the configurations pruning had removed (a schema with three nested
+    /// `{1,17}` groups around `a?`: 37 kept in 28,672 slots).
+    #[test]
+    fn pruned_frontier_does_not_keep_the_unpruned_capacity() {
+        let xsd = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:element name="r">
+    <xs:complexType>
+      <xs:sequence maxOccurs="17">
+        <xs:sequence maxOccurs="17">
+          <xs:sequence maxOccurs="17">
+            <xs:element name="a" minOccurs="0"/>
+          </xs:sequence>
+        </xs:sequence>
+      </xs:sequence>
+    </xs:complexType>
+  </xs:element>
+</xs:schema>"#;
+        let mut set = crate::schema::SchemaSet::new();
+        crate::pipeline::load_and_process_schema(xsd.as_bytes(), "nested.xsd", &mut set, None)
+            .expect("schema loads");
+        let mut counted = 0;
+        for (_, ct) in set.arenas.complex_types.iter() {
+            let Ok(crate::compiler::ContentModelMatcher::Nfa(nfa)) =
+                crate::compiler::compile_content_model_matcher(&set, ct)
+            else {
+                continue;
+            };
+            if let ActiveStates::Counted { configs, .. } = ActiveStates::try_from_nfa(&nfa).unwrap()
+            {
+                counted += 1;
+                assert!(
+                    configs.capacity() <= 2 * configs.len() + 8,
+                    "{} configurations kept in a table of capacity {}",
+                    configs.len(),
+                    configs.capacity()
+                );
+            }
+        }
+        assert_eq!(counted, 1, "the nested groups take the scalar counted path");
     }
 
     /// The reproduced defect: `a{0,10001}` must accept exactly 10 001 and

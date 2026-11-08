@@ -96,6 +96,30 @@ pub(crate) fn validate_simple_type_in(
     validate_simple_type_inner(value, type_key, schema_set, resolver)
 }
 
+/// [`validate_simple_type_in`] for a caller that discards the PSVI
+/// `[schema normalized value]`: for an atomic simple type the result carries
+/// none (`normalized_value` is `None`), which saves copying the value; the
+/// verdict, the typed value and every error are those of
+/// [`validate_simple_type_in`]. Any other type takes the general path.
+pub(crate) fn validate_simple_type_in_without_normalized(
+    value: &str,
+    type_key: TypeKey,
+    schema_set: &SchemaSet,
+    resolver: Option<PrefixResolver<'_>>,
+) -> Result<SimpleTypeResult, ValidationError> {
+    if let TypeKey::Simple(sk) = type_key {
+        if schema_set
+            .arenas
+            .simple_types
+            .get(sk)
+            .is_some_and(|st| st.variety == SimpleTypeVariety::Atomic)
+        {
+            return validate_atomic_type_with(value, sk, schema_set, resolver, false);
+        }
+    }
+    validate_simple_type_inner(value, type_key, schema_set, resolver)
+}
+
 /// Whether `value` holds an `xs:QName` / `xs:NOTATION` value in the value
 /// space (not a lexical form) — itself, as a union's member value, or as a
 /// list member.
@@ -1574,12 +1598,13 @@ fn check_simple_content_facets(
                         .map(|w| w.value)
                         .unwrap_or_else(|| validator.whitespace()),
                 );
-                let xsd10 = schema_set
-                    .is_xsd10()
-                    .then(|| xsd10_nan_bound_facets(facets, typed.type_code, &normalized))
-                    .flatten();
+                let xsd10 = if schema_set.is_xsd10() {
+                    xsd10_nan_bound_facets(facets, typed.type_code, &normalized)
+                } else {
+                    None
+                };
                 validator
-                    .validate_with_facets(lex, xsd10.as_ref().unwrap_or(facets))
+                    .validate_with_facets(lex, xsd10.as_deref().unwrap_or(facets))
                     .map_err(|e| errors::from_value_error_default(e, None))?;
             }
             None => facets.validate_string(lex).map_err(facet_error)?,
@@ -1602,7 +1627,7 @@ fn xsd10_nan_bound_facets(
     facets: &FacetSet,
     type_code: XmlTypeCode,
     normalized: &str,
-) -> Option<FacetSet> {
+) -> Option<Box<FacetSet>> {
     if !matches!(type_code, XmlTypeCode::Float | XmlTypeCode::Double) || normalized != "NaN" {
         return None;
     }
@@ -1618,7 +1643,7 @@ fn xsd10_nan_bound_facets(
     if !min && !max {
         return None;
     }
-    let mut admitted = facets.clone();
+    let mut admitted = Box::new(facets.clone());
     if min {
         admitted.min_inclusive = None;
     }
@@ -1641,7 +1666,7 @@ fn xsd10_year_facets(
     facets: &FacetSet,
     type_code: XmlTypeCode,
     normalized: &str,
-) -> Option<FacetSet> {
+) -> Option<Box<FacetSet>> {
     if !matches!(
         type_code,
         XmlTypeCode::DateTime | XmlTypeCode::Date | XmlTypeCode::GYear | XmlTypeCode::GYearMonth
@@ -1666,7 +1691,7 @@ fn xsd10_year_facets(
     if !has_facet || !involved {
         return None;
     }
-    let mut rest = facets.clone();
+    let mut rest = Box::new(facets.clone());
     rest.min_inclusive = None;
     rest.max_inclusive = None;
     rest.min_exclusive = None;
@@ -1770,6 +1795,18 @@ fn validate_atomic_type(
     schema_set: &SchemaSet,
     resolver: Option<PrefixResolver<'_>>,
 ) -> Result<SimpleTypeResult, ValidationError> {
+    validate_atomic_type_with(value, sk, schema_set, resolver, true)
+}
+
+/// [`validate_atomic_type`]; `keep_normalized` = `false` leaves the result's
+/// `normalized_value` out (`None`) where it would copy the value.
+fn validate_atomic_type_with(
+    value: &str,
+    sk: SimpleTypeKey,
+    schema_set: &SchemaSet,
+    resolver: Option<PrefixResolver<'_>>,
+    keep_normalized: bool,
+) -> Result<SimpleTypeResult, ValidationError> {
     let type_code = resolve_type_code(sk, schema_set);
 
     // Short-circuit for abstract base types — accept as untyped
@@ -1831,19 +1868,30 @@ fn validate_atomic_type(
         .unwrap_or_else(|| validator.whitespace());
     let normalized = normalize_whitespace(value, effective_ws);
 
-    let year_facets = schema_set
-        .is_xsd10()
-        .then(|| xsd10_year_facets(&facets, type_code, &normalized))
-        .flatten();
-    let xsd10 = schema_set
-        .is_xsd10()
-        .then(|| xsd10_nan_bound_facets(&facets, type_code, &normalized))
-        .flatten()
-        .or_else(|| year_facets.clone());
+    // XSD 1.0 adjustments of the facets the value is checked against: the
+    // NaN bounds, else the negative-year bounds, else the type's own facets.
+    // Boxed and borrowed: a `FacetSet` is several hundred bytes, and carrying
+    // an `Option<FacetSet>` by value copied it for every value, also when no
+    // adjustment applies (the common case).
+    let is_xsd10 = schema_set.is_xsd10();
+    let year_facets = if is_xsd10 {
+        xsd10_year_facets(&facets, type_code, &normalized)
+    } else {
+        None
+    };
+    let nan_facets = if is_xsd10 {
+        xsd10_nan_bound_facets(&facets, type_code, &normalized)
+    } else {
+        None
+    };
     let typed_value = if facets.is_empty() {
         validator.validate(value)
     } else {
-        validator.validate_with_facets(value, xsd10.as_ref().unwrap_or(&facets))
+        let checked = nan_facets
+            .as_deref()
+            .or(year_facets.as_deref())
+            .unwrap_or(&facets);
+        validator.validate_with_facets(value, checked)
     };
 
     match typed_value {
@@ -1870,7 +1918,7 @@ fn validate_atomic_type(
             Ok(SimpleTypeResult {
                 typed_value: val,
                 member_type: None,
-                normalized_value: Some(normalized.into_owned()),
+                normalized_value: keep_normalized.then(|| normalized.into_owned()),
             })
         }
         Err(type_err) => Err(errors::from_value_error_default(type_err, None)),

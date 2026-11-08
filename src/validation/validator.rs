@@ -13,6 +13,8 @@ use crate::schema::SchemaSet;
 
 use super::errors::{DiagnosticItem, InstancePath, ValidationError, ValidationSubject};
 use super::info::ValidationFlags;
+#[cfg(feature = "xsd11")]
+use super::runtime::PreparedSchemaFacts;
 use super::runtime::{build_content_models, PreparedContentModels, ValidationRuntime};
 
 // ---------------------------------------------------------------------------
@@ -183,6 +185,10 @@ pub struct SchemaValidator<'a> {
     /// Which assertion evaluation path is active (XSD 1.1 only)
     #[cfg(feature = "xsd11")]
     pub(crate) assertion_source: AssertionSource,
+    /// What the runtime may skip for this schema set, found once here
+    /// rather than at each run (`PreparedSchemaFacts`).
+    #[cfg(feature = "xsd11")]
+    pub(crate) facts: PreparedSchemaFacts,
 }
 
 impl<'a> SchemaValidator<'a> {
@@ -222,6 +228,8 @@ impl<'a> SchemaValidator<'a> {
             } else {
                 AssertionSource::Disabled
             },
+            #[cfg(feature = "xsd11")]
+            facts: PreparedSchemaFacts::of(schema_set),
         }
     }
 
@@ -361,6 +369,8 @@ impl<'a> SchemaValidator<'a> {
             sink,
             #[cfg(feature = "xsd11")]
             self.assertion_source,
+            #[cfg(feature = "xsd11")]
+            self.facts,
         )
     }
 }
