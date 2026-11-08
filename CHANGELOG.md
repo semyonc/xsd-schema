@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- `BufferDocument` pages are 256 nodes (4 KB) and 64 namespace bindings
+  (768 bytes) instead of 4,096 of each (64 KB + 48 KB). Pages are allocated
+  whole, so every document used to reserve about 115 KB of arena before its
+  first element, however small it was; a host building many small trees into
+  one arena paid that per tree (10,000 trivial documents: 1.2 GB). A trivial
+  document now reserves about 9 KB in a fresh arena, a 2,000-element document
+  58 KB instead of 160 KB, a 5,000-element one 124 KB instead of 373 KB, and
+  large documents the same or less (chunk rounding). Node references and the
+  shift-and-mask addressing are unchanged; building and validating a 16 MB
+  document is within measurement noise of before (about 1 %).
 - XSD 1.1 (`xsd11`): the XPath tests of `xs:assert`, the `assertion` facet and
   `xs:alternative` are compiled once per schema set instead of at every evaluation.
 - Streaming validation does less work per element and per value; no verdict,

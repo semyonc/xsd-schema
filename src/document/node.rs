@@ -2,14 +2,22 @@ use crate::navigator::DomNodeType;
 
 // ── Page-addressing constants ──────────────────────────────────────────
 
-/// Page size exponent: 2^12 = 4096 nodes per page.
-pub const PAGE_SHIFT: u32 = 12;
+/// Page size exponent: 2^8 = 256 nodes per page.
+///
+/// Pages are allocated whole, on demand, so the first page is what the
+/// smallest document costs: 256 × 16 bytes = 4 KB. Pages were 4,096 nodes
+/// (64 KB) before; that reserved about 115 KB of arena for every document
+/// together with the namespace page, which a host building many small trees
+/// into one arena paid in full. A smaller page keeps the shift-and-mask
+/// addressing, allocates nothing it does not fill, and costs one more
+/// bump allocation and one more page-table entry per 256 nodes.
+pub const PAGE_SHIFT: u32 = 8;
 
-/// Nodes per page (4096). Each page = 4096 × 16 bytes = 64 KB.
+/// Nodes per page (256). Each page = 256 × 16 bytes = 4 KB.
 pub const PAGE_SIZE: u32 = 1 << PAGE_SHIFT;
 
 /// Bitmask for extracting the slot within a page.
-pub const PAGE_MASK: u32 = PAGE_SIZE - 1; // 0xFFF
+pub const PAGE_MASK: u32 = PAGE_SIZE - 1; // 0xFF
 
 /// NULL sentinel — never a valid node index.
 pub const NULL: u32 = u32::MAX;
@@ -439,9 +447,9 @@ mod tests {
 
     #[test]
     fn page_constants() {
-        assert_eq!(PAGE_SHIFT, 12);
-        assert_eq!(PAGE_SIZE, 4096);
-        assert_eq!(PAGE_MASK, 0xFFF);
+        assert_eq!(PAGE_SHIFT, 8);
+        assert_eq!(PAGE_SIZE, 256);
+        assert_eq!(PAGE_MASK, 0xFF);
         assert_eq!(1u32 << PAGE_SHIFT, PAGE_SIZE);
         assert_eq!(PAGE_SIZE - 1, PAGE_MASK);
     }
