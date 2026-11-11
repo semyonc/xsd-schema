@@ -9,7 +9,10 @@
 //! is returned, so nothing of a refused tag reaches a caller that interns
 //! names. What quick-xml itself detects (mismatched end tags, unclosed
 //! markup) is reported the same way, as [`NotWellFormed`]; only an I/O error
-//! of the source stays quick-xml's.
+//! of the source stays quick-xml's. quick-xml also refuses an event whose
+//! bytes are not UTF-8 before the layer sees it; the layer then runs its
+//! checks on those bytes, so such input is reported with the rule, message
+//! and position the checks give it (`not_utf8`).
 //!
 //! The rules are those of the version the XML declaration names: XML 1.1
 //! (Second Edition) and Namespaces in XML 1.1 for exactly `version="1.1"`,
@@ -390,19 +393,61 @@ impl AttrSpan {
         tag: &'t [u8],
         version: quick_xml::XmlVersion,
     ) -> Result<Cow<'t, str>, quick_xml::Error> {
-        let raw = self.raw_value(tag);
+        let text = |b: &'t [u8]| std::str::from_utf8(b).map_err(quick_xml::Error::from);
+        let raw = text(self.raw_value(tag))?;
         if self.needs_normalization {
             quick_xml::events::attributes::Attribute {
-                key: quick_xml::name::QName(self.key(tag)),
+                key: quick_xml::name::QName(text(self.key(tag))?),
                 value: Cow::Borrowed(raw),
             }
             .normalized_value(version)
         } else {
-            std::str::from_utf8(raw)
-                .map(Cow::Borrowed)
-                .map_err(|e| quick_xml::Error::Encoding(e.into()))
+            Ok(Cow::Borrowed(raw))
         }
     }
+}
+
+/// An event as the checks see it: the bytes quick-xml hands out for it,
+/// between the markup delimiters (an end tag's are not looked at).
+#[derive(Debug, Clone, Copy)]
+enum Raw<'a> {
+    Text(&'a [u8]),
+    /// Between `&` and `;`.
+    Ref(&'a [u8]),
+    Start(&'a [u8]),
+    Empty(&'a [u8]),
+    End,
+    CData(&'a [u8]),
+    Comment(&'a [u8]),
+    Pi(&'a [u8]),
+    Decl(&'a [u8]),
+    /// After `<!DOCTYPE` and white space, up to `>`.
+    DocType(&'a [u8]),
+    Eof,
+}
+
+impl<'a> Raw<'a> {
+    #[inline]
+    fn of(event: &'a Event<'_>) -> Self {
+        match event {
+            Event::Text(t) => Raw::Text(t.as_bytes()),
+            Event::GeneralRef(r) => Raw::Ref(r.as_bytes()),
+            Event::Start(e) => Raw::Start(e.as_bytes()),
+            Event::Empty(e) => Raw::Empty(e.as_bytes()),
+            Event::End(_) => Raw::End,
+            Event::CData(c) => Raw::CData(c.as_bytes()),
+            Event::Comment(c) => Raw::Comment(c.as_bytes()),
+            Event::PI(p) => Raw::Pi(p.as_bytes()),
+            Event::Decl(d) => Raw::Decl(d.as_bytes()),
+            Event::DocType(t) => Raw::DocType(t.as_bytes()),
+            Event::Eof => Raw::Eof,
+        }
+    }
+}
+
+/// White space as quick-xml reads it around names and in declarations.
+fn is_quick_xml_space(b: u8) -> bool {
+    matches!(b, b' ' | b'\r' | b'\n' | b'\t')
 }
 
 /// The document type declaration returned last, whose keyword is still to be
@@ -561,12 +606,30 @@ impl<B: BufRead> WfReader<B> {
         }
         buf.clear();
         let before = self.inner.buffer_position();
-        let event = match self.inner.read_event_into(buf) {
+        // quick-xml refuses an event whose bytes are not UTF-8 after it has
+        // read them into `buf`; they are what the checks below explain that
+        // refusal with. The borrow checker cannot see that a failed read
+        // leaves no borrow of `buf` behind (the returned event is the only
+        // thing that borrows it), so the buffer is reached through a raw
+        // pointer on that path (doc/UNSAFE.md, item 3).
+        let buf: *mut Vec<u8> = buf;
+        // SAFETY: `buf` comes from the `&'b mut Vec<u8>` this function holds,
+        // so it is valid and unaliased for `'b`; this is its only use on the
+        // path that returns the event.
+        let event = match self.inner.read_event_into(unsafe { &mut *buf }) {
             Ok(event) => event,
+            Err(quick_xml::Error::Encoding(e)) => {
+                // SAFETY: the read failed, so nothing borrows `*buf` any
+                // more: the error owns its data and the mutable reborrow
+                // above ended with the call. This shared reborrow is the last
+                // use of the pointer.
+                let raw = unsafe { &*buf };
+                return Err(self.not_utf8(raw, before, quick_xml::Error::Encoding(e)));
+            }
             Err(e) => return Err(self.quick_xml_error(e)),
         };
         let after = self.inner.buffer_position();
-        self.check(&event, before, after)?;
+        self.check(Raw::of(&event), before, after)?;
         if self.count_event {
             self.events += 1;
         } else {
@@ -599,7 +662,13 @@ impl<B: BufRead> WfReader<B> {
     #[cold]
     #[inline(never)]
     fn quick_xml_error(&self, e: quick_xml::Error) -> WfError {
-        let pos = self.inner.error_position();
+        self.quick_xml_error_at(e, self.inner.error_position())
+    }
+
+    /// The same, at the quick-xml offset `pos`.
+    #[cold]
+    #[inline(never)]
+    fn quick_xml_error_at(&self, e: quick_xml::Error, pos: u64) -> WfError {
         match e {
             quick_xml::Error::Syntax(SyntaxError::InvalidBangMarkup) => self.nwf(
                 R::Markup,
@@ -674,6 +743,99 @@ impl<B: BufRead> WfReader<B> {
             // reports them.
             other => decoding_refusal(other, pos + self.bom, self.version),
         }
+    }
+
+    /// An event quick-xml refused because its bytes, `raw` (all of its
+    /// markup, or all of its text), are not UTF-8: reported as the checks
+    /// report it, so the rule, message and position do not depend on which
+    /// layer saw the bytes first. The event is taken apart the way quick-xml
+    /// does before it decodes (`ReaderState::emit_*`), and what quick-xml
+    /// would have refused on the way — an end tag that matches no open
+    /// element, an unclosed reference, a misspelled `<!` keyword — is
+    /// refused as it is then. `before` is where the read started.
+    #[cold]
+    #[inline(never)]
+    fn not_utf8(&mut self, raw: &[u8], before: u64, e: quick_xml::Error) -> WfError {
+        let after = self.inner.buffer_position();
+        let Some(start) = after
+            .checked_sub(raw.len() as u64)
+            .filter(|_| !raw.is_empty())
+        else {
+            // Not an event's bytes (a source that reports an encoding error
+            // as its I/O error): as a caller's decoding reports it.
+            return self.quick_xml_error(e);
+        };
+        let len = raw.len();
+        let refused = |e: quick_xml::Error, pos: u64| Err((e, pos));
+        let event: Result<Raw<'_>, (quick_xml::Error, u64)> = match raw {
+            [b'<', b'!', b'-', ..] if raw.starts_with(b"<!--") && len >= 7 => {
+                Ok(Raw::Comment(&raw[4..len - 3]))
+            }
+            [b'<', b'!', b'-', ..] => refused(SyntaxError::UnclosedComment.into(), start),
+            [b'<', b'!', b'[', ..] if raw.starts_with(b"<![CDATA[") && len >= 12 => {
+                Ok(Raw::CData(&raw[9..len - 3]))
+            }
+            [b'<', b'!', b'[', ..] => refused(SyntaxError::UnclosedCData.into(), start),
+            [b'<', b'!', b'D' | b'd', ..]
+                if len >= 10 && raw[..9].eq_ignore_ascii_case(b"<!DOCTYPE") =>
+            {
+                match raw[9..len - 1].iter().position(|&b| !is_quick_xml_space(b)) {
+                    Some(s) => Ok(Raw::DocType(&raw[9 + s..len - 1])),
+                    None => refused(IllFormedError::MissingDoctypeName.into(), after - 1),
+                }
+            }
+            [b'<', b'!', b'D' | b'd', ..] => refused(SyntaxError::UnclosedDoctype.into(), start),
+            [b'<', b'/', ..] => {
+                // quick-xml compared the name with the open element's and
+                // named the end tag with its decoded name, which bytes that
+                // are not UTF-8 left empty.
+                match self.open_at.last() {
+                    Some(&at) => refused(
+                        IllFormedError::MismatchedEndTag {
+                            expected: String::from_utf8_lossy(&self.open[at..]).into_owned(),
+                            found: String::new(),
+                        }
+                        .into(),
+                        start,
+                    ),
+                    None => refused(IllFormedError::UnmatchedEndTag(String::new()).into(), start),
+                }
+            }
+            [b'<', b'?', ..] if len > 3 => {
+                let content = &raw[2..len - 2];
+                if content.starts_with(b"xml")
+                    && (content.len() == 3 || is_quick_xml_space(content[3]))
+                {
+                    Ok(Raw::Decl(content))
+                } else {
+                    Ok(Raw::Pi(content))
+                }
+            }
+            [b'<', ..] if raw.ends_with(b"/>") && len >= 3 => Ok(Raw::Empty(&raw[1..len - 2])),
+            [b'<', ..] if len >= 2 => Ok(Raw::Start(&raw[1..len - 1])),
+            [b'&', ..] if raw.ends_with(b";") && len >= 2 => Ok(Raw::Ref(&raw[1..len - 1])),
+            [b'&', ..] => refused(IllFormedError::UnclosedReference.into(), start),
+            // Markup quick-xml reads to its `>`, so not a lone `<`.
+            [b'<', ..] => return self.bad_bytes(raw, start),
+            _ => Ok(Raw::Text(raw)),
+        };
+        let found = match event {
+            Ok(event) => self.check(event, before, after),
+            Err((e, pos)) => Err(self.quick_xml_error_at(e, pos)),
+        };
+        match found {
+            Err(e) => e,
+            // Every check reads all of its event's bytes, so this is not
+            // reached; were it, the bytes are still refused.
+            Ok(()) => self.bad_bytes(raw, start),
+        }
+    }
+
+    /// The first byte of `raw` (at `start`) that is not UTF-8, refused.
+    #[cold]
+    #[inline(never)]
+    fn bad_bytes(&self, raw: &[u8], start: u64) -> WfError {
+        self.bad_utf8(start + find_bad_utf8(raw).unwrap_or(0) as u64)
     }
 
     /// The innermost open element and how many are open: "the element 'p:b'
@@ -760,30 +922,30 @@ impl<B: BufRead> WfReader<B> {
     // ── Dispatch ─────────────────────────────────────────────────────────
 
     #[inline]
-    fn check(&mut self, event: &Event<'_>, before: u64, after: u64) -> Result<(), WfError> {
+    fn check(&mut self, event: Raw<'_>, before: u64, after: u64) -> Result<(), WfError> {
         // Offsets of an event's content: quick-xml hands out what is between
         // the markup delimiters, so the start is the end less the length.
         let len = |b: &[u8]| b.len() as u64;
         match event {
-            Event::Text(t) => {
+            Raw::Text(t) => {
                 self.last_start = after - len(t);
                 self.check_text(t, self.last_start)
             }
-            Event::GeneralRef(r) => {
+            Raw::Ref(r) => {
                 self.last_start = after - len(r) - 2;
                 self.check_reference_event(r, self.last_start)
             }
-            Event::Start(e) => {
+            Raw::Start(e) => {
                 self.run = None;
                 self.last_start = after - len(e) - 2;
                 self.check_start(e, self.last_start, false)
             }
-            Event::Empty(e) => {
+            Raw::Empty(e) => {
                 self.run = None;
                 self.last_start = after - len(e) - 3;
                 self.check_start(e, self.last_start, true)
             }
-            Event::End(_) => {
+            Raw::End => {
                 self.run = None;
                 self.last_start = before;
                 if let Some(at) = self.open_at.pop() {
@@ -804,31 +966,30 @@ impl<B: BufRead> WfReader<B> {
     }
 
     /// The events other than text, references and tags.
-    fn check_other(&mut self, event: &Event<'_>, before: u64, after: u64) -> Result<(), WfError> {
+    fn check_other(&mut self, event: Raw<'_>, before: u64, after: u64) -> Result<(), WfError> {
         let len = |b: &[u8]| b.len() as u64;
         match event {
-            Event::CData(c) => {
+            Raw::CData(c) => {
                 self.last_start = after - len(c) - 12;
                 self.check_cdata(c, self.last_start)
             }
-            Event::Comment(c) => {
+            Raw::Comment(c) => {
                 self.last_start = after - len(c) - 7;
                 self.check_comment(c, self.last_start)
             }
-            Event::PI(p) => {
+            Raw::Pi(p) => {
                 self.last_start = after - len(p) - 4;
                 self.check_pi(p, self.last_start)
             }
-            Event::Decl(d) => {
-                let d: &[u8] = d;
+            Raw::Decl(d) => {
                 self.last_start = after - len(d) - 4;
                 self.check_decl(d, self.last_start)
             }
-            Event::DocType(t) => {
+            Raw::DocType(t) => {
                 self.last_start = before;
                 self.check_doctype(t, before, after)
             }
-            Event::Eof => {
+            Raw::Eof => {
                 self.last_start = after;
                 if self.depth > 0 {
                     return Err(self.nwf(
@@ -842,11 +1003,7 @@ impl<B: BufRead> WfReader<B> {
                 }
                 Ok(())
             }
-            Event::Text(_)
-            | Event::GeneralRef(_)
-            | Event::Start(_)
-            | Event::Empty(_)
-            | Event::End(_) => {
+            Raw::Text(_) | Raw::Ref(_) | Raw::Start(_) | Raw::Empty(_) | Raw::End => {
                 unreachable!("handled by `check`")
             }
         }

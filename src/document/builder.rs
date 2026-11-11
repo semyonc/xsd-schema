@@ -1643,9 +1643,7 @@ impl<'a> BufferDocumentBuilder<'a> {
                 Ok(Event::Text(ref e)) => {
                     if !self.element_stack.is_empty() {
                         // XML 1.0 / 1.1 line-end normalization (§2.11).
-                        let text = e
-                            .xml_content(xml_reader.quick_xml_version())
-                            .map_err(|_| document_error(xml_reader.recheck().utf8()))?;
+                        let text = e.xml_content(xml_reader.quick_xml_version());
                         self.text(&text);
                     }
                 }
@@ -1657,19 +1655,13 @@ impl<'a> BufferDocumentBuilder<'a> {
                     self.text(&text);
                 }
                 Ok(Event::CData(ref e)) => {
-                    let text = std::str::from_utf8(e)
-                        .map_err(|_| document_error(xml_reader.recheck().utf8()))?;
-                    self.text(text);
+                    self.text(e);
                 }
                 Ok(Event::Comment(ref e)) => {
-                    let text = std::str::from_utf8(e)
-                        .map_err(|_| document_error(xml_reader.recheck().utf8()))?;
-                    self.comment(text)?;
+                    self.comment(e)?;
                 }
                 Ok(Event::PI(ref e)) => {
-                    let raw = std::str::from_utf8(e)
-                        .map_err(|_| document_error(xml_reader.recheck().utf8()))?;
-                    let (target, data) = parse_pi_content(raw);
+                    let (target, data) = parse_pi_content(e);
                     self.processing_instruction(target, data)?;
                 }
                 Ok(Event::Decl(_)) => {
@@ -1709,7 +1701,7 @@ impl<'a> BufferDocumentBuilder<'a> {
         // `at` reports what still fails as the refusal it is (see `Recheck`).
         let at = xml_reader.recheck();
         let utf8 = |_| document_error(at.utf8());
-        let tag: &[u8] = e;
+        let tag = e.as_bytes();
         let mut local_decls: Vec<Box<[u8]>> = Vec::new();
         let mut ns_decls_str: Vec<(String, String)> = Vec::new();
 
@@ -1743,7 +1735,7 @@ impl<'a> BufferDocumentBuilder<'a> {
 
         // Resolve element name
         let full_name = e.name();
-        let full_name_bytes = full_name.as_ref();
+        let full_name_bytes = full_name.as_ref().as_bytes();
         let (elem_prefix_bytes, elem_local_bytes) = split_prefix_local(full_name_bytes);
 
         let elem_local = std::str::from_utf8(elem_local_bytes).map_err(utf8)?;

@@ -561,7 +561,7 @@ fn handle_start_element(
 
     // Parse element name
     let name = element.name();
-    let name_bytes = name.as_ref();
+    let name_bytes = name.as_ref().as_bytes();
     let (local_name_bytes, prefix_bytes) = split_qname(name_bytes);
 
     let local_name = std::str::from_utf8(local_name_bytes).map_err(|e| {
@@ -583,12 +583,11 @@ fn handle_start_element(
             .map_err(|e| SchemaError::xml(format!("Attribute value error: {}", e), None))?;
 
         // Check for xmlns declarations
-        if attr_name == b"xmlns" {
+        if attr_name == "xmlns" {
             // Default namespace
             state.ns_context.add_namespace("", &attr_value);
-        } else if attr_name.starts_with(b"xmlns:") {
+        } else if let Some(prefix) = attr_name.strip_prefix("xmlns:") {
             // Prefixed namespace
-            let prefix = std::str::from_utf8(&attr_name[6..]).unwrap_or("");
             state.ns_context.add_namespace(prefix, &attr_value);
         }
     }
@@ -1048,9 +1047,7 @@ fn handle_text(
     span: SourceSpan,
 ) -> SchemaResult<()> {
     let version = state.quick_xml_version();
-    let text_content = text
-        .xml_content(version)
-        .map_err(|e| SchemaError::xml(format!("Text content error: {}", e), None))?;
+    let text_content = text.xml_content(version);
 
     apply_text(state, &text_content, span)
 }
@@ -1104,16 +1101,12 @@ fn handle_cdata(
     if let Some(mut frame) = state.frame_stack.pop() {
         if frame.accepts_text() {
             // Convert CDATA to string
-            if let Ok(cdata_str) = std::str::from_utf8(cdata.as_ref()) {
-                frame.on_cdata(cdata_str);
-            }
+            frame.on_cdata(cdata);
         } else if !frame.is_skip_frame() {
             // CDATA content is significant — even whitespace-only CDATA represents
             // intentional text. In an XSD element that doesn't allow text content,
             // this is invalid.
-            let cdata_is_whitespace = std::str::from_utf8(cdata.as_ref())
-                .map(|s| s.trim().is_empty())
-                .unwrap_or(false);
+            let cdata_is_whitespace = cdata.trim().is_empty();
             if !cdata_is_whitespace {
                 let source_ref = state.source_ref(span);
                 state.frame_stack.push(frame);

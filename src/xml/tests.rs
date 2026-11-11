@@ -191,3 +191,57 @@ fn xml_1_1_positions_and_citations() {
         other => panic!("{other:?}"),
     }
 }
+
+#[test]
+fn bytes_that_are_not_utf8_are_refused_as_the_checks_refuse_them() {
+    // quick-xml refuses an event whose bytes are not UTF-8 before the layer
+    // checks it; the layer reports what its checks find in those bytes, at
+    // the same rule and position whatever the source's chunks.
+    let cases: &[(&[u8], R, u64)] = &[
+        (b"<r>ab\xFF</r>", R::Encoding, 5),
+        (b" \xFF<r/>", R::Document, 1),
+        (b"<r>&a\xFF;</r>", R::Encoding, 4),
+        (b"<r>&a\xFF</r>", R::Reference, 3),
+        (b"<r a=\"\xFF\"/>", R::Encoding, 6),
+        (b"<r a\xFF=\"1\"/>", R::Encoding, 4),
+        (b"<r></r\xFF>", R::ElementTypeMatch, 3),
+        (b"<r/></r\xFF>", R::ElementTypeMatch, 4),
+        (b"<!--\xFF--><r/>", R::Encoding, 4),
+        (b"<r><![CDATA[\xFF]]></r>", R::Encoding, 12),
+        (b"<?pi \xFF?><r/>", R::Encoding, 5),
+        (b"<?xml version=\"1.0\"\xFF?><r/>", R::XmlDeclaration, 19),
+        (b"<!DOCTYPE r\xFF><r/>", R::Encoding, 11),
+        (b"<!DOCTYX r\xFF><r/>", R::Truncated, 0),
+        (b"<!-x\xFF--><r/>", R::Truncated, 0),
+        (b"\xEF\xBB\xBF<r>\xC3</r>", R::Encoding, 6),
+    ];
+    for &(xml, rule, pos) in cases {
+        assert_eq!(
+            rule_at(xml, false),
+            (rule, pos),
+            "{:?}",
+            String::from_utf8_lossy(xml)
+        );
+        // The same in one-byte chunks.
+        let mut r = WfReader::new(
+            std::io::BufReader::with_capacity(1, xml),
+            &ParseLimits::none(),
+            false,
+        );
+        let mut buf = Vec::new();
+        let found = loop {
+            match r.read_event_into(&mut buf) {
+                Ok(Event::Eof) => panic!("{:?} read through", String::from_utf8_lossy(xml)),
+                Ok(_) => {}
+                Err(WfError::NotWellFormed(e)) => break (e.rule(), e.position()),
+                Err(other) => panic!("{other:?}"),
+            }
+        };
+        assert_eq!(
+            found,
+            (rule, pos),
+            "{:?} in chunks",
+            String::from_utf8_lossy(xml)
+        );
+    }
+}

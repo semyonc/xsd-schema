@@ -27,10 +27,10 @@ pub(crate) fn resolve_general_ref(r: &BytesRef<'_>) -> Result<Cow<'static, str>,
         return Ok(Cow::Owned(ch.to_string()));
     }
 
-    let name = r.decode()?;
-    match resolve_predefined_entity(&name) {
+    let name: &str = r;
+    match resolve_predefined_entity(name) {
         Some(replacement) => Ok(Cow::Borrowed(replacement)),
-        None => Err(EscapeError::UnrecognizedEntity(0..name.len(), name.into_owned()).into()),
+        None => Err(EscapeError::UnrecognizedEntity(0..name.len(), name.to_owned()).into()),
     }
 }
 

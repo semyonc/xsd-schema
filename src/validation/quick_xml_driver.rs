@@ -502,10 +502,7 @@ where
         match &event {
             Ok(Event::Text(e)) if depth > 0 => {
                 // XML 1.0 / 1.1 line-end normalization (§2.11).
-                pending_text.push_str(
-                    &e.xml_content(xml_reader.quick_xml_version())
-                        .map_err(|_| drive_error(xml_reader.recheck().utf8()))?,
-                );
+                pending_text.push_str(&e.xml_content(xml_reader.quick_xml_version()));
                 continue;
             }
             Ok(Event::GeneralRef(e)) if depth > 0 => {
@@ -576,8 +573,7 @@ where
                 depth = depth.saturating_sub(1);
             }
             Ok(Event::CData(ref e)) if depth > 0 => {
-                let s = std::str::from_utf8(e.as_ref())
-                    .map_err(|_| drive_error(xml_reader.recheck().utf8()))?;
+                let s: &str = e;
                 runtime.validate_text(s);
                 handler
                     .on_text(TextKind::CData, s)
@@ -589,14 +585,10 @@ where
                 // nor handler.
             }
             Ok(Event::Comment(ref e)) => {
-                let s = std::str::from_utf8(e.as_ref())
-                    .map_err(|_| drive_error(xml_reader.recheck().utf8()))?;
-                handler.on_comment(s).map_err(DriveWithError::Hook)?;
+                handler.on_comment(e).map_err(DriveWithError::Hook)?;
             }
             Ok(Event::PI(ref e)) => {
-                let raw = std::str::from_utf8(e.as_ref())
-                    .map_err(|_| drive_error(xml_reader.recheck().utf8()))?;
-                let (target, data) = parse_pi_content(raw);
+                let (target, data) = parse_pi_content(e);
                 handler
                     .on_processing_instruction(target, data)
                     .map_err(DriveWithError::Hook)?;
@@ -604,9 +596,7 @@ where
             Ok(Event::DocType(ref e)) => {
                 // In the prolog (the reader refuses one anywhere else). The
                 // keyword is checked on the markup before the hook sees it.
-                let text = std::str::from_utf8(e.as_ref())
-                    .map_err(|_| drive_error(xml_reader.recheck().utf8()))?
-                    .to_string();
+                let text = String::from(&**e);
                 xml_reader.confirm_doctype(buf).map_err(drive_error)?;
                 let name_end = text
                     .find([' ', '\t', '\n', '\r', '['])
@@ -712,7 +702,7 @@ where
 
     // 1. Push xmlns scope, collect declarations as (prefix_string, uri_string).
     // The tag's attributes, as the reader found them while checking it.
-    let tag: &[u8] = e;
+    let tag = e.as_bytes();
     let spans = xml_reader.attributes();
     let version = xml_reader.quick_xml_version();
     // The reader checked the tag (UTF-8, bound prefixes, references): `at`
@@ -942,9 +932,8 @@ fn resolve_element_qname<'a, E>(
     at: Recheck,
     prefix_map: &'a PrefixMap,
 ) -> Result<(&'a str, &'a str, &'a str), DriveWithError<E>> {
-    let (prefix_bytes, local_bytes) = split_prefix_local(e.name().0);
-    let local = std::str::from_utf8(local_bytes).map_err(|_| drive_error(at.utf8()))?;
-    let prefix = std::str::from_utf8(prefix_bytes).map_err(|_| drive_error(at.utf8()))?;
+    let (prefix, local) = split_prefix_local(e.name().0);
+    let prefix_bytes = prefix.as_bytes();
     let namespace = if prefix_bytes.is_empty() {
         prefix_map
             .get(prefix_bytes)
@@ -1034,10 +1023,10 @@ fn build_ns_context(prefix_map: &PrefixMap, schema_set: &SchemaSet) -> Namespace
     snapshot
 }
 
-fn split_prefix_local(name: &[u8]) -> (&[u8], &[u8]) {
-    match name.iter().position(|&b| b == b':') {
-        Some(pos) => (&name[..pos], &name[pos + 1..]),
-        None => (b"", name),
+fn split_prefix_local(name: &str) -> (&str, &str) {
+    match name.split_once(':') {
+        Some((prefix, local)) => (prefix, local),
+        None => ("", name),
     }
 }
 

@@ -1,12 +1,13 @@
 # Unsafe Code
 
-The library contains three `unsafe` blocks, in two places; the tests one more.
+The library contains five `unsafe` blocks, in three places; the tests one more.
 This list is complete: `grep -rnw unsafe src` finds no other.
 
 | # | Where | What |
 | --- | --- | --- |
 | 1 | `src/namespace/table.rs`, `NameTable::resolve_ref` and `try_resolve_ref` | `&str` into interned names without a `RefCell` guard |
 | 2 | `src/validation/runtime.rs`, `begin_assertion_buffering` | the self-referential fragment builder of assertion buffering |
+| 3 | `src/xml/reader.rs`, `WfReader::read_event_into` | the read buffer reached again after quick-xml refused bytes that are not UTF-8 |
 | — | `src/types/mod.rs`, test `test_xml_type_code_roundtrip` | `transmute` of `u8` to `XmlTypeCode` (`#[cfg(test)]` only) |
 
 ## 1. NameTable::resolve_ref / try_resolve_ref
@@ -46,6 +47,31 @@ XSD 1.1 assertion buffering during streaming validation.
 - `Bump` uses interior mutability; builder holds `&Bump`, not `&mut Bump`.
 - `ValidationRuntime` is `!Send + !Sync`.
 
+## 3. WfReader::read_event_into: The Buffer After a Refused Read
+
+**File**: `src/xml/reader.rs`, `WfReader::read_event_into()`
+
+quick-xml reads an event's bytes into the caller's buffer and then checks that
+they are UTF-8; when they are not, it returns `Error::Encoding` and the bytes
+stay in the buffer. The well-formedness layer reports such input with the rule,
+message and position its own checks give for those bytes, so it reads them
+there. The event a successful read returns borrows the buffer for the
+lifetime of the caller's `&'b mut Vec<u8>`, and the borrow checker extends
+that borrow to the error path as well (NLL "problem case #3"; Polonius accepts
+the code). Two blocks work around it: the call reborrows the buffer mutably
+through a raw pointer made from that `&'b mut`, and the error path reborrows
+it shared through the same pointer.
+
+**Safety invariants**:
+
+- The pointer comes from the function's own `&'b mut Vec<u8>`: valid,
+  aligned and unaliased for `'b`.
+- On success the event (derived from the mutable reborrow) is returned and the
+  pointer is not used again.
+- On an error nothing borrows the buffer: `quick_xml::Error` owns its data and
+  the mutable reborrow ended with the call. The shared reborrow is the last
+  use of the pointer and does not outlive the function.
+
 ## Test code
 
 **File**: `src/types/mod.rs`, `test_xml_type_code_roundtrip` (`#[cfg(test)]`)
@@ -62,10 +88,14 @@ MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test --lib --features xsd
     validation::runtime::tests::assertion_runtime_tests
 MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test --lib --features xsd11 \
     types::tests::test_xml_type_code_roundtrip
+cargo +nightly miri test --lib \
+    xml::tests::bytes_that_are_not_utf8_are_refused_as_the_checks_refuse_them
 ```
 
 The first covers block 1, the second block 2, the third the test-only
-`transmute`. `-Zmiri-disable-isolation` lets the XPath engine read the clock
+`transmute`, the fourth block 3 (both paths: every kind of event refused,
+read whole and in one-byte chunks, after events that were returned).
+`-Zmiri-disable-isolation` lets the XPath engine read the clock
 (`fn:current-dateTime`), which an isolated Miri refuses. The whole library
 can run under Miri as well (`cargo +nightly miri test --lib`, with
 `--features xsd11` and the flag above), but slowly: the 23 assertion tests

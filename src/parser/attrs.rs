@@ -82,7 +82,7 @@ pub(crate) fn parse_attributes_in<'a>(
             .into_owned();
 
         // Split into prefix and local name
-        let (local_name_bytes, prefix_bytes) = crate::parser::reader::split_qname(name);
+        let (local_name_bytes, prefix_bytes) = crate::parser::reader::split_qname(name.as_bytes());
 
         let name_table = ns_context.name_table_mut();
         let local_name_str =

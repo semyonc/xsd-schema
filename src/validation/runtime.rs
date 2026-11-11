@@ -6451,10 +6451,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         let mut validity = SchemaValidity::Valid;
 
         // Even token count check (namespace/location pairs)
-        // `usize::is_multiple_of` was stabilized in Rust 1.87; the modulo keeps
-        // the crate buildable on older toolchains.
-        #[allow(clippy::manual_is_multiple_of)]
-        if tokens.len() % 2 != 0 {
+        if !tokens.len().is_multiple_of(2) {
             self.report_error(
                 "cvc-schema-location",
                 format!(
@@ -6489,10 +6486,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         let base_uri = self.current_element_base_uri();
         let xsd10 = self.schema_set.is_xsd10();
         let current_serial = self.validation_stack.last().map(|ev| ev.element_serial);
-        for pair in tokens.chunks_exact(2) {
-            let ns_str = pair[0];
-            let loc_str = pair[1];
-
+        for &[ns_str, loc_str] in tokens.as_chunks::<2>().0 {
             if xsd10 {
                 if let Some(serial) = current_serial {
                     let ns_id: Option<NameId> = if ns_str.is_empty() {

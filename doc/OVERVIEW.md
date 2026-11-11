@@ -224,8 +224,9 @@ crate's `unsafe` blocks (`resolve_ref` / `try_resolve_ref` return `&str` into
 interned data without allocating, so `DomNavigator` methods don't need to
 allocate). The third lives in `ValidationRuntime::begin_assertion_buffering`,
 which extends the lifetime of a `Bump` arena borrow used by the
-self-referential fragment builder. Every site and its contract is listed in
-`doc/UNSAFE.md`.
+self-referential fragment builder; the last two in `WfReader::read_event_into`,
+which reads the buffer again after quick-xml refused bytes that are not UTF-8.
+Every site and its contract is listed in `doc/UNSAFE.md`.
 
 ---
 
@@ -678,4 +679,4 @@ DOM implementation, and they should not reimplement type machinery — see the
 | Identity constraints | `src/validation/identity.rs` | `src/validation/active_axis.rs`, `src/validation/identity_parser.rs` |
 | XSD 1.1 assertions | `src/validation/assertions.rs` | `src/document/`, `src/xpath/` |
 | XPath engine work | `src/xpath/` | `src/navigator/`, `src/document/` |
-| Unsafe-code review | `doc/UNSAFE.md` | `src/namespace/table.rs`, `src/validation/runtime.rs` |
+| Unsafe-code review | `doc/UNSAFE.md` | `src/namespace/table.rs`, `src/validation/runtime.rs`, `src/xml/reader.rs` |

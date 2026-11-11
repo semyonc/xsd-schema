@@ -370,15 +370,14 @@ impl TestSuiteParser {
             match reader.read_event_into(&mut buf) {
                 Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
                     let name_ref = e.local_name();
-                    let local_name = String::from_utf8_lossy(name_ref.as_ref()).to_string();
+                    let local_name = name_ref.as_ref().to_string();
 
                     match local_name.as_str() {
                         "testSuite" | "testSet" => {
                             // Extract version from testSet if present
                             for attr in e.attributes().flatten() {
-                                if attr.key.as_ref() == b"version" {
-                                    testset_version_attr =
-                                        Some(String::from_utf8_lossy(&attr.value).to_string());
+                                if attr.key.as_ref() == "version" {
+                                    testset_version_attr = Some(attr.value.to_string());
                                 }
                             }
                         }
@@ -386,8 +385,8 @@ impl TestSuiteParser {
                             // Follow testSetRef links to external manifest files
                             for attr in e.attributes().flatten() {
                                 let key = attr.key.as_ref();
-                                if key == b"xlink:href" || key == b"href" {
-                                    let href = String::from_utf8_lossy(&attr.value);
+                                if key == "xlink:href" || key == "href" {
+                                    let href = &attr.value;
                                     let ref_path = manifest_dir.join(href.as_ref());
                                     if ref_path.exists() {
                                         let ver = testset_version_attr.as_deref();
@@ -414,13 +413,11 @@ impl TestSuiteParser {
                             group_version_attr = None;
                             for attr in e.attributes().flatten() {
                                 match attr.key.as_ref() {
-                                    b"name" => {
-                                        current_group =
-                                            String::from_utf8_lossy(&attr.value).to_string();
+                                    "name" => {
+                                        current_group = attr.value.to_string();
                                     }
-                                    b"version" => {
-                                        group_version_attr =
-                                            Some(String::from_utf8_lossy(&attr.value).to_string());
+                                    "version" => {
+                                        group_version_attr = Some(attr.value.to_string());
                                     }
                                     _ => {}
                                 }
@@ -435,13 +432,11 @@ impl TestSuiteParser {
                             let mut test_name = String::new();
                             for attr in e.attributes().flatten() {
                                 match attr.key.as_ref() {
-                                    b"name" => {
-                                        test_name =
-                                            String::from_utf8_lossy(&attr.value).to_string();
+                                    "name" => {
+                                        test_name = attr.value.to_string();
                                     }
-                                    b"version" => {
-                                        test_version_attr =
-                                            Some(String::from_utf8_lossy(&attr.value).to_string());
+                                    "version" => {
+                                        test_version_attr = Some(attr.value.to_string());
                                     }
                                     _ => {}
                                 }
@@ -498,8 +493,8 @@ impl TestSuiteParser {
                             if let Some(ref mut test) = current_test {
                                 for attr in e.attributes().flatten() {
                                     let key = attr.key.as_ref();
-                                    if key == b"xlink:href" || key == b"href" {
-                                        let href = String::from_utf8_lossy(&attr.value);
+                                    if key == "xlink:href" || key == "href" {
+                                        let href = &attr.value;
                                         let schema_path = manifest_dir.join(href.as_ref());
                                         test.schema_files.push(schema_path);
                                     }
@@ -510,8 +505,8 @@ impl TestSuiteParser {
                             if let Some(ref mut test) = current_test {
                                 for attr in e.attributes().flatten() {
                                     let key = attr.key.as_ref();
-                                    if key == b"xlink:href" || key == b"href" {
-                                        let href = String::from_utf8_lossy(&attr.value);
+                                    if key == "xlink:href" || key == "href" {
+                                        let href = &attr.value;
                                         let instance_path = manifest_dir.join(href.as_ref());
                                         test.instance_file = Some(instance_path);
                                     }
@@ -525,15 +520,11 @@ impl TestSuiteParser {
 
                                 for attr in e.attributes().flatten() {
                                     match attr.key.as_ref() {
-                                        b"validity" => {
-                                            validity_str = Some(
-                                                String::from_utf8_lossy(&attr.value).to_string(),
-                                            );
+                                        "validity" => {
+                                            validity_str = Some(attr.value.to_string());
                                         }
-                                        b"version" => {
-                                            expected_version = Some(
-                                                String::from_utf8_lossy(&attr.value).to_string(),
-                                            );
+                                        "version" => {
+                                            expected_version = Some(attr.value.to_string());
                                         }
                                         _ => {}
                                     }
@@ -561,7 +552,7 @@ impl TestSuiteParser {
                 }
                 Ok(Event::End(ref e)) => {
                     let name_ref = e.local_name();
-                    let local_name = String::from_utf8_lossy(name_ref.as_ref()).to_string();
+                    let local_name = name_ref.as_ref().to_string();
 
                     match local_name.as_str() {
                         "testGroup" => {
