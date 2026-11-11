@@ -538,11 +538,6 @@ impl<B: BufRead> WfReader<B> {
         &self.attrs
     }
 
-    /// The underlying quick-xml reader.
-    pub(crate) fn inner(&self) -> &Reader<B> {
-        &self.inner
-    }
-
     /// The byte offset into the input (a leading BOM included) up to which
     /// the input has been read.
     pub(crate) fn buffer_position(&self) -> u64 {

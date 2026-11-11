@@ -31,8 +31,8 @@ pub use reader::{split_qname, ReaderConfig, TrackedEvent, TrackedReader};
 
 // Re-exports from attrs
 pub use attrs::{
-    categorize_attributes, parse_attributes, parse_boolean, parse_form, parse_occurs,
-    parse_process_contents, parse_use, AttributeMap, ParsedAttribute,
+    categorize_attributes, parse_boolean, parse_form, parse_occurs, parse_process_contents,
+    parse_use, AttributeMap, ParsedAttribute,
 };
 
 // Re-exports from parse

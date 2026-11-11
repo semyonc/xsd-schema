@@ -452,16 +452,6 @@ impl SchemaError {
     }
 }
 
-/// Conversion from quick-xml errors
-impl From<quick_xml::Error> for SchemaError {
-    fn from(err: quick_xml::Error) -> Self {
-        SchemaError::XmlError {
-            message: err.to_string(),
-            location: None,
-        }
-    }
-}
-
 /// Helper function for formatting optional location
 fn location_str(loc: &Option<SourceLocation>) -> String {
     match loc {

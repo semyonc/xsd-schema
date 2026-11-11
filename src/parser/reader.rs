@@ -1,9 +1,9 @@
 //! Tracked XML reader
 //!
-//! Wraps quick-xml Reader with byte position tracking for source mapping.
+//! Reads a schema document through the crate's well-formedness layer, with
+//! byte position tracking for source mapping.
 
 use quick_xml::events::Event;
-use quick_xml::Reader;
 use std::io::BufRead;
 
 use crate::error::{SchemaError, SchemaResult};
@@ -12,17 +12,22 @@ use crate::xml::reader::{WfError, WfReader};
 use crate::xml::ParseLimits;
 
 /// XML event with source span
+///
+/// What kind of event it is ([`is_start`](Self::is_start) and the other
+/// predicates) and where it is in the input ([`span`](Self::span)); the
+/// event's content is the crate's own (the schema-document parser reads it).
 #[derive(Debug)]
 pub struct TrackedEvent<'a> {
-    /// The XML event
-    pub event: Event<'a>,
+    /// The XML event (quick-xml's, so not public: quick-xml's types are not
+    /// part of this crate's API)
+    pub(crate) event: Event<'a>,
     /// Byte span in source
     pub span: SourceSpan,
 }
 
 impl<'a> TrackedEvent<'a> {
     /// Create a new tracked event
-    pub fn new(event: Event<'a>, span: SourceSpan) -> Self {
+    pub(crate) fn new(event: Event<'a>, span: SourceSpan) -> Self {
         Self { event, span }
     }
 
@@ -188,11 +193,6 @@ impl<R: BufRead> TrackedReader<R> {
     /// its XML declaration has been read).
     pub fn xml_version(&self) -> crate::xml::XmlVersion {
         self.reader.xml_version()
-    }
-
-    /// Get a reference to the underlying reader for decoding
-    pub fn inner(&self) -> &Reader<R> {
-        self.reader.inner()
     }
 }
 

@@ -42,19 +42,9 @@ impl ParsedAttribute {
     }
 }
 
-/// Parse attributes from a quick-xml BytesStart (values normalized with the
-/// XML 1.0 rules)
-pub fn parse_attributes<'a>(
-    attrs: impl Iterator<Item = Result<Attribute<'a>, quick_xml::events::attributes::AttrError>>,
-    ns_context: &mut NamespaceContext,
-    source: Option<SourceRef>,
-) -> SchemaResult<Vec<ParsedAttribute>> {
-    parse_attributes_in(attrs, ns_context, source, XmlVersion::Implicit1_0)
-}
-
-/// [`parse_attributes`] with the values normalized for the document's XML
-/// `version` (XML 1.1 also reads NEL, CR NEL and LINE SEPARATOR as line
-/// ends).
+/// Parse the attributes of a start tag (quick-xml's), with the values
+/// normalized for the document's XML `version` (XML 1.0 / 1.1 §3.3.3; XML 1.1
+/// also reads NEL, CR NEL and LINE SEPARATOR as line ends).
 pub(crate) fn parse_attributes_in<'a>(
     attrs: impl Iterator<Item = Result<Attribute<'a>, quick_xml::events::attributes::AttrError>>,
     ns_context: &mut NamespaceContext,
