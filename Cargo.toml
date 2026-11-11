@@ -63,7 +63,7 @@ unicode-normalization = { version = "0.1", optional = true }
 # XML Schema 1.1 regex engine (native XSD/XPath regex with ICU4X Unicode).
 # The maintained fork of `regexml`, published as `regexml-fork`; renamed back
 # so the code keeps the name `regexml`.
-regexml = { package = "regexml-fork", version = "0.3", optional = true }
+regexml = { package = "regexml-fork", version = "0.4", optional = true }
 
 [build-dependencies]
 lalrpop = { version = "0.23.2", optional = true }
