@@ -78,19 +78,25 @@ over 10 iterations, and the schema is compiled **once, off the clock**.
 
 | Strategy | Parser | Time | Throughput | RSS delta |
 | --- | --- | ---: | ---: | ---: | 
-| streaming | quick-xml | 231 ms | 67.5 MB/s | **736 KB** |
-| DOM (roxmltree) | roxmltree | 212 ms | 73.3 MB/s | 88.5 MB |
-| DOM (BufferDoc) | quick-xml | 291 ms | 53.4 MB/s | 61.6 MB |
+| streaming | quick-xml | 237 ms | 65.8 MB/s | **704 KB** |
+| DOM (roxmltree) | roxmltree | 214 ms | 72.8 MB/s | 88.5 MB |
+| DOM (BufferDoc) | quick-xml | 297 ms | 52.5 MB/s | 62.2 MB |
 
-Re-measured 2026-11-07 with Rust 1.99.1 (eight runs per strategy, medians,
-spread under 3 %), after the per-element and per-value work listed under
-0.3.1 in the changelog; the streaming row again on 2026-11-08, after
-the streaming driver stopped copying element names (eight runs alternating
-with the previous build, which measured 258 ms in the same session; spread
-under 8 %). The DOM rows do not go through that driver. The 0.3.0 table
-(2026-10-29) read 322 / 279 / 357 ms, and on the same machine and toolchain
-0.2.3 measures 296 / 252 / 325 ms: the cost the exact value-space facet checks
-of 0.3.0 added on this facet-heavy corpus is won back.
+Re-measured 2026-11-10 with Rust 1.99.1 for 0.4.0, on quick-xml
+0.42 and regexml-fork 0.4 (eight runs per strategy, medians, spread under
+5 %), alternating with a build of 0.3.1, which measured 229 / 214 / 293 ms in
+the same session. All three rows are within what two builds differ by on this
+machine without doing different work, so the times do not separate 0.4.0 from
+0.3.1. Counted in executed instructions, which repeat to a few tenths of a
+percent, the two quick-xml rows do about 2 % more work and the roxmltree row
+the same: quick-xml 0.42 checks every event for UTF-8 as it reads, which makes
+reading alone about a quarter slower than with 0.41
+([quick-xml issue 1039](https://github.com/tafia/quick-xml/issues/1039)), and
+reading is a small part of validation. regexml-fork 0.4 does not show
+here, as this schema has no patterns; a 990-item NF-e document, whose schema
+has 74, validates in 33 ms instead of 51 ms. The 0.3.1 table (2026-11-07 and
+-08) read 231 / 212 / 291 ms, the 0.3.0 table (2026-10-29) 322 / 279 / 357 ms,
+and on the same machine and toolchain 0.2.3 measures 296 / 252 / 325 ms.
 
 
 
