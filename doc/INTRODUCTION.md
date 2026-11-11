@@ -3,7 +3,8 @@
 This document is a short introduction to the public API in `xsd-schema`.
 It is intentionally smaller than rustdoc: use it to find the right entry
 points first, then drill into rustdoc for method-level details. Coming from
-0.2.x? [Upgrading to 0.3](UPGRADING_0_3.md) lists what changed.
+0.3.x? [Upgrading to 0.4](UPGRADING_0_4.md) lists what changed (from 0.2.x:
+[Upgrading to 0.3](UPGRADING_0_3.md)).
 
 ## Feature Sets
 

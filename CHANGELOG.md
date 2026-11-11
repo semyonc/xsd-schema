@@ -7,6 +7,94 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+This will be 0.4.0. It raises the minimum supported Rust version, moves to
+quick-xml 0.42, lalrpop 0.23 and regexml-fork 0.4, and takes quick-xml's types
+out of the public API, so that a later quick-xml release no longer changes this
+crate's API. Code that uses none of the items under *Breaking changes* and
+builds with Rust 1.88 needs no change; [Upgrading to 0.4](doc/UPGRADING_0_4.md)
+has the 0.3.x and the 0.4 code for each item. 0.3.1 stays the release for Rust
+1.85 to 1.87.
+
+Conformance is unchanged against 0.3.1: the W3C XSD 1.0 suite passes 39,461 of
+39,510 tests, the XSD 1.1 suite 2,313 of 2,319 and the XPath 2.0 tests of XQTS
+8,047 of 8,047, with the same failures by name; the GAEB DA XML 3.3 and WSDL
+corpora give the same results.
+
+### Breaking changes
+
+- The minimum supported Rust version is 1.88 (was 1.85). quick-xml 0.42 and
+  lalrpop 0.23 need 1.86, the ICU4X 2.4 crates behind regexml-fork 0.4 (`xsd11`)
+  1.88.
+- No public item carries a quick-xml type any more. These are removed or no
+  longer public:
+  - `parser::TrackedEvent::event`, a `quick_xml::events::Event`, is no longer
+    public, nor is `TrackedEvent::new`. Use the event's kind (`is_start`,
+    `is_empty`, `is_end`, `is_text`, `is_eof`) and its `span`, which stay.
+  - `parser::TrackedReader::inner()`, which returned the `quick_xml::Reader`, is
+    removed. The reader's position and state are `buffer_position`,
+    `last_position`, `error_position` and `xml_version`.
+  - `impl From<quick_xml::Error> for SchemaError` is removed, so `?` no longer
+    turns a quick-xml error into a `SchemaError`. Use
+    `SchemaError::xml(e.to_string(), None)`, which is what the conversion made.
+  - `parser::attrs::parse_attributes` (also exported as
+    `parser::parse_attributes`), which took quick-xml attributes, is removed.
+    The schema-document parser keeps the step internally; code that called it
+    builds `ParsedAttribute` (public fields) from the attributes it reads and
+    uses `categorize_attributes` and `AttributeMap` as before.
+
+  The validation drivers (`drive_quick_xml` and its variants),
+  `BufferDocument` and the schema loaders take a `BufRead` or a byte slice, as
+  before.
+
+### Changed
+
+- quick-xml 0.42 (was 0.41) reads the XML text. It refuses input that is not
+  UTF-8 while it reads; the readers report such input as before, with the same
+  well-formedness rule, message and byte position.
+- regexml-fork 0.4 (was 0.3) is the XSD 1.1 and XPath regular-expression engine
+  (`xsd11`):
+  - The character data behind `\p{…}`, `\P{…}`, `\d`, `\w` and their
+    complements, and behind case-blind matching, is Unicode 18.0's instead of
+    15.1's (ICU4X 2.4 instead of 1.5): the characters assigned since 15.1 are
+    in their categories (`\p{L}` holds 158,172 code points instead of 136,726,
+    `\p{Nd}` 770 instead of 680), and of those assigned in 15.1 U+0295 moves
+    from `Ll` to `Lo` and U+1171E from `Mn` to `Mc`. `\s`, `\i`, `\c`, `.` and
+    the block escapes (`\p{IsBasicLatin}`) do not change; XSD 1.0 patterns are
+    pinned to Unicode 3.0 by this crate and do not change either.
+  - `zerovec` 0.10, which the ICU4X 1.5 crates brought, is no longer in the
+    dependency graph.
+- lalrpop and lalrpop-util 0.23.2 (were 0.22.2) generate and run the XPath
+  parser (`xsd11`); the build no longer depends on `string_cache` 0.8.
+- The library has five `unsafe` blocks (was three): the two new ones let the
+  well-formedness reader read the bytes quick-xml refused as not UTF-8, so that
+  it reports them as before; see [`doc/UNSAFE.md`](doc/UNSAFE.md).
+
+### Fixed
+
+- XSD 1.1 and XPath (`xsd11`): under the `i` flag (`fn:matches`, `fn:replace`,
+  `fn:tokenize`), a repetition followed by a literal no longer rejects matches:
+  `fn:matches("file.XML", ".*\.xml", "i")` is true, and so are `.*1` on "a1"
+  and `\S+@\S+` on "a@b" (regexml-fork 0.4).
+- With `xsd11`, a pattern (`xs:pattern` or an XPath regular expression) whose
+  repetition counts are near the largest `usize` (`(ab){1,9223372036854775807}`)
+  no longer gives wrong answers or panics (regexml-fork 0.4).
+
+### Performance
+
+- With `xsd11`, `xs:pattern` facets (XSD 1.0 and 1.1) are checked faster and
+  without allocating: regexml-fork 0.4 answers whole-string matches of up to
+  127 characters from sets of positions instead of backtracking. Streaming
+  validation of a 990-item NF-e document, whose schema has 74 patterns, takes
+  33 ms instead of 51 ms.
+- On the README benchmark corpus, streaming validation and building a
+  `BufferDocument` execute about 2 % more instructions, and validation over
+  roxmltree the same number: quick-xml 0.42 checks every event for UTF-8 as it
+  reads, which makes reading alone about a quarter slower than with 0.41
+  ([quick-xml issue 1039](https://github.com/tafia/quick-xml/issues/1039)).
+  In time the three README rows stay within run-to-run spread of 0.3.1's
+  (237 / 214 / 297 ms against 229 / 214 / 293 ms, measured alternately in one
+  session).
+
 ## [0.3.1] - 2026-11-08
 
 This release removes no public item and changes no signature. It is faster

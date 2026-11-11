@@ -13,8 +13,8 @@
 //!
 //! The guides in `doc/` of the repository walk through the API: the
 //! Introduction for the entry points, the Architecture Overview, the
-//! Extensibility guide, Implementation Limits, and — coming from 0.2.x —
-//! What's New in 0.3 and Upgrading to 0.3.
+//! Extensibility guide, Implementation Limits, and — coming from 0.3.x —
+//! Upgrading to 0.4 (from 0.2.x: What's New in 0.3 and Upgrading to 0.3).
 //!
 //! # Entry Points
 //!
@@ -323,6 +323,8 @@ mod doc_guides {
     struct Unsafe;
     #[doc = include_str!("../doc/UPGRADING_0_3.md")]
     struct Upgrading03;
+    #[doc = include_str!("../doc/UPGRADING_0_4.md")]
+    struct Upgrading04;
     #[doc = include_str!("../doc/WHATS_NEW.md")]
     struct WhatsNew;
 }
