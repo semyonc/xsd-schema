@@ -22,7 +22,7 @@ use crate::schema::SchemaSet;
 use crate::types::value::{XmlAtomicValue, XmlValue, XmlValueKind};
 use crate::types::XmlTypeCode;
 use crate::validation::info::ContentType;
-use crate::xml::reader::{AttrKind, WfError, WfReader};
+use crate::xml::reader::{AttrKind, NextEvent, SliceWfReader, WfError, WfReader};
 use crate::xml_entity::resolve_general_ref;
 
 use super::buffer::{
@@ -1560,12 +1560,56 @@ impl<'a> BufferDocumentBuilder<'a> {
     /// ([`BufferDocumentError::LimitExceeded`]). The XML declaration is kept
     /// ([`BufferDocument::xml_declaration`]); a document type declaration in
     /// the prolog is checked and not kept.
-    pub fn build<R: BufRead>(
-        mut self,
-        reader: R,
-    ) -> Result<BufferDocument<'a>, BufferDocumentError> {
-        let mut xml_reader = WfReader::new(reader, &self.parse_limits, false);
+    ///
+    /// For a document that is already in memory as a whole, prefer
+    /// [`build_bytes`](Self::build_bytes): the same document, reading the
+    /// bytes in place instead of through a buffer.
+    pub fn build<R: BufRead>(self, reader: R) -> Result<BufferDocument<'a>, BufferDocumentError> {
+        let xml_reader = WfReader::new(reader, &self.parse_limits, false);
+        self.build_from(xml_reader, Vec::with_capacity(1024))
+    }
 
+    /// Builds the document from XML text that is in memory as a whole: the
+    /// bytes are read in place, each event borrowing `input` instead of being
+    /// copied into a buffer first.
+    ///
+    /// Otherwise the same as [`build`](Self::build) over the same bytes: the
+    /// same checks and limits, the same document (source spans included), the
+    /// same errors with the same byte positions. The document does not borrow
+    /// `input`.
+    ///
+    /// ```
+    /// use xsd_schema::document::{BufferDocumentBuilder, BufferDocumentOptions};
+    /// use xsd_schema::namespace::NameTable;
+    /// use xsd_schema::navigator::DomNavigator;
+    ///
+    /// let arena = bumpalo::Bump::new();
+    /// let names = NameTable::new();
+    /// let input: Vec<u8> = b"<order id=\"7\"><qty>2</qty></order>".to_vec();
+    /// let doc = BufferDocumentBuilder::new(&arena, &names, None, BufferDocumentOptions::default())?
+    ///     .build_bytes(&input)?;
+    /// drop(input); // the document keeps its own copy of what it needs
+    ///
+    /// let mut nav = doc.create_navigator();
+    /// assert!(nav.move_to_first_child()); // order
+    /// assert_eq!(nav.local_name(), "order");
+    /// # Ok::<(), xsd_schema::document::BufferDocumentError>(())
+    /// ```
+    pub fn build_bytes(self, input: &[u8]) -> Result<BufferDocument<'a>, BufferDocumentError> {
+        let xml_reader = SliceWfReader::from_slice(input, &self.parse_limits, false);
+        // Not written to: the events borrow `input`.
+        self.build_from(xml_reader, Vec::new())
+    }
+
+    /// The builders' loop, over either source of the well-formedness layer.
+    fn build_from<'i, B: BufRead, W>(
+        mut self,
+        mut xml_reader: WfReader<B, W>,
+        mut buf: Vec<u8>,
+    ) -> Result<BufferDocument<'a>, BufferDocumentError>
+    where
+        WfReader<B, W>: NextEvent<'i>,
+    {
         // Transient prefix → URI mapping for namespace resolution
         let mut prefix_map: HashMap<Box<[u8]>, Vec<String>> = HashMap::new();
         prefix_map
@@ -1581,10 +1625,9 @@ impl<'a> BufferDocumentBuilder<'a> {
         let mut scope_decls: Vec<Vec<Box<[u8]>>> = Vec::new();
 
         let track = self.options.track_source_locations;
-        let mut buf = Vec::with_capacity(1024);
 
         loop {
-            let event = xml_reader.read_event_into(&mut buf);
+            let event = xml_reader.next_event(&mut buf);
             let event_start = if track {
                 xml_reader.event_start() as usize
             } else {
@@ -1686,10 +1729,10 @@ impl<'a> BufferDocumentBuilder<'a> {
 
     /// Handles `Event::Start` and `Event::Empty` elements; `spans` are the
     /// tag's attributes, as the reader found them while checking it.
-    fn handle_start_or_empty<R: BufRead>(
+    fn handle_start_or_empty<R: BufRead, W>(
         &mut self,
         e: &quick_xml::events::BytesStart<'_>,
-        xml_reader: &WfReader<R>,
+        xml_reader: &WfReader<R, W>,
         is_empty: bool,
         prefix_map: &mut HashMap<Box<[u8]>, Vec<String>>,
         scope_decls: &mut Vec<Vec<Box<[u8]>>>,

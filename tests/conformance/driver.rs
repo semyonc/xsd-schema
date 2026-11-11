@@ -1370,15 +1370,36 @@ fn scan_unparsed_entities(xml: &str) -> std::collections::HashSet<String> {
 }
 
 /// Single validation pass. Returns errors and collected schema-location hints.
-#[allow(clippy::type_complexity)]
+///
+/// The instance is read twice: in place (`drive_quick_xml_with_bytes`) and
+/// through a buffer (`drive_quick_xml_with`, what a caller with a `BufRead`
+/// uses). The two must agree to the outcome, every message and every hint; a
+/// difference is a driver error, which fails the test.
 fn validate_instance_pass(
     schema_set: &xsd_schema::SchemaSet,
     instance_path: &Path,
     content: &[u8],
 ) -> ValidationPassResult {
+    let in_place = validate_instance_pass_from(schema_set, instance_path, content, true);
+    let buffered = validate_instance_pass_from(schema_set, instance_path, content, false);
+    if format!("{in_place:?}") != format!("{buffered:?}") {
+        return Err(format!(
+            "the readers differ: in place {in_place:?}, through a buffer {buffered:?}"
+        ));
+    }
+    in_place
+}
+
+/// [`validate_instance_pass`] over one reader: in place or through a buffer.
+fn validate_instance_pass_from(
+    schema_set: &xsd_schema::SchemaSet,
+    instance_path: &Path,
+    content: &[u8],
+    in_place: bool,
+) -> ValidationPassResult {
     use xsd_schema::validation::{
-        drive_quick_xml_with, DriveWithError, EndElementInfo, SchemaValidity,
-        ValidationEventHandler,
+        drive_quick_xml_with, drive_quick_xml_with_bytes, DriveWithError, EndElementInfo,
+        SchemaValidity, ValidationEventHandler,
     };
 
     // Conformance runs the strict-conformance default flags (identity
@@ -1462,7 +1483,12 @@ fn validate_instance_pass(
     let mut handler = DriverHandler {
         root_validity: None,
     };
-    drive_quick_xml_with(content, &mut runtime, schema_set, &mut handler).map_err(|e| match e {
+    let driven = if in_place {
+        drive_quick_xml_with_bytes(content, &mut runtime, schema_set, &mut handler)
+    } else {
+        drive_quick_xml_with(content, &mut runtime, schema_set, &mut handler)
+    };
+    driven.map_err(|e| match e {
         // The content is in memory: no I/O error can come; not a
         // well-formedness verdict either way.
         DriveWithError::Io(e) => format!("I/O error: {}", e),

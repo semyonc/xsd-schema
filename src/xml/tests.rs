@@ -1,34 +1,65 @@
 //! Unit tests of the well-formedness layer: the reader on its own, below the
 //! drivers (whose behaviour `tests/well_formedness.rs` covers end to end).
+//!
+//! Every case reads through both sources — the buffered [`WfReader`] and the
+//! [`SliceWfReader`] — and checks that they agree event by event: kind,
+//! content, start and end offsets, and the error.
+
+use std::io::BufRead;
 
 use quick_xml::events::Event;
 
-use super::reader::{WfError, WfReader};
+use super::reader::{NextEvent, SliceWfReader, WfError, WfReader};
 use super::{ParseLimit, ParseLimits, WellFormednessRule as R};
 
-/// Every event kind of `xml` (as `Debug` names), or the error.
-fn read_all(xml: &[u8], limits: &ParseLimits, trim: bool) -> Result<Vec<String>, WfError> {
-    let mut r = WfReader::new(xml, limits, trim);
+/// Everything a source hands out for its input: per event its content and
+/// offsets, then the error (as `Debug`), if any. The DOCTYPE keyword is left
+/// to the next read, as a caller that does not report the declaration does.
+fn trace<'i, B: BufRead, W>(mut r: WfReader<B, W>) -> (Vec<String>, Result<(), WfError>)
+where
+    WfReader<B, W>: NextEvent<'i>,
+{
     let mut buf = Vec::new();
     let mut out = Vec::new();
     loop {
-        let event = r.read_event_into(&mut buf)?;
-        let name = match &event {
-            Event::Start(_) => "Start",
-            Event::Empty(_) => "Empty",
-            Event::End(_) => "End",
-            Event::Text(_) => "Text",
-            Event::GeneralRef(_) => "Ref",
-            Event::CData(_) => "CData",
-            Event::Comment(_) => "Comment",
-            Event::PI(_) => "PI",
-            Event::Decl(_) => "Decl",
-            Event::DocType(_) => "DocType",
-            Event::Eof => break,
-        };
-        out.push(name.to_string());
+        match r.next_event(&mut buf) {
+            Ok(Event::Eof) => return (out, Ok(())),
+            Ok(event) => out.push(format!(
+                "{event:?} {}..{} {}",
+                r.event_start(),
+                r.buffer_position(),
+                r.attributes().len()
+            )),
+            Err(e) => return (out, Err(e)),
+        }
     }
-    Ok(out)
+}
+
+/// The two sources over `xml`, which must agree; the buffered one's result.
+fn both(xml: &[u8], limits: &ParseLimits, trim: bool) -> (Vec<String>, Result<(), WfError>) {
+    let buffered = trace(WfReader::new(xml, limits, trim));
+    let slice = trace(SliceWfReader::from_slice(xml, limits, trim));
+    assert_eq!(
+        (&buffered.0, format!("{:?}", buffered.1)),
+        (&slice.0, format!("{:?}", slice.1)),
+        "buffered and slice differ for {:?} (trim {trim})",
+        String::from_utf8_lossy(xml)
+    );
+    buffered
+}
+
+/// Every event kind of `xml` (as `Debug` names), or the error; both sources.
+fn read_all(xml: &[u8], limits: &ParseLimits, trim: bool) -> Result<Vec<String>, WfError> {
+    let (events, end) = both(xml, limits, trim);
+    end?;
+    Ok(events
+        .iter()
+        .map(|e| e[..e.find(['(', ' ']).unwrap_or(e.len())].to_string())
+        .map(|k| match k.as_str() {
+            "GeneralRef" => "Ref".to_string(),
+            _ => k,
+        })
+        .collect())
 }
 
 fn rule_at(xml: &[u8], trim: bool) -> (R, u64) {
@@ -86,6 +117,62 @@ fn the_doctype_keyword_is_checked_on_the_next_read() {
         }
         other => panic!("{other:?}"),
     }
+    // The slice source looks at the input, at the next read or when asked.
+    let mut r = SliceWfReader::from_slice(b"<!doctype r><r/>", &ParseLimits::none(), false);
+    assert!(matches!(r.read_event(), Ok(Event::DocType(_))));
+    match r.read_event() {
+        Err(WfError::NotWellFormed(e)) => {
+            assert_eq!(e.rule(), R::DocumentTypeDeclaration);
+            assert_eq!(e.position(), 0);
+        }
+        other => panic!("{other:?}"),
+    }
+    for (xml, trim) in [
+        (&b"\n <!doctype r><r/>"[..], true),
+        (b"\n <!doctype r><r/>", false),
+    ] {
+        let mut b = WfReader::new(xml, &ParseLimits::none(), trim);
+        let mut s = SliceWfReader::from_slice(xml, &ParseLimits::none(), trim);
+        let mut buf = Vec::new();
+        loop {
+            let (x, y) = (b.read_event_into(&mut buf), s.read_event());
+            assert_eq!(format!("{x:?}"), format!("{y:?}"));
+            if matches!(x, Ok(Event::DocType(_))) {
+                let one = NextEvent::confirm_doctype(&mut b, &buf);
+                let two = NextEvent::confirm_doctype(&mut s, &[]);
+                assert_eq!(format!("{one:?}"), format!("{two:?}"));
+                assert!(two.is_err(), "'<!doctype', trim {trim}");
+                break;
+            }
+            assert!(x.is_ok());
+        }
+    }
+    for (xml, trim) in [
+        (&b"  <!doctype r><r/>"[..], true),
+        (b"\xEF\xBB\xBF<!DOCTYPE r><r/>", true),
+        (b"\xEF\xBB\xBF\n<!DocType r><r/>", true),
+        (b"\xEF\xBB\xBF\n<!DocType r><r/>", false),
+    ] {
+        let _ = both(xml, &ParseLimits::none(), trim);
+        let mut b = WfReader::new(xml, &ParseLimits::none(), trim);
+        let mut s = SliceWfReader::from_slice(xml, &ParseLimits::none(), trim);
+        let mut buf = Vec::new();
+        loop {
+            let (x, y) = (b.read_event_into(&mut buf), s.read_event());
+            if let Ok(Event::DocType(_)) = x {
+                assert!(matches!(y, Ok(Event::DocType(_))));
+                let one = NextEvent::confirm_doctype(&mut b, &buf);
+                let two = NextEvent::confirm_doctype(&mut s, &[]);
+                assert_eq!(
+                    format!("{one:?}"),
+                    format!("{two:?}"),
+                    "{xml:?} trim {trim}"
+                );
+                break;
+            }
+            assert_eq!(format!("{x:?}"), format!("{y:?}"));
+        }
+    }
     // A caller that clears the buffer in between only loses that check.
     let mut r = WfReader::new(&b"<!doctype r><r/>"[..], &ParseLimits::none(), false);
     let mut buf = Vec::new();
@@ -119,6 +206,7 @@ fn quick_xml_refusals_are_not_well_formed_too() {
 #[test]
 fn a_limit_is_checked_before_the_tag_is_returned() {
     let limits = ParseLimits::none().with_max_attributes(1);
+    assert!(both(b"<r><e a='1' b='2'/></r>", &limits, false).1.is_err());
     let mut r = WfReader::new(&b"<r><e a='1' b='2'/></r>"[..], &limits, false);
     let mut buf = Vec::new();
     assert!(matches!(r.read_event_into(&mut buf), Ok(Event::Start(_))));
@@ -243,5 +331,79 @@ fn bytes_that_are_not_utf8_are_refused_as_the_checks_refuse_them() {
             "{:?} in chunks",
             String::from_utf8_lossy(xml)
         );
+        // With white space skipped before markup (the schema reader), and
+        // after leading white space: the two sources still agree.
+        assert!(both(xml, &ParseLimits::none(), true).1.is_err());
+        let mut spaced = b" \n\t".to_vec();
+        spaced.extend_from_slice(xml);
+        let _ = both(&spaced, &ParseLimits::none(), true);
+        let _ = both(&spaced, &ParseLimits::none(), false);
+    }
+}
+
+/// What the slice source relies on for a refused event: quick-xml's slice
+/// reader has moved past the refused bytes exactly as the buffered one has
+/// (the same `buffer_position` and `error_position`), and those bytes — the
+/// buffered reader's buffer — are the input between the offsets before and
+/// after the read, a leading BOM uncounted. Re-run this first when quick-xml
+/// changes how it validates UTF-8.
+#[test]
+fn quick_xml_moves_past_refused_bytes_alike_in_both_readers() {
+    let cases: &[&[u8]] = &[
+        b"<r>ab\xFF</r>",
+        b" \xFF<r/>",
+        b"<r>&a\xFF;</r>",
+        b"<r>&a\xFF</r>",
+        b"<r a=\"\xFF\"/>",
+        b"<r></r\xFF>",
+        b"<!--\xFF--><r/>",
+        b"<r><![CDATA[\xFF]]></r>",
+        b"<?pi \xFF?><r/>",
+        b"<!DOCTYPE r\xFF><r/>",
+        b"\xEF\xBB\xBF<r>\xC3</r>",
+        b"\xEF\xBB\xBF \n<r a='\xC3'/>",
+        b"<r>t&amp;\xFF</r>",
+    ];
+    for &xml in cases {
+        for trim in [false, true] {
+            let bom = if xml.starts_with(&[0xEF, 0xBB, 0xBF]) {
+                3
+            } else {
+                0
+            };
+            let mut b = quick_xml::Reader::from_reader(xml);
+            let mut s = quick_xml::Reader::from_reader(xml);
+            b.config_mut().trim_text_start = trim;
+            s.config_mut().trim_text_start = trim;
+            let mut buf = Vec::new();
+            loop {
+                buf.clear();
+                let before = s.buffer_position();
+                assert_eq!(b.buffer_position(), before);
+                let (x, y) = (b.read_event_into(&mut buf), s.read_event());
+                match (x, y) {
+                    (Ok(Event::Eof), _) => panic!("{xml:?} read through"),
+                    (Ok(x), Ok(y)) => assert_eq!(format!("{x:?}"), format!("{y:?}")),
+                    (Err(x), Err(y)) => {
+                        assert!(matches!(x, quick_xml::Error::Encoding(_)), "{x:?}");
+                        assert!(matches!(y, quick_xml::Error::Encoding(_)), "{y:?}");
+                        let after = s.buffer_position();
+                        assert_eq!(b.buffer_position(), after, "{xml:?}");
+                        assert_eq!(b.error_position(), s.error_position(), "{xml:?}");
+                        let read = &xml[(before + bom) as usize..(after + bom) as usize];
+                        let skipped = if trim {
+                            read.iter()
+                                .position(|c| !b" \t\r\n".contains(c))
+                                .unwrap_or(read.len())
+                        } else {
+                            0
+                        };
+                        assert_eq!(&read[skipped..], &buf[..], "{xml:?} trim {trim}");
+                        break;
+                    }
+                    (x, y) => panic!("{xml:?}: {x:?} against {y:?}"),
+                }
+            }
+        }
     }
 }

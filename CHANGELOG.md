@@ -46,6 +46,20 @@ corpora give the same results.
   `BufferDocument` and the schema loaders take a `BufRead` or a byte slice, as
   before.
 
+### Added
+
+- Readers for a document that is in memory as a whole, which read the bytes in
+  place: each event borrows the input instead of being copied into a buffer
+  first. `validation::drive_quick_xml_bytes` and
+  `validation::drive_quick_xml_with_bytes` are `drive_quick_xml` and
+  `drive_quick_xml_with` for a `&[u8]`, and
+  `document::BufferDocumentBuilder::build_bytes` is `build` for a `&[u8]`.
+  Over the same bytes they check, report and build exactly what the `BufRead`
+  functions do: the same well-formedness rules and limits, hooks, diagnostics,
+  documents and errors with their byte positions. The `BufRead` functions
+  still accept a slice (`&[u8]` is a `BufRead`) and still read it through a
+  buffer. See *Performance*.
+
 ### Changed
 
 - quick-xml 0.42 (was 0.41) reads the XML text. It refuses input that is not
@@ -66,8 +80,13 @@ corpora give the same results.
 - lalrpop and lalrpop-util 0.23.2 (were 0.22.2) generate and run the XPath
   parser (`xsd11`); the build no longer depends on `string_cache` 0.8.
 - The library has five `unsafe` blocks (was three): the two new ones let the
-  well-formedness reader read the bytes quick-xml refused as not UTF-8, so that
-  it reports them as before; see [`doc/UNSAFE.md`](doc/UNSAFE.md).
+  well-formedness reader read the bytes quick-xml refused as not UTF-8 from its
+  buffer, so that it reports them as before; see
+  [`doc/UNSAFE.md`](doc/UNSAFE.md). The readers that read a slice in place,
+  schema loading among them, take those bytes from the input and use neither.
+- Schema documents are read in place: loading a schema from bytes no longer
+  copies each event of the document into a buffer. What is loaded and every
+  error are as before.
 
 ### Fixed
 
@@ -91,9 +110,17 @@ corpora give the same results.
   roxmltree the same number: quick-xml 0.42 checks every event for UTF-8 as it
   reads, which makes reading alone about a quarter slower than with 0.41
   ([quick-xml issue 1039](https://github.com/tafia/quick-xml/issues/1039)).
-  In time the three README rows stay within run-to-run spread of 0.3.1's
-  (237 / 214 / 297 ms against 229 / 214 / 293 ms, measured alternately in one
-  session).
+  In time the three README rows stay within run-to-run spread of
+  0.3.1's (237 / 214 / 297 ms against 229 / 214 / 293 ms, measured alternately
+  in one session on 2026-11-10).
+- The readers that read a document in memory in place (see *Added*) skip
+  quick-xml's copy of every event into a buffer. On the README benchmark
+  corpus, streaming validation and building a `BufferDocument` execute about
+  1.5 % fewer instructions with them than with the `BufRead` functions
+  of the same build, and the well-formedness reader alone 12 % fewer; in time
+  that is under 1 %, inside run-to-run spread. Streaming validation of a
+  990-item NF-e document executes 0.7 % fewer. Schema documents are read the
+  same way.
 
 ## [0.3.1] - 2026-11-08
 

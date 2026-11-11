@@ -5,8 +5,12 @@
 //!
 //! * the quick-xml validation driver (`drive_quick_xml`, layer 1, and
 //!   `drive_quick_xml_with`, layer 2), with and without PSVI typed values,
-//!   against an XSD 1.0 and an XSD 1.1 schema set;
-//! * `BufferDocument::from_reader` (the document builder) and the typed build
+//!   against an XSD 1.0 and an XSD 1.1 schema set, and their counterparts
+//!   that read the bytes in place (`drive_quick_xml_bytes`,
+//!   `drive_quick_xml_with_bytes`), whose errors must be the buffered ones
+//!   to the byte position and message;
+//! * `BufferDocument::from_reader` (the document builder), `build_bytes` (the
+//!   same in place, the same error required) and the typed build
 //!   (`build_typed_document_with`), with the `xsd11` feature;
 //! * the schema-document reader, where the case can be written as a schema
 //!   document.
@@ -16,8 +20,9 @@
 
 use xsd_schema::pipeline::load_and_process_schema;
 use xsd_schema::validation::{
-    drive_quick_xml, drive_quick_xml_with, CollectingValidationSink, DoctypeView, DriveError,
-    DriveWithError, NoopHandler, SchemaValidator, ValidationEventHandler, ValidationFlags,
+    drive_quick_xml, drive_quick_xml_bytes, drive_quick_xml_with, drive_quick_xml_with_bytes,
+    CollectingValidationSink, DoctypeView, DriveError, DriveWithError, NoopHandler,
+    SchemaValidator, ValidationEventHandler, ValidationFlags,
 };
 use xsd_schema::xml::{ParseLimit, ParseLimits, WellFormednessRule as R};
 use xsd_schema::{NameId, SchemaError, SchemaSet};
@@ -76,8 +81,15 @@ fn of_drive_with_error<E: std::fmt::Debug>(e: DriveWithError<E>) -> Outcome {
     }
 }
 
-/// Layer 1 (`drive_quick_xml`, which also calls `end_validation`).
-fn drive1(ss: &SchemaSet, xml: &[u8], limits: &ParseLimits, psvi: bool) -> Outcome {
+/// Layer 1 (`drive_quick_xml`, which also calls `end_validation`) through a buffer (`drive_quick_xml`) or in place
+/// (`drive_quick_xml_bytes`): the outcome and the error's whole text.
+fn drive1_from(
+    ss: &SchemaSet,
+    xml: &[u8],
+    limits: &ParseLimits,
+    psvi: bool,
+    in_place: bool,
+) -> (Outcome, String) {
     let mut flags = ValidationFlags::default();
     if !psvi {
         flags &= !ValidationFlags::BUILD_PSVI_TYPED_VALUES;
@@ -89,16 +101,36 @@ fn drive1(ss: &SchemaSet, xml: &[u8], limits: &ParseLimits, psvi: bool) -> Outco
         warnings: &mut warnings,
     });
     runtime.set_parse_limits(limits.clone());
-    match drive_quick_xml(xml, &mut runtime, ss) {
-        Ok(_) => Outcome::Ok,
+    let driven = if in_place {
+        drive_quick_xml_bytes(xml, &mut runtime, ss)
+    } else {
+        drive_quick_xml(xml, &mut runtime, ss)
+    };
+    match driven {
+        Ok(_) => (Outcome::Ok, String::new()),
         // A validation failure of the whole run is not a reader outcome.
-        Err(DriveError::Validation(_)) => Outcome::Ok,
-        Err(e) => of_drive_error(e),
+        Err(DriveError::Validation(e)) => (Outcome::Ok, format!("{e:?}")),
+        Err(e) => {
+            let text = format!("{e:?} | {e}");
+            (of_drive_error(e), text)
+        }
     }
 }
 
 /// Layer 2 (`drive_quick_xml_with`, a handler).
 fn drive2(ss: &SchemaSet, xml: &[u8], limits: &ParseLimits, psvi: bool) -> Outcome {
+    drive2_from(ss, xml, limits, psvi, false).0
+}
+
+/// Layer 2 through a buffer (`drive_quick_xml_with`) or in place
+/// (`drive_quick_xml_with_bytes`): the outcome and the error's whole text.
+fn drive2_from(
+    ss: &SchemaSet,
+    xml: &[u8],
+    limits: &ParseLimits,
+    psvi: bool,
+    in_place: bool,
+) -> (Outcome, String) {
     let mut flags = ValidationFlags::default();
     if !psvi {
         flags &= !ValidationFlags::BUILD_PSVI_TYPED_VALUES;
@@ -110,9 +142,17 @@ fn drive2(ss: &SchemaSet, xml: &[u8], limits: &ParseLimits, psvi: bool) -> Outco
         warnings: &mut warnings,
     });
     runtime.set_parse_limits(limits.clone());
-    match drive_quick_xml_with(xml, &mut runtime, ss, &mut NoopHandler) {
-        Ok(_) => Outcome::Ok,
-        Err(e) => of_drive_with_error(e),
+    let driven = if in_place {
+        drive_quick_xml_with_bytes(xml, &mut runtime, ss, &mut NoopHandler)
+    } else {
+        drive_quick_xml_with(xml, &mut runtime, ss, &mut NoopHandler)
+    };
+    match driven {
+        Ok(_) => (Outcome::Ok, String::new()),
+        Err(e) => {
+            let text = format!("{e:?} | {e}");
+            (of_drive_with_error(e), text)
+        }
     }
 }
 
@@ -140,17 +180,26 @@ mod doc {
         }
     }
 
-    /// `BufferDocumentBuilder::build` (what `BufferDocument::from_reader` runs).
-    pub fn buffer(xml: &[u8], limits: &ParseLimits) -> Outcome {
+    /// `BufferDocumentBuilder::build` (what `BufferDocument::from_reader` runs),
+    /// or `build_bytes` (`in_place`): the outcome and the error's whole text.
+    pub fn buffer(xml: &[u8], limits: &ParseLimits, in_place: bool) -> (Outcome, String) {
         let arena = Bump::new();
         let names = NameTable::new();
         let builder =
             BufferDocumentBuilder::new(&arena, &names, None, BufferDocumentOptions::default())
                 .expect("builder")
                 .with_parse_limits(limits.clone());
-        match builder.build(xml) {
-            Ok(_) => Outcome::Ok,
-            Err(e) => of_document_error(e),
+        let built = if in_place {
+            builder.build_bytes(xml)
+        } else {
+            builder.build(xml)
+        };
+        match built {
+            Ok(_) => (Outcome::Ok, String::new()),
+            Err(e) => {
+                let text = format!("{e:?} | {e}");
+                (of_document_error(e), text)
+            }
         }
     }
 
@@ -193,24 +242,54 @@ mod doc {
 fn reader_mismatches(xml: &[u8], expected: &Outcome, limits: &ParseLimits) -> Vec<String> {
     let shown = String::from_utf8_lossy(xml);
     let shown: String = shown.chars().take(120).collect();
-    let mut out = Vec::new();
-    let mut expect = |reader: &str, got: Outcome| {
+    let out = std::cell::RefCell::new(Vec::new());
+    let expect = |reader: &str, got: Outcome| {
         if &got != expected {
-            out.push(format!(
+            out.borrow_mut().push(format!(
                 "{shown:?} [{reader}]: got {got:?}, expected {expected:?}"
+            ));
+        }
+    };
+    // A reader in place and its buffered counterpart, to the error's text.
+    let same = |reader: &str, buffered: &(Outcome, String), in_place: &(Outcome, String)| {
+        if buffered != in_place {
+            out.borrow_mut().push(format!(
+                "{shown:?} [{reader}]: {in_place:?}, buffered {buffered:?}"
             ));
         }
     };
     for v11 in [false, true] {
         let ss = schema_set(v11);
         for psvi in [true, false] {
+            let buffered = drive1_from(&ss, xml, limits, psvi, false);
+            let in_place = drive1_from(&ss, xml, limits, psvi, true);
+            same(
+                &format!("drive_quick_xml_bytes v11={v11} psvi={psvi}"),
+                &buffered,
+                &in_place,
+            );
             expect(
                 &format!("drive_quick_xml v11={v11} psvi={psvi}"),
-                drive1(&ss, xml, limits, psvi),
+                buffered.0,
+            );
+            expect(
+                &format!("drive_quick_xml_bytes v11={v11} psvi={psvi}"),
+                in_place.0,
+            );
+            let buffered = drive2_from(&ss, xml, limits, psvi, false);
+            let in_place = drive2_from(&ss, xml, limits, psvi, true);
+            same(
+                &format!("drive_quick_xml_with_bytes v11={v11} psvi={psvi}"),
+                &buffered,
+                &in_place,
             );
             expect(
                 &format!("drive_quick_xml_with v11={v11} psvi={psvi}"),
-                drive2(&ss, xml, limits, psvi),
+                buffered.0,
+            );
+            expect(
+                &format!("drive_quick_xml_with_bytes v11={v11} psvi={psvi}"),
+                in_place.0,
             );
         }
         #[cfg(feature = "xsd11")]
@@ -221,12 +300,16 @@ fn reader_mismatches(xml: &[u8], expected: &Outcome, limits: &ParseLimits) -> Ve
     }
     #[cfg(feature = "xsd11")]
     {
-        expect("BufferDocumentBuilder::build", doc::buffer(xml, limits));
+        let buffered = doc::buffer(xml, limits, false);
+        let in_place = doc::buffer(xml, limits, true);
+        same("BufferDocumentBuilder::build_bytes", &buffered, &in_place);
+        expect("BufferDocumentBuilder::build", buffered.0);
+        expect("BufferDocumentBuilder::build_bytes", in_place.0);
         if limits.is_unlimited() {
             expect("BufferDocument::from_reader", doc::from_reader(xml));
         }
     }
-    out
+    out.into_inner()
 }
 
 /// Every instance reader path gives `expected` for `xml`.

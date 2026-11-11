@@ -8,7 +8,7 @@ use std::io::BufRead;
 
 use crate::error::{SchemaError, SchemaResult};
 use crate::parser::location::SourceSpan;
-use crate::xml::reader::{WfError, WfReader};
+use crate::xml::reader::{NextEvent, SliceWfReader, WfError, WfReader};
 use crate::xml::ParseLimits;
 
 /// XML event with source span
@@ -77,41 +77,25 @@ impl<'a> TrackedEvent<'a> {
 /// in the buffer, at the next read (a caller that clears the buffer in
 /// between skips that one check).
 pub struct TrackedReader<R> {
-    /// The underlying quick-xml reader, behind the well-formedness layer
-    reader: WfReader<R>,
-    /// Start of the last event returned (see [`read_event`](Self::read_event))
-    last_position: usize,
-    /// Input offset of the last well-formedness error
-    error_position: Option<usize>,
+    inner: Tracked<WfReader<R>>,
 }
 
 impl<'a> TrackedReader<&'a [u8]> {
     /// Create a new reader from a byte slice
+    ///
+    /// The events borrow `buf` ([`read_event`](Self::read_event)), so this
+    /// reader copies each one from the slice into the buffer, as for any
+    /// other source.
     pub fn from_bytes(bytes: &'a [u8]) -> Self {
         TrackedReader::from_reader(bytes)
-    }
-
-    /// Create a reader from a byte slice that refuses a document nested
-    /// deeper than `limits.max_depth` — the schema-document parser's
-    /// `ParserConfig::max_depth` ([`SchemaError::LimitExceeded`]).
-    pub(crate) fn from_bytes_with_limits(bytes: &'a [u8], limits: &ParseLimits) -> Self {
-        Self {
-            reader: WfReader::new(bytes, limits, true),
-            last_position: 0,
-            error_position: None,
-        }
     }
 }
 
 impl<R: BufRead> TrackedReader<R> {
     /// Create a new reader from a BufRead source
     pub fn from_reader(reader: R) -> Self {
-        // quick-xml skips the white space before text and markup; the end of
-        // a text event is trimmed in `read_event`.
         Self {
-            reader: WfReader::new(reader, &ParseLimits::none(), true),
-            last_position: 0,
-            error_position: None,
+            inner: Tracked::new(WfReader::new(reader, &ParseLimits::none(), true)),
         }
     }
 
@@ -126,7 +110,77 @@ impl<R: BufRead> TrackedReader<R> {
     /// ended — before white space the read skipped — as their length does
     /// not tell where their `<` is.
     pub fn read_event<'b>(&mut self, buf: &'b mut Vec<u8>) -> SchemaResult<TrackedEvent<'b>> {
-        let mut event = match self.reader.read_event_into(buf) {
+        self.inner.read_event(buf)
+    }
+
+    /// Get the current buffer position
+    pub fn buffer_position(&self) -> usize {
+        self.inner.buffer_position()
+    }
+
+    /// The start of the last event returned: its span's `start`
+    pub fn last_position(&self) -> usize {
+        self.inner.last_position
+    }
+
+    /// The input offset (a leading byte-order mark included) of the
+    /// violation behind the last well-formedness error
+    /// [`read_event`](Self::read_event) returned, if any.
+    pub fn error_position(&self) -> Option<usize> {
+        self.inner.error_position
+    }
+
+    /// The version of XML whose rules the document is read with (known once
+    /// its XML declaration has been read).
+    pub fn xml_version(&self) -> crate::xml::XmlVersion {
+        self.inner.xml_version()
+    }
+}
+
+/// What a [`TrackedReader`] is, over either source of the well-formedness
+/// layer: the public reader over a buffered one, the schema-document parser
+/// over the whole document as a slice (its events borrow the input).
+pub(crate) struct Tracked<S> {
+    /// The underlying quick-xml reader, behind the well-formedness layer
+    reader: S,
+    /// Start of the last event returned (see [`read_event`](Self::read_event))
+    last_position: usize,
+    /// Input offset of the last well-formedness error
+    error_position: Option<usize>,
+}
+
+impl<'a> Tracked<SliceWfReader<'a>> {
+    /// A reader over the whole document `bytes`, with `limits` (the
+    /// schema-document parser's: only `max_depth`, from
+    /// `ParserConfig::max_depth`; [`SchemaError::LimitExceeded`]). Otherwise
+    /// as [`TrackedReader::from_reader`] over the same bytes: the same events,
+    /// spans and errors.
+    pub(crate) fn from_slice(bytes: &'a [u8], limits: &ParseLimits) -> Self {
+        Tracked::new(SliceWfReader::from_slice(bytes, limits, true))
+    }
+}
+
+impl<B: BufRead, W> Tracked<WfReader<B, W>> {
+    fn new(reader: WfReader<B, W>) -> Self {
+        // quick-xml skips the white space before text and markup (the reader
+        // is made so); the end of a text event is trimmed in `read_event`.
+        Self {
+            reader,
+            last_position: 0,
+            error_position: None,
+        }
+    }
+
+    /// See [`TrackedReader::read_event`].
+    pub(crate) fn read_event<'i, 'b>(
+        &mut self,
+        buf: &'b mut Vec<u8>,
+    ) -> SchemaResult<TrackedEvent<'b>>
+    where
+        WfReader<B, W>: NextEvent<'i>,
+        'i: 'b,
+    {
+        let mut event = match self.reader.next_event(buf) {
             Ok(event) => event,
             Err(WfError::Io(e)) => {
                 return Err(SchemaError::XmlError {
@@ -141,7 +195,7 @@ impl<R: BufRead> TrackedReader<R> {
             Err(WfError::Limit(e)) => {
                 self.error_position = Some(e.position() as usize);
                 // Only the schema-document parser sets limits on this reader
-                // (`from_bytes_with_limits`), and only the depth limit, from
+                // (`Tracked::from_slice`), and only the depth limit, from
                 // `ParserConfig::max_depth`.
                 if e.limit() == crate::xml::ParseLimit::Depth {
                     return Err(SchemaError::limit(
@@ -172,26 +226,18 @@ impl<R: BufRead> TrackedReader<R> {
         Ok(TrackedEvent::new(event, span))
     }
 
-    /// Get the current buffer position
-    pub fn buffer_position(&self) -> usize {
+    /// See [`TrackedReader::buffer_position`].
+    pub(crate) fn buffer_position(&self) -> usize {
         self.reader.buffer_position() as usize
     }
 
-    /// The start of the last event returned: its span's `start`
-    pub fn last_position(&self) -> usize {
-        self.last_position
-    }
-
-    /// The input offset (a leading byte-order mark included) of the
-    /// violation behind the last well-formedness error
-    /// [`read_event`](Self::read_event) returned, if any.
-    pub fn error_position(&self) -> Option<usize> {
+    /// See [`TrackedReader::error_position`].
+    pub(crate) fn error_position(&self) -> Option<usize> {
         self.error_position
     }
 
-    /// The version of XML whose rules the document is read with (known once
-    /// its XML declaration has been read).
-    pub fn xml_version(&self) -> crate::xml::XmlVersion {
+    /// See [`TrackedReader::xml_version`].
+    pub(crate) fn xml_version(&self) -> crate::xml::XmlVersion {
         self.reader.xml_version()
     }
 }

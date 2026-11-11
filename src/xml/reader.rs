@@ -26,10 +26,18 @@
 //! Positions are byte offsets into the input, a leading byte-order mark
 //! included ([`buffer_position`](WfReader::buffer_position) too).
 //!
+//! There are two sources. A [`WfReader`] over any `BufRead` reads each event
+//! into the caller's buffer ([`read_event_into`](WfReader::read_event_into));
+//! a [`SliceWfReader`], over input that is in memory as a whole, hands out
+//! events that borrow the input ([`read_event`](SliceWfReader::read_event)),
+//! without the copy. Both run the same checks on the same bytes, so what they
+//! accept, the events and every diagnostic are the same. A caller's read loop
+//! takes its events through [`NextEvent`], which both implement.
+//!
 //! The case of the `<!DOCTYPE` keyword is not visible in quick-xml's event:
-//! it is checked on the markup still in the buffer, by
-//! [`confirm_doctype`](WfReader::confirm_doctype) (a caller that reports the
-//! declaration calls it first) or else at the next read.
+//! it is checked on the markup (still in the buffer, or in the input), by
+//! [`NextEvent::confirm_doctype`] (a caller that reports the declaration
+//! calls it first) or else at the next read.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -455,14 +463,33 @@ fn is_quick_xml_space(b: u8) -> bool {
 /// (so that an unrelated buffer is not mistaken for it).
 #[derive(Debug, Clone, Copy)]
 struct PendingDoctype {
+    /// Where the read that returned it started, in quick-xml offsets (white
+    /// space the read skipped included).
+    before: u64,
     after: u64,
     len: usize,
     hash: u64,
 }
 
 /// The well-formedness layer over a `quick_xml::Reader`.
-pub(crate) struct WfReader<B> {
+///
+/// `W` is what the reader keeps of the input itself: nothing (`()`) for a
+/// buffered source, the whole input for a [`SliceWfReader`].
+pub(crate) struct WfReader<B, W = ()> {
     inner: Reader<B>,
+    /// The whole input, a leading BOM included (`()` for a buffered source).
+    whole: W,
+    /// Everything the checks keep, shared by both sources.
+    st: WfState,
+}
+
+/// The well-formedness layer's state and its checks, independent of the
+/// source: one copy of the check code serves the buffered and the slice
+/// reader (so neither changes how the other is compiled).
+struct WfState {
+    /// quick-xml's `trim_text_start`: white space before character data and
+    /// markup is skipped.
+    trim: bool,
     /// Length of a leading UTF-8 byte-order mark that quick-xml removed (it
     /// counts offsets after it); added to every reported position.
     bom: u64,
@@ -498,86 +525,32 @@ pub(crate) struct WfReader<B> {
     open_at: Vec<usize>,
 }
 
+/// A [`WfReader`] over input that is in memory as a whole: its events borrow
+/// the input ([`read_event`](Self::read_event)).
+pub(crate) type SliceWfReader<'a> = WfReader<&'a [u8], &'a [u8]>;
+
+/// The UTF-8 byte-order mark.
+const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
+
+/// A quick-xml reader configured the way the layer reads.
+fn configured<B>(mut inner: Reader<B>, trim_text_start: bool) -> Reader<B> {
+    let config = inner.config_mut();
+    config.trim_text_start = trim_text_start;
+    config.trim_text_end = false;
+    config.check_end_names = true;
+    inner
+}
+
 impl<B: BufRead> WfReader<B> {
     /// A reader over `reader` with `limits`. `trim_text_start` is quick-xml's
     /// option (white space before character data and markup is skipped); the
     /// instance readers keep it off, the schema-document reader on.
     pub(crate) fn new(reader: B, limits: &ParseLimits, trim_text_start: bool) -> Self {
-        let mut inner = Reader::from_reader(reader);
-        let config = inner.config_mut();
-        config.trim_text_start = trim_text_start;
-        config.trim_text_end = false;
-        config.check_end_names = true;
-        WfReader {
-            inner,
-            bom: 0,
-            started: false,
-            decl_at: 0,
-            max: Max::of(limits),
-            phase: Phase::Prolog,
-            depth: 0,
-            events: 0,
-            count_event: true,
-            seen_doctype: false,
-            doctype_pending: None,
-            nodes: 0,
-            run: None,
-            scope: Scope::default(),
-            attrs: Vec::new(),
-            version: XmlVersion::V1_0,
-            declaration: None,
-            last_start: 0,
-            open: Vec::new(),
-            open_at: Vec::new(),
-        }
-    }
-
-    /// The attributes of the start tag returned last (offsets into its
-    /// bytes), in document order.
-    pub(crate) fn attributes(&self) -> &[AttrSpan] {
-        &self.attrs
-    }
-
-    /// The byte offset into the input (a leading BOM included) up to which
-    /// the input has been read.
-    pub(crate) fn buffer_position(&self) -> u64 {
-        self.inner.buffer_position() + self.bom
-    }
-
-    /// The byte offset into the input (a leading BOM included) where the
-    /// markup of the event returned last starts: the `<` of a tag or a
-    /// declaration.
-    pub(crate) fn event_start(&self) -> u64 {
-        self.last_start + self.bom
-    }
-
-    /// The version whose rules apply (known once the XML declaration, if
-    /// any, has been read).
-    pub(crate) fn xml_version(&self) -> XmlVersion {
-        self.version
-    }
-
-    /// The same, as quick-xml's normalization functions take it.
-    pub(crate) fn quick_xml_version(&self) -> quick_xml::XmlVersion {
-        match self.version {
-            XmlVersion::V1_1 => quick_xml::XmlVersion::Explicit1_1,
-            _ => quick_xml::XmlVersion::Implicit1_0,
-        }
-    }
-
-    /// The XML declaration, once it has been read.
-    pub(crate) fn declaration(&self) -> Option<&XmlDeclaration> {
-        self.declaration.as_ref()
-    }
-
-    /// Checks the keyword of the document type declaration just returned,
-    /// on its markup in `buf` (the buffer it was read into, before the next
-    /// read). A caller that reports the declaration calls this first.
-    pub(crate) fn confirm_doctype(&mut self, buf: &[u8]) -> Result<(), WfError> {
-        match self.doctype_pending.take() {
-            Some(p) => self.check_doctype_markup(buf, p),
-            None => Ok(()),
-        }
+        WfReader::with_parts(
+            configured(Reader::from_reader(reader), trim_text_start),
+            (),
+            limits,
+        )
     }
 
     /// The next event, checked. Clears `buf` first.
@@ -585,19 +558,19 @@ impl<B: BufRead> WfReader<B> {
         &mut self,
         buf: &'b mut Vec<u8>,
     ) -> Result<Event<'b>, WfError> {
-        if !self.started {
-            self.started = true;
+        if !self.st.started {
+            self.st.started = true;
             // quick-xml removes a UTF-8 BOM it sees in the first fill of its
             // source and counts offsets after it; look the same way (a BOM
             // split across fills is taken care of in `check_text`).
             match self.inner.get_mut().fill_buf() {
-                Ok([0xEF, 0xBB, 0xBF, ..]) => self.bom = 3,
+                Ok([0xEF, 0xBB, 0xBF, ..]) => self.st.bom = 3,
                 Ok(_) => {}
                 Err(e) => return Err(WfError::Io(e)),
             }
         }
-        if let Some(p) = self.doctype_pending.take() {
-            self.check_doctype_markup(buf, p)?;
+        if let Some(p) = self.st.doctype_pending.take() {
+            self.st.check_doctype_markup(buf, p)?;
         }
         buf.clear();
         let before = self.inner.buffer_position();
@@ -606,7 +579,9 @@ impl<B: BufRead> WfReader<B> {
         // refusal with. The borrow checker cannot see that a failed read
         // leaves no borrow of `buf` behind (the returned event is the only
         // thing that borrows it), so the buffer is reached through a raw
-        // pointer on that path (doc/UNSAFE.md, item 3).
+        // pointer on that path (doc/UNSAFE.md, item 3). The slice source
+        // (`SliceWfReader::read_event`) takes the refused bytes from the
+        // input instead and needs neither block.
         let buf: *mut Vec<u8> = buf;
         // SAFETY: `buf` comes from the `&'b mut Vec<u8>` this function holds,
         // so it is valid and unaliased for `'b`; this is its only use on the
@@ -619,18 +594,248 @@ impl<B: BufRead> WfReader<B> {
                 // above ended with the call. This shared reborrow is the last
                 // use of the pointer.
                 let raw = unsafe { &*buf };
-                return Err(self.not_utf8(raw, before, quick_xml::Error::Encoding(e)));
+                return Err(self.refused(raw, before, quick_xml::Error::Encoding(e)));
             }
             Err(e) => return Err(self.quick_xml_error(e)),
         };
-        let after = self.inner.buffer_position();
-        self.check(Raw::of(&event), before, after)?;
-        if self.count_event {
-            self.events += 1;
-        } else {
-            self.count_event = true;
-        }
+        self.accept(&event, before)?;
         Ok(event)
+    }
+}
+
+impl<'a> SliceWfReader<'a> {
+    /// A reader over the whole input `input`, otherwise as
+    /// [`WfReader::new`].
+    pub(crate) fn from_slice(input: &'a [u8], limits: &ParseLimits, trim_text_start: bool) -> Self {
+        WfReader::with_parts(
+            configured(Reader::from_reader(input), trim_text_start),
+            input,
+            limits,
+        )
+    }
+
+    /// The next event, checked; it borrows the input.
+    pub(crate) fn read_event(&mut self) -> Result<Event<'a>, WfError> {
+        if !self.st.started {
+            self.st.started = true;
+            // quick-xml's slice reader removes a leading UTF-8 BOM before its
+            // first event and counts offsets after it, as the buffered one
+            // does with a BOM in its first fill (here the whole input).
+            if self.whole.starts_with(UTF8_BOM) {
+                self.st.bom = 3;
+            }
+        }
+        if let Some(p) = self.st.doctype_pending.take() {
+            self.st
+                .check_doctype_markup(self.markup(p.before, p.after), p)?;
+        }
+        let before = self.inner.buffer_position();
+        let event = match self.inner.read_event() {
+            Ok(event) => event,
+            Err(quick_xml::Error::Encoding(e)) => {
+                // quick-xml has moved past the refused bytes (its offset
+                // counts them, as the buffered reader's does), so they are
+                // the input between the two offsets.
+                let raw = self.markup(before, self.inner.buffer_position());
+                return Err(self.refused(raw, before, quick_xml::Error::Encoding(e)));
+            }
+            Err(e) => return Err(self.quick_xml_error(e)),
+        };
+        self.accept(&event, before)?;
+        Ok(event)
+    }
+
+    /// The bytes of the event read from the quick-xml offset `before` to
+    /// `after`: what the buffered reader holds in its buffer for it. That is
+    /// the input between the two, less the white space the read skipped
+    /// before it (with `trim_text_start`; the event itself never starts with
+    /// white space then).
+    fn markup(&self, before: u64, after: u64) -> &'a [u8] {
+        let whole: &'a [u8] = self.whole;
+        let at = |q: u64| usize::try_from(q + self.st.bom).unwrap_or(usize::MAX);
+        let bytes = whole.get(at(before)..at(after)).unwrap_or_default();
+        if self.st.trim {
+            let skipped = bytes
+                .iter()
+                .position(|&b| !is_quick_xml_space(b))
+                .unwrap_or(bytes.len());
+            &bytes[skipped..]
+        } else {
+            bytes
+        }
+    }
+}
+
+/// Where a caller's read loop takes its checked events from: a buffered
+/// [`WfReader`] or a [`SliceWfReader`]. Implemented by both, so a loop body
+/// is written once and monomorphized per source.
+///
+/// `'i` is the input's lifetime for a slice source (any lifetime for a
+/// buffered one). Events borrow `buf` (or, from a slice, the input), and the
+/// same buffer is passed to every call.
+pub(crate) trait NextEvent<'i> {
+    /// The next event, checked.
+    fn next_event<'b>(&mut self, buf: &'b mut Vec<u8>) -> Result<Event<'b>, WfError>
+    where
+        'i: 'b;
+
+    /// Checks the keyword of the document type declaration just returned,
+    /// on its markup (in `buf`, the buffer it was read into, before the next
+    /// read; a slice source looks at the input). A caller that reports the
+    /// declaration calls this first.
+    fn confirm_doctype(&mut self, buf: &[u8]) -> Result<(), WfError>;
+}
+
+impl<'i, B: BufRead> NextEvent<'i> for WfReader<B> {
+    #[inline(always)]
+    fn next_event<'b>(&mut self, buf: &'b mut Vec<u8>) -> Result<Event<'b>, WfError>
+    where
+        'i: 'b,
+    {
+        self.read_event_into(buf)
+    }
+
+    fn confirm_doctype(&mut self, buf: &[u8]) -> Result<(), WfError> {
+        match self.st.doctype_pending.take() {
+            Some(p) => self.st.check_doctype_markup(buf, p),
+            None => Ok(()),
+        }
+    }
+}
+
+impl<'i> NextEvent<'i> for SliceWfReader<'i> {
+    #[inline(always)]
+    fn next_event<'b>(&mut self, _buf: &'b mut Vec<u8>) -> Result<Event<'b>, WfError>
+    where
+        'i: 'b,
+    {
+        self.read_event()
+    }
+
+    fn confirm_doctype(&mut self, _buf: &[u8]) -> Result<(), WfError> {
+        match self.st.doctype_pending.take() {
+            Some(p) => self
+                .st
+                .check_doctype_markup(self.markup(p.before, p.after), p),
+            None => Ok(()),
+        }
+    }
+}
+
+impl<B: BufRead, W> WfReader<B, W> {
+    /// A reader over the configured quick-xml reader `inner`.
+    fn with_parts(inner: Reader<B>, whole: W, limits: &ParseLimits) -> Self {
+        let trim = inner.config().trim_text_start;
+        WfReader {
+            inner,
+            whole,
+            st: WfState {
+                trim,
+                bom: 0,
+                started: false,
+                decl_at: 0,
+                max: Max::of(limits),
+                phase: Phase::Prolog,
+                depth: 0,
+                events: 0,
+                count_event: true,
+                seen_doctype: false,
+                doctype_pending: None,
+                nodes: 0,
+                run: None,
+                scope: Scope::default(),
+                attrs: Vec::new(),
+                version: XmlVersion::V1_0,
+                declaration: None,
+                last_start: 0,
+                open: Vec::new(),
+                open_at: Vec::new(),
+            },
+        }
+    }
+
+    /// Checks the event just read from the quick-xml offset `before` and
+    /// counts it.
+    #[inline(always)]
+    fn accept(&mut self, event: &Event<'_>, before: u64) -> Result<(), WfError> {
+        let after = self.inner.buffer_position();
+        let st = &mut self.st;
+        st.check(Raw::of(event), before, after)?;
+        if st.count_event {
+            st.events += 1;
+        } else {
+            st.count_event = true;
+        }
+        Ok(())
+    }
+
+    /// The attributes of the start tag returned last (offsets into its
+    /// bytes), in document order.
+    pub(crate) fn attributes(&self) -> &[AttrSpan] {
+        &self.st.attrs
+    }
+
+    /// The byte offset into the input (a leading BOM included) up to which
+    /// the input has been read.
+    pub(crate) fn buffer_position(&self) -> u64 {
+        self.inner.buffer_position() + self.st.bom
+    }
+
+    /// The byte offset into the input (a leading BOM included) where the
+    /// markup of the event returned last starts: the `<` of a tag or a
+    /// declaration.
+    pub(crate) fn event_start(&self) -> u64 {
+        self.st.last_start + self.st.bom
+    }
+
+    /// The version whose rules apply (known once the XML declaration, if
+    /// any, has been read).
+    pub(crate) fn xml_version(&self) -> XmlVersion {
+        self.st.version
+    }
+
+    /// The same, as quick-xml's normalization functions take it.
+    pub(crate) fn quick_xml_version(&self) -> quick_xml::XmlVersion {
+        self.st.quick_xml_version()
+    }
+
+    /// The XML declaration, once it has been read.
+    pub(crate) fn declaration(&self) -> Option<&XmlDeclaration> {
+        self.st.declaration.as_ref()
+    }
+
+    /// For a caller decoding the event returned last: its start and the
+    /// version, to report as this layer's error what its checks rule out
+    /// ([`Recheck`]).
+    pub(crate) fn recheck(&self) -> Recheck {
+        self.st.recheck()
+    }
+
+    /// What quick-xml detected, as a well-formedness error at quick-xml's
+    /// error position (I/O errors stay quick-xml's).
+    #[cold]
+    #[inline(never)]
+    fn quick_xml_error(&self, e: quick_xml::Error) -> WfError {
+        self.st.quick_xml_error_at(e, self.inner.error_position())
+    }
+
+    /// The bytes `raw` of an event quick-xml refused as not UTF-8, read from
+    /// the quick-xml offset `before`: see [`WfState::not_utf8`].
+    #[cold]
+    #[inline(never)]
+    fn refused(&mut self, raw: &[u8], before: u64, e: quick_xml::Error) -> WfError {
+        let (after, at) = (self.inner.buffer_position(), self.inner.error_position());
+        self.st.not_utf8(raw, before, after, at, e)
+    }
+}
+
+impl WfState {
+    /// See [`WfReader::quick_xml_version`].
+    fn quick_xml_version(&self) -> quick_xml::XmlVersion {
+        match self.version {
+            XmlVersion::V1_1 => quick_xml::XmlVersion::Explicit1_1,
+            _ => quick_xml::XmlVersion::Implicit1_0,
+        }
     }
 
     // ── Errors ───────────────────────────────────────────────────────────
@@ -652,15 +857,8 @@ impl<B: BufRead> WfReader<B> {
         WfError::Limit(LimitExceeded::new(limit, max, found, pos + self.bom))
     }
 
-    /// What quick-xml detected, as a well-formedness error at quick-xml's
-    /// error position (I/O errors stay quick-xml's).
-    #[cold]
-    #[inline(never)]
-    fn quick_xml_error(&self, e: quick_xml::Error) -> WfError {
-        self.quick_xml_error_at(e, self.inner.error_position())
-    }
-
-    /// The same, at the quick-xml offset `pos`.
+    /// What quick-xml detected, as a well-formedness error at the quick-xml
+    /// offset `pos` (I/O errors stay quick-xml's).
     #[cold]
     #[inline(never)]
     fn quick_xml_error_at(&self, e: quick_xml::Error, pos: u64) -> WfError {
@@ -747,18 +945,25 @@ impl<B: BufRead> WfReader<B> {
     /// does before it decodes (`ReaderState::emit_*`), and what quick-xml
     /// would have refused on the way — an end tag that matches no open
     /// element, an unclosed reference, a misspelled `<!` keyword — is
-    /// refused as it is then. `before` is where the read started.
+    /// refused as it is then. `before` is where the read started, `after`
+    /// where quick-xml stopped and `error_at` its error position.
     #[cold]
     #[inline(never)]
-    fn not_utf8(&mut self, raw: &[u8], before: u64, e: quick_xml::Error) -> WfError {
-        let after = self.inner.buffer_position();
+    fn not_utf8(
+        &mut self,
+        raw: &[u8],
+        before: u64,
+        after: u64,
+        error_at: u64,
+        e: quick_xml::Error,
+    ) -> WfError {
         let Some(start) = after
             .checked_sub(raw.len() as u64)
             .filter(|_| !raw.is_empty())
         else {
             // Not an event's bytes (a source that reports an encoding error
             // as its I/O error): as a caller's decoding reports it.
-            return self.quick_xml_error(e);
+            return self.quick_xml_error_at(e, error_at);
         };
         let len = raw.len();
         let refused = |e: quick_xml::Error, pos: u64| Err((e, pos));
@@ -850,9 +1055,9 @@ impl<B: BufRead> WfReader<B> {
     /// For a caller decoding the event returned last: its start and the
     /// version, to report as this layer's error what its checks rule out
     /// ([`Recheck`]).
-    pub(crate) fn recheck(&self) -> Recheck {
+    fn recheck(&self) -> Recheck {
         Recheck {
-            pos: self.event_start(),
+            pos: self.last_start + self.bom,
             version: self.version,
         }
     }
@@ -1379,7 +1584,7 @@ impl<B: BufRead> WfReader<B> {
     /// `t` is the declaration after `<!DOCTYPE` and white space, up to `>`.
     fn check_doctype(&mut self, t: &[u8], before: u64, after: u64) -> Result<(), WfError> {
         let name_pos = after - 1 - t.len() as u64;
-        let trimming = self.inner.config().trim_text_start;
+        let trimming = self.trim;
         // With white space skipped before markup, `before` is where that
         // white space starts; the name's offset is exact either way.
         let pos = if trimming { name_pos } else { before };
@@ -1422,6 +1627,7 @@ impl<B: BufRead> WfReader<B> {
         }
         self.check_doctypedecl(t, name_pos)?;
         self.doctype_pending = Some(PendingDoctype {
+            before,
             after,
             len: t.len(),
             hash: fnv1a(t),

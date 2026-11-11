@@ -42,7 +42,7 @@ use crate::parser::frames::{
     SkipFrame,
 };
 use crate::parser::location::{SourceLocation, SourceMap, SourceMapStorage, SourceRef, SourceSpan};
-use crate::parser::reader::{split_qname, TrackedReader};
+use crate::parser::reader::{split_qname, Tracked};
 use crate::parser::structure::{
     validate_attribute_group_structure, validate_attribute_structure,
     validate_complex_type_structure, validate_element_structure, validate_extension_structure,
@@ -341,14 +341,13 @@ pub fn parse_schema_with_chameleon(
     );
 
     // Create XML reader; the nesting limit is checked on the raw markup.
-    let mut reader = if config.max_depth == 0 {
-        TrackedReader::from_bytes(xml)
+    // The whole document is in memory: the events borrow it.
+    let limits = if config.max_depth == 0 {
+        crate::xml::ParseLimits::none()
     } else {
-        TrackedReader::from_bytes_with_limits(
-            xml,
-            &crate::xml::ParseLimits::none().with_max_depth(config.max_depth),
-        )
+        crate::xml::ParseLimits::none().with_max_depth(config.max_depth)
     };
+    let mut reader = Tracked::from_slice(xml, &limits);
     let mut buf = Vec::new();
 
     // Track if we've seen the root schema element

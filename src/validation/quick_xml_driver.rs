@@ -12,6 +12,13 @@
 //!   responsible for `end_validation` on this path; see the
 //!   [`ValidationEventHandler`] trait for hook ordering.
 //!
+//! Each layer has a counterpart for a document that is in memory as a whole,
+//! [`drive_quick_xml_bytes`] and [`drive_quick_xml_with_bytes`]: they read the
+//! byte slice in place, without copying each event into a buffer first, and
+//! are otherwise the same — the same checks, events, hooks, diagnostics and
+//! byte positions. The `BufRead` functions accept a slice too (`&[u8]` is a
+//! `BufRead`) but read it through a buffer.
+//!
 //! The text is read through the crate's well-formedness layer
 //! ([`crate::xml`]): a document that is not well-formed is refused with
 //! [`DriveWithError::NotWellFormed`], and the runtime's
@@ -41,7 +48,9 @@ use crate::validation::errors::ValidationError;
 use crate::validation::info::{SchemaInfo, SchemaValidity};
 use crate::validation::runtime::ValidationRuntime;
 use crate::validation::validator::ValidationSink;
-use crate::xml::reader::{AttrKind, AttrSpan, Recheck, WfError, WfReader};
+use crate::xml::reader::{
+    AttrKind, AttrSpan, NextEvent, Recheck, SliceWfReader, WfError, WfReader,
+};
 use crate::xml::{LimitExceeded, NotWellFormed};
 use crate::xml_entity::resolve_general_ref;
 
@@ -111,7 +120,7 @@ pub enum DriveWithError<E> {
 
 /// View of an element-start (or empty) event passed to handler hooks.
 ///
-/// Borrowed slices live until the next `read_event_into` call, so hooks must
+/// Borrowed slices live until the driver reads the next event, so hooks must
 /// not retain references past their return.
 #[derive(Clone, Copy)]
 pub struct ElementStartView<'a> {
@@ -385,6 +394,10 @@ impl ValidationEventHandler for NoopHandler {
 /// is refused ([`DriveError::NotWellFormed`], [`DriveError::LimitExceeded`]).
 /// A document type declaration in the prolog is accepted and not processed;
 /// comments and PIs are dropped.
+///
+/// For a document that is already in memory as a whole, prefer
+/// [`drive_quick_xml_bytes`]: the same validation, reading the bytes in place
+/// instead of through a buffer.
 pub fn drive_quick_xml<R, S>(
     reader: R,
     runtime: &mut ValidationRuntime<'_, S>,
@@ -410,16 +423,75 @@ where
     S: ValidationSink,
 {
     let mut handler = NoopHandler;
-    let outcome = drive_quick_xml_with_in(reader, runtime, schema_set, &mut handler, buf).map_err(
-        |e| match e {
-            DriveWithError::Io(e) => DriveError::Io(e),
-            DriveWithError::NotWellFormed(e) => DriveError::NotWellFormed(e),
-            DriveWithError::LimitExceeded(e) => DriveError::LimitExceeded(e),
-            DriveWithError::Hook(_) => unreachable!("NoopHandler is infallible"),
-        },
-    )?;
+    let outcome = drive_quick_xml_with_in(reader, runtime, schema_set, &mut handler, buf)
+        .map_err(layer_1_error)?;
     runtime.end_validation().map_err(DriveError::Validation)?;
     Ok(outcome)
+}
+
+/// [`drive_quick_xml`] for a document that is in memory as a whole: the
+/// bytes are read in place, each event borrowing `input` instead of being
+/// copied into a buffer first.
+///
+/// What is checked and reported is the same as for [`drive_quick_xml`] over
+/// the same bytes: the well-formedness rules and parse limits, the
+/// diagnostics the runtime's sink receives, the outcome and every error
+/// (with its byte position). Calls `runtime.end_validation()`.
+///
+/// ```
+/// use xsd_schema::validation::{
+///     drive_quick_xml_bytes, CollectingValidationSink, SchemaValidator, SchemaValidity,
+///     ValidationFlags,
+/// };
+/// use xsd_schema::SchemaSetBuilder;
+///
+/// let schema_set = SchemaSetBuilder::new()
+///     .add_source(
+///         r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+///              <xs:element name="qty" type="xs:positiveInteger"/>
+///            </xs:schema>"#,
+///         "qty.xsd",
+///     )?
+///     .compile()?
+///     .into_schema_set();
+/// let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+///
+/// // A message received whole.
+/// let message: Vec<u8> = b"<qty>0</qty>".to_vec();
+/// let (mut errors, mut warnings) = (Vec::new(), Vec::new());
+/// let mut runtime = validator.start_run(CollectingValidationSink {
+///     errors: &mut errors,
+///     warnings: &mut warnings,
+/// });
+/// let outcome = drive_quick_xml_bytes(&message, &mut runtime, &schema_set)?;
+/// drop(runtime);
+/// assert_eq!(outcome.root_validity, Some(SchemaValidity::Invalid));
+/// assert_eq!(errors[0].instance_path().unwrap().to_string(), "/Q{}qty[1]");
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+pub fn drive_quick_xml_bytes<S>(
+    input: &[u8],
+    runtime: &mut ValidationRuntime<'_, S>,
+    schema_set: &SchemaSet,
+) -> Result<DriveOutcome, DriveError>
+where
+    S: ValidationSink,
+{
+    let mut handler = NoopHandler;
+    let outcome = drive_quick_xml_with_bytes(input, runtime, schema_set, &mut handler)
+        .map_err(layer_1_error)?;
+    runtime.end_validation().map_err(DriveError::Validation)?;
+    Ok(outcome)
+}
+
+/// A layer-2 error of the layer-1 helpers, whose handler is infallible.
+fn layer_1_error(e: DriveWithError<Infallible>) -> DriveError {
+    match e {
+        DriveWithError::Io(e) => DriveError::Io(e),
+        DriveWithError::NotWellFormed(e) => DriveError::NotWellFormed(e),
+        DriveWithError::LimitExceeded(e) => DriveError::LimitExceeded(e),
+        DriveWithError::Hook(never) => match never {},
+    }
 }
 
 // ── Layer 2: handler-driven ───────────────────────────────────────────────
@@ -429,6 +501,10 @@ where
 ///
 /// **Does NOT call `runtime.end_validation()`.** The caller must do so after
 /// any post-stream state collection (e.g. `runtime.schema_location_hints()`).
+///
+/// For a document that is already in memory as a whole, prefer
+/// [`drive_quick_xml_with_bytes`]: the same hooks in the same order, reading
+/// the bytes in place instead of through a buffer.
 pub fn drive_quick_xml_with<R, S, H>(
     reader: R,
     runtime: &mut ValidationRuntime<'_, S>,
@@ -457,9 +533,98 @@ where
     S: ValidationSink,
     H: ValidationEventHandler,
 {
+    let xml_reader = WfReader::new(reader, runtime.parse_limits(), false);
+    drive_events(xml_reader, runtime, schema_set, handler, buf)
+}
+
+/// [`drive_quick_xml_with`] for a document that is in memory as a whole: the
+/// bytes are read in place, each event borrowing `input` instead of being
+/// copied into a buffer first.
+///
+/// The hooks are called in the same order with the same views, byte offsets
+/// and errors as [`drive_quick_xml_with`] over the same bytes. **Does NOT
+/// call `runtime.end_validation()`**, like [`drive_quick_xml_with`].
+///
+/// ```
+/// use xsd_schema::validation::{
+///     drive_quick_xml_with_bytes, CollectingValidationSink, SchemaValidator,
+///     ValidationEventHandler, ValidationFlags,
+/// };
+/// use xsd_schema::SchemaSetBuilder;
+///
+/// /// Records where each element starts in the input.
+/// #[derive(Default)]
+/// struct Starts(Vec<usize>);
+///
+/// impl ValidationEventHandler for Starts {
+///     type Error = std::convert::Infallible;
+///     fn on_element_start_offset(&mut self, byte_pos: usize) -> Result<(), Self::Error> {
+///         self.0.push(byte_pos);
+///         Ok(())
+///     }
+/// }
+///
+/// let schema_set = SchemaSetBuilder::new()
+///     .add_source(
+///         r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+///              <xs:element name="list">
+///                <xs:complexType><xs:sequence>
+///                  <xs:element name="item" type="xs:string" maxOccurs="unbounded"/>
+///                </xs:sequence></xs:complexType>
+///              </xs:element>
+///            </xs:schema>"#,
+///         "list.xsd",
+///     )?
+///     .compile()?
+///     .into_schema_set();
+/// let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+///
+/// let document = b"<list><item>a</item><item>b</item></list>";
+/// let (mut errors, mut warnings) = (Vec::new(), Vec::new());
+/// let mut runtime = validator.start_run(CollectingValidationSink {
+///     errors: &mut errors,
+///     warnings: &mut warnings,
+/// });
+/// let mut starts = Starts::default();
+/// drive_quick_xml_with_bytes(document, &mut runtime, &schema_set, &mut starts)?;
+/// runtime.end_validation()?;
+/// drop(runtime);
+/// assert!(errors.is_empty());
+/// assert_eq!(starts.0, [0, 6, 20]);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+pub fn drive_quick_xml_with_bytes<S, H>(
+    input: &[u8],
+    runtime: &mut ValidationRuntime<'_, S>,
+    schema_set: &SchemaSet,
+    handler: &mut H,
+) -> Result<DriveOutcome, DriveWithError<H::Error>>
+where
+    S: ValidationSink,
+    H: ValidationEventHandler,
+{
+    let xml_reader = SliceWfReader::from_slice(input, runtime.parse_limits(), false);
+    // Not written to: the events borrow `input`.
+    let mut buf = Vec::new();
+    drive_events(xml_reader, runtime, schema_set, handler, &mut buf)
+}
+
+/// The drivers' loop, over either source of the well-formedness layer.
+fn drive_events<'i, B, W, S, H>(
+    mut xml_reader: WfReader<B, W>,
+    runtime: &mut ValidationRuntime<'_, S>,
+    schema_set: &SchemaSet,
+    handler: &mut H,
+    buf: &mut Vec<u8>,
+) -> Result<DriveOutcome, DriveWithError<H::Error>>
+where
+    B: BufRead,
+    WfReader<B, W>: NextEvent<'i>,
+    S: ValidationSink,
+    H: ValidationEventHandler,
+{
     // Every check of the shared well-formedness layer, and the run's parse
     // limits, hold for an event before it reaches this loop.
-    let mut xml_reader = WfReader::new(reader, runtime.parse_limits(), false);
 
     // prefix bytes -> stack of URI strings (top-of-stack = current binding)
     let mut prefix_map = PrefixMap::default();
@@ -492,7 +657,7 @@ where
     buf.clear();
 
     loop {
-        let event = xml_reader.read_event_into(buf);
+        let event = xml_reader.next_event(buf);
         let event_start = xml_reader.event_start() as usize;
 
         // A run of character data containing `&amp;` or `&#65;` is reported as
@@ -649,6 +814,10 @@ fn drive_error<E>(e: WfError) -> DriveWithError<E> {
 ///
 /// Whitespace-only runs go through the whitespace path, which element-only
 /// content models ignore; anything else is character content.
+// Inlined into each instance of the loop (`drive_events` runs once per
+// source): with two callers LLVM would keep these out of line, which costs the
+// buffered path about 2 % of its instructions on many small elements.
+#[inline(always)]
 fn flush_text_run<S, H>(
     pending: &mut String,
     runtime: &mut ValidationRuntime<'_, S>,
@@ -675,11 +844,11 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-fn handle_start_or_empty<R, S, H>(
+fn handle_start_or_empty<R, W, S, H>(
     e: &BytesStart<'_>,
     is_empty: bool,
     event_start: usize,
-    xml_reader: &WfReader<R>,
+    xml_reader: &WfReader<R, W>,
     runtime: &mut ValidationRuntime<'_, S>,
     schema_set: &SchemaSet,
     handler: &mut H,
@@ -868,6 +1037,10 @@ where
 
 /// Collect xmlns / xmlns:* declarations of the tag into `prefix_map`.
 /// Returns the (prefix, uri) declarations so they can be exposed to handlers.
+// Inlined into each instance of the loop (`drive_events` runs once per
+// source): with two callers LLVM would keep these out of line, which costs the
+// buffered path about 2 % of its instructions on many small elements.
+#[inline(always)]
 fn push_xmlns_scope<E>(
     tag: &[u8],
     spans: &[AttrSpan],
@@ -927,6 +1100,10 @@ fn pop_xmlns_scope(
 
 /// The element's local name, namespace URI and prefix, borrowed from the tag
 /// and the bindings in scope.
+// Inlined into each instance of the loop (`drive_events` runs once per
+// source): with two callers LLVM would keep these out of line, which costs the
+// buffered path about 2 % of its instructions on many small elements.
+#[inline(always)]
 fn resolve_element_qname<'a, E>(
     e: &'a BytesStart<'_>,
     at: Recheck,
@@ -948,6 +1125,10 @@ fn resolve_element_qname<'a, E>(
     Ok((local, namespace, prefix))
 }
 
+// Inlined into each instance of the loop (`drive_events` runs once per
+// source): with two callers LLVM would keep these out of line, which costs the
+// buffered path about 2 % of its instructions on many small elements.
+#[inline(always)]
 fn scan_xsi_attributes<E>(
     tag: &[u8],
     spans: &[AttrSpan],

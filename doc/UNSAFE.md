@@ -72,6 +72,15 @@ it shared through the same pointer.
   the mutable reborrow ended with the call. The shared reborrow is the last
   use of the pointer and does not outlive the function.
 
+The reader over a slice (`SliceWfReader::read_event`, behind
+`drive_quick_xml_bytes`, `drive_quick_xml_with_bytes`,
+`BufferDocumentBuilder::build_bytes` and schema loading) needs neither block:
+its events borrow the input, not a buffer, and after a refused read quick-xml
+has moved past the refused bytes exactly as the buffered reader has, so they
+are the input between the offsets before and after the read (safe slicing;
+the test `xml::tests::quick_xml_moves_past_refused_bytes_alike_in_both_readers`
+pins that behaviour of quick-xml).
+
 ## Test code
 
 **File**: `src/types/mod.rs`, `test_xml_type_code_roundtrip` (`#[cfg(test)]`)
@@ -94,7 +103,11 @@ cargo +nightly miri test --lib \
 
 The first covers block 1, the second block 2, the third the test-only
 `transmute`, the fourth block 3 (both paths: every kind of event refused,
-read whole and in one-byte chunks, after events that were returned).
+read whole and in one-byte chunks, after events that were returned; each
+case also through the slice reader, which has no `unsafe`). The other
+`xml::tests` run every reader case through both sources as well
+(`cargo +nightly miri test --lib xml::`, also with
+`MIRIFLAGS=-Zmiri-tree-borrows`).
 `-Zmiri-disable-isolation` lets the XPath engine read the clock
 (`fn:current-dateTime`), which an isolated Miri refuses. The whole library
 can run under Miri as well (`cargo +nightly miri test --lib`, with

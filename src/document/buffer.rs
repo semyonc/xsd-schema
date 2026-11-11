@@ -760,6 +760,11 @@ impl<'a> BufferDocument<'a> {
     // ── Parsing helpers ───────────────────────────────────────────────
 
     /// Parses an XML document from a reader into a `BufferDocument`.
+    ///
+    /// For a document that is already in memory as a whole,
+    /// [`BufferDocumentBuilder::build_bytes`](super::builder::BufferDocumentBuilder::build_bytes)
+    /// builds the same document reading the bytes in place instead of through
+    /// a buffer.
     pub fn from_reader<R: std::io::BufRead>(
         reader: R,
         arena: &'a Bump,
