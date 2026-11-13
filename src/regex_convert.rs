@@ -225,6 +225,8 @@ struct OpenClass {
     content_start: usize,
     /// Whether it is a negative character group (`[^…]`).
     negated: bool,
+    /// Whether it is the subtrahend of a class subtraction (`-[…]`).
+    subtrahend: bool,
 }
 
 /// [`convert_xml_pattern`], also returning the first mistake
@@ -249,9 +251,19 @@ fn convert(pattern: &str, options: ConvertOptions) -> (String, Option<String>) {
     // The character classes open at this point, innermost last: the
     // subtrahend of a class subtraction is a class inside the class.
     let mut classes: Vec<OpenClass> = Vec::new();
+    // A subtraction operator was just written: the next `[` opens its
+    // subtrahend.
+    let mut subtraction = false;
+    // A subtrahend was just closed: its class must close now.
+    let mut after_subtrahend = false;
     let mut chars = pattern.chars().peekable();
     while let Some(ch) = chars.next() {
         let in_class = !classes.is_empty();
+        if std::mem::take(&mut after_subtrahend) && ch != ']' {
+            error.get_or_insert_with(|| {
+                "a character class subtraction must be the last part of its class".to_string()
+            });
+        }
         if ch == '\\' {
             let Some(&next) = chars.peek() else {
                 result.push('\\');
@@ -316,6 +328,15 @@ fn convert(pattern: &str, options: ConvertOptions) -> (String, Option<String>) {
                 }
             }
         } else if ch == '[' {
+            // Inside a class, a `[` opens the subtrahend of a subtraction and
+            // nothing else (XSD has no nested classes; the `regex` crate
+            // would read one as a union).
+            let subtrahend = std::mem::take(&mut subtraction);
+            if in_class && !subtrahend {
+                error.get_or_insert_with(|| {
+                    "a '[' inside a character class must start a subtraction ('-[')".to_string()
+                });
+            }
             let negated = chars.next_if_eq(&'^').is_some();
             let start = result.len();
             result.push_str(if negated { "[^" } else { "[" });
@@ -323,17 +344,20 @@ fn convert(pattern: &str, options: ConvertOptions) -> (String, Option<String>) {
                 start,
                 content_start: result.len(),
                 negated,
+                subtrahend,
             });
         } else if ch == ']' {
-            if classes
-                .pop()
-                .is_some_and(|open| result.len() == open.content_start)
-            {
-                error.get_or_insert_with(|| "empty character class".to_string());
+            if let Some(open) = classes.pop() {
+                if result.len() == open.content_start {
+                    error.get_or_insert_with(|| "empty character class".to_string());
+                }
+                after_subtrahend = open.subtrahend;
             }
             result.push(']');
         } else if ch == '-' && in_class {
-            push_class_hyphen(&mut result, &mut classes, &chars, &mut error);
+            subtraction = push_class_hyphen(&mut result, &mut classes, &chars, &mut error);
+        } else if in_class {
+            push_class_char(&mut result, &classes, ch);
         } else {
             result.push(ch);
         }
@@ -345,7 +369,29 @@ fn convert(pattern: &str, options: ConvertOptions) -> (String, Option<String>) {
     (result, error)
 }
 
-/// Convert a `-` inside a character class.
+/// Copy a character of a character class that is not a `-`, written so that
+/// the `regex` crate reads it as that one character. Its class syntax has
+/// more than XSD's: `&&` (intersection) and `~~` (symmetric difference), so a
+/// `&` or `~` is escaped; and `[:name:]` / `[:^name:]` (an ASCII class), so a
+/// `:` that starts a class is written as `\x3A`. XSD reads all three as
+/// themselves (a `[` inside a class only starts a subtraction there, and
+/// `[:alpha:]` is the class of `:`, `a`, `l`, `p`, `h`).
+fn push_class_char(out: &mut String, classes: &[OpenClass], ch: char) {
+    match ch {
+        '&' => out.push_str(r"\&"),
+        '~' => out.push_str(r"\~"),
+        ':' if classes
+            .last()
+            .is_some_and(|open| out.len() == open.content_start) =>
+        {
+            out.push_str(r"\x3A")
+        }
+        _ => out.push(ch),
+    }
+}
+
+/// Convert a `-` inside a character class; `true` when it is the
+/// subtraction operator, so that the next `[` opens the subtrahend.
 ///
 /// XSD 1.1 §G.4.2 \[76\]: "A '-' character is recognized as a subtraction
 /// operator (and hence, as terminating the posCharGroup or negCharGroup) if
@@ -357,13 +403,15 @@ fn convert(pattern: &str, options: ConvertOptions) -> (String, Option<String>) {
 /// and `-` minus `b`) is escaped, since `regex` reads `---` otherwise. Any
 /// other hyphen is copied. A `-[` with no member before it is an `error`
 /// (the group before a subtraction is not empty, and a `[` is no member);
-/// its hyphen is copied.
+/// its hyphen is copied. Two hyphens in a row are an `error` unless the
+/// second is the operator (`regex` reads `--` as a set difference, and
+/// regexml refuses it in either version of the grammar).
 fn push_class_hyphen(
     out: &mut String,
     classes: &mut [OpenClass],
     rest: &std::iter::Peekable<std::str::Chars<'_>>,
     error: &mut Option<String>,
-) {
+) -> bool {
     let mut ahead = rest.clone();
     match (ahead.next(), ahead.next()) {
         (Some('['), _)
@@ -375,6 +423,7 @@ fn push_class_hyphen(
                 "a character class subtraction needs a character group before its '-'".to_string()
             });
             out.push('-');
+            false
         }
         (Some('['), _) => {
             if let Some(open) = classes.last_mut().filter(|open| open.negated) {
@@ -384,9 +433,23 @@ fn push_class_hyphen(
                 open.negated = false;
             }
             out.push_str("--");
+            true
         }
-        (Some('-'), Some('[')) => out.push_str(r"\-"),
-        _ => out.push('-'),
+        (Some('-'), Some('[')) => {
+            out.push_str(r"\-");
+            false
+        }
+        (Some('-'), _) => {
+            error.get_or_insert_with(|| {
+                "two hyphens in a row inside a character class ('--') are no XSD syntax".to_string()
+            });
+            out.push('-');
+            false
+        }
+        _ => {
+            out.push('-');
+            false
+        }
     }
 }
 
@@ -1086,6 +1149,96 @@ mod tests {
         for regex in both_versions(r"[-a-c\-]+") {
             assert!(regex.is_match("-abc-"));
             assert!(!regex.is_match("d"));
+        }
+    }
+
+    /// The class syntax of the `regex` crate that XSD does not have is
+    /// written so that `regex` reads XSD's meaning: `[:name:]` (an ASCII
+    /// class there, here the class of its characters), `&&` and `~~` (set
+    /// operations there, literal characters here).
+    #[test]
+    fn test_regex_class_syntax_is_escaped() {
+        for options in [ConvertOptions::xsd_v1_0(), ConvertOptions::xsd()] {
+            for (pattern, text) in [
+                (r"[a-z-[:^alpha:]]", r"^[a-z--[\x3A^alpha:]]$"),
+                (r"[a-z-[:-c]]", r"^[a-z--[\x3A-c]]$"),
+                (r"[:alpha:]", r"^[\x3Aalpha:]$"),
+                (r"[^:a]", r"^[^\x3Aa]$"),
+                (r"[a:]", r"^[a:]$"),
+                (r"[a&&b]", r"^[a\&\&b]$"),
+                (r"[a~~b]", r"^[a\~\~b]$"),
+                ("a&&b~~c", "^a&&b~~c$"),
+            ] {
+                assert_eq!(
+                    try_convert_xml_pattern(pattern, options),
+                    Ok(text.to_string()),
+                    "{pattern}"
+                );
+            }
+        }
+        let accepts = |pattern: &str, yes: &str, no: &str| {
+            for regex in both_versions(pattern) {
+                for c in yes.chars() {
+                    assert!(regex.is_match(&c.to_string()), "{pattern} accepts {c:?}");
+                }
+                for c in no.chars() {
+                    assert!(!regex.is_match(&c.to_string()), "{pattern} refuses {c:?}");
+                }
+            }
+        };
+        // a-z minus the six characters `:`, `^`, `a`, `l`, `p`, `h`.
+        accepts(r"[a-z-[:^alpha:]]", "bcxz", "alph:^1");
+        accepts(r"[a-z-[:alpha:]]", "bcxz", "alph:");
+        accepts(r"[0-9a-z-[:^digit:]]", "0129abcz", "digt:^");
+        accepts(r"[a-z-[:-c]]", "dxz", "abc:");
+        accepts(r"[:alpha:]", ":alph", "bz");
+        accepts(r"[a&&b]", "a&b", "c");
+        accepts(r"[a~~b]", "a~b", "c");
+        accepts(r"[a-z-[a&&b]]", "cxz", "ab&");
+        accepts(r"[^&~]", "ab", "&~");
+    }
+
+    /// The rest of the class syntax of the `regex` crate is no XSD syntax
+    /// either, and regexml refuses it in both versions of the grammar: two
+    /// hyphens in a row that are not a literal hyphen before a subtraction
+    /// (`regex`: a set difference), a `[` inside a class that does not start
+    /// a subtraction (`regex`: a nested class, so a union or an ASCII class),
+    /// and anything after a subtraction's subtrahend. They are errors.
+    #[test]
+    fn test_regex_class_syntax_that_xsd_lacks_is_an_error() {
+        let hyphens = "two hyphens in a row inside a character class ('--') are no XSD syntax";
+        let nested = "a '[' inside a character class must start a subtraction ('-[')";
+        let last = "a character class subtraction must be the last part of its class";
+        for options in [ConvertOptions::xsd_v1_0(), ConvertOptions::xsd()] {
+            for (pattern, error) in [
+                ("[a--b]", hyphens),
+                ("[--a]", hyphens),
+                ("[a--]", hyphens),
+                ("[+--]", hyphens),
+                ("[a-c--]", hyphens),
+                ("[a[b]]", nested),
+                ("[[:alpha:]]", nested),
+                ("[^[a]]", nested),
+                ("[a-z-[b]-[c]]", last),
+                ("[a-z-[b]c]", last),
+                ("[a-z-[:^alpha:]a]", last),
+            ] {
+                assert_eq!(
+                    try_convert_xml_pattern(pattern, options),
+                    Err(error.to_string()),
+                    "{pattern}"
+                );
+            }
+        }
+        // Still valid: a literal hyphen before the operator, nested
+        // subtractions, a subtraction from a negative group.
+        for pattern in [
+            r"[a--[b]]",
+            r"[a-z-[b-y-[c]]]",
+            r"[^a-z-[0-9]]",
+            r"[\--[b]]",
+        ] {
+            both_versions(pattern);
         }
     }
 

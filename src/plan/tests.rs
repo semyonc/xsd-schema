@@ -349,9 +349,9 @@ fn plan_data_is_send_and_sync() {
     sync::<PlanRef<'static>>();
 }
 
-/// Adversarial review, finding 1: a name with two declarations, one of them
-/// still being built when the other content model is determinized. The
-/// placeholder must not pass as equal to the other (uncovered) declaration.
+/// A name with two declarations, one of them still being built when the
+/// other content model is determinized: its placeholder must not pass as
+/// equal to the other (uncovered) declaration.
 #[test]
 fn a_child_plan_being_built_is_equal_to_nothing() {
     let xsd = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
@@ -369,9 +369,9 @@ fn a_child_plan_being_built_is_equal_to_nothing() {
     }
 }
 
-/// Adversarial review, finding 2: simple content whose values the runtime
-/// also checks at document level or against namespace bindings (IDs,
-/// references, QNames, unions that may hold them) is not delegated whole.
+/// Simple content whose values the runtime also checks at document level or
+/// against namespace bindings (IDs, references, QNames, unions that may hold
+/// them) is not delegated whole.
 #[test]
 fn simple_content_of_ids_references_and_qnames_is_uncovered() {
     for (base, docs) in [
@@ -401,5 +401,42 @@ fn simple_content_of_ids_references_and_qnames_is_uncovered() {
         for doc in docs {
             assert_eq!(verdicts(&set, &plan, doc), (false, false), "{base}: {doc}");
         }
+    }
+}
+
+/// A subtrahend written like an ASCII class (`[:^alpha:]`)
+/// was read as one by the `regex` crate, so the table accepted `a`, which
+/// XSD (and regexml, the dynamic path with `xsd11`) refuses. In an `xsd11`
+/// build this asserts against regexml.
+#[test]
+fn a_subtrahend_that_looks_like_an_ascii_class_is_its_characters() {
+    let xsd = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+      <xs:simpleType name="T"><xs:restriction base="xs:string">
+        <xs:pattern value="[a-z-[:^alpha:]]"/>
+      </xs:restriction></xs:simpleType>
+      <xs:element name="r"><xs:complexType><xs:sequence>
+        <xs:element name="v" type="T" minOccurs="0"/>
+      </xs:sequence><xs:attribute name="a" type="T"/></xs:complexType></xs:element>
+    </xs:schema>"#;
+    for set in [load(xsd), {
+        let mut set = SchemaSet::xsd11();
+        load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut set, None).expect("schema");
+        set
+    }] {
+        let (plan, _) = build(&set);
+        for c in ["a", "l", "p", "h", ":", "^"] {
+            assert_eq!(
+                verdicts(&set, &plan, &format!("<r><v>{c}</v></r>")),
+                (false, false),
+                "{c}"
+            );
+            assert_eq!(
+                verdicts(&set, &plan, &format!("<r a='{c}'/>")),
+                (false, false),
+                "{c}"
+            );
+        }
+        assert_eq!(verdicts(&set, &plan, "<r><v>b</v></r>"), (true, true));
+        assert_eq!(verdicts(&set, &plan, "<r a='z'/>"), (true, true));
     }
 }

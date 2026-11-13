@@ -97,6 +97,21 @@ corpora give the same results.
 - With `xsd11`, a pattern (`xs:pattern` or an XPath regular expression) whose
   repetition counts are near the largest `usize` (`(ab){1,9223372036854775807}`)
   no longer gives wrong answers or panics (regexml-fork 0.4).
+- Without the `xsd11` feature, a character class of a pattern means what XSD
+  says where the `regex` crate's class syntax reads it otherwise, as the
+  `xsd11` build always did:
+  - a class or subtrahend that starts with `:` is a class of characters, not an
+    ASCII class: `[a-z-[:^alpha:]]` is a–z without `:`, `^`, `a`, `l`, `p` and
+    `h` (it matched all of a–z), and `[a-z-[:alpha:]]` matches `b` (it matched
+    nothing);
+  - `&` and `~` in a class are characters: `[a&&b]` matches `a`, `&` and `b`
+    (it was an empty intersection), and `[a~~b]` matches `~` too;
+  - a class with two hyphens in a row that are not a hyphen before a
+    subtraction (`[a--b]`, `[--a]`), a `[` inside a class that does not start a
+    subtraction (`[a[b]]`, `[[:alpha:]]`), or anything after a subtraction's
+    subtrahend (`[a-z-[b]c]`) is an invalid pattern, as in the `xsd11` build
+    (the `regex` crate read them as a set difference, a union and a union).
+  `regex_convert::convert_xml_pattern` writes these forms out the same way.
 
 ### Performance
 

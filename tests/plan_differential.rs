@@ -11,7 +11,7 @@
 //! ```
 //!
 //! **T2 (`--mutations`).** NF-e 4.00, FatturaPA 1.2.3 and UBL 2.1 (Invoice,
-//! Order, CreditNote): every valid document of the probe's corpus must be
+//! Order, CreditNote): every valid document listed below must be
 //! answered `Valid` by the delegating tier, and no mutant of the mutated ones
 //! may be answered `Valid`, as shipped or delegating, unless the dynamic
 //! validator accepts it.
@@ -24,7 +24,11 @@
 //! translation (the tripwire). Values: the enumerations and other literals
 //! of the same schema, generated strings the table accepts (walks of the
 //! DFA, with their characters moved to neighbouring code points, dropped and
-//! repeated) and fixed boundary strings.
+//! repeated) and fixed boundary strings. Then a fixed list of hand-written
+//! patterns at the corners of the two engines' syntax, alone over every
+//! string up to length 2 of a 50-character alphabet and random longer ones,
+//! and in random two-pattern steps and two-step chains (a value must then be
+//! accepted by every step).
 //!
 //! Exit code 1 on any failure.
 
@@ -298,9 +302,10 @@ fn differential(
     r
 }
 
-// The probe's document scanner and mutation generator
-// (`validation-bench/codegen-probe/src/bin/real.rs`), with the operators the
-// design adds (§8 of the plan's design notes).
+// A scanner for the documents above (elements, attributes, text runs) and the
+// mutations made from them: structure, names, namespaces, attributes, values,
+// references, the prolog, `xsi:` attributes, and characters just outside the
+// trusted alphabets.
 
 struct El {
     name: String,
@@ -978,6 +983,7 @@ mod patterns {
                 }
             }
         }
+        corner_patterns(&mut stats, &mut failures);
         println!(
             "T8 pattern level: {} schema files, {:.1} s",
             files.len(),
@@ -991,5 +997,367 @@ mod patterns {
         }
         println!("  failures: {}", failures.len());
         !failures.is_empty()
+    }
+
+    /// Hand-written patterns at the corners of the two engines' syntax
+    /// (class subtraction, ASCII-class and set-operator look-alikes,
+    /// category, block and name escapes, anchors, quantifiers), and the
+    /// characters around them.
+    const CORNER_PATTERNS: &[&str] = &[
+        "[a-z-[:alpha:]]",
+        "[a-z-[:^alpha:]]",
+        "[a-z-[:alpha:]]*",
+        "[\\w-[_]]",
+        "\\w+",
+        "\\W",
+        "[^\\W]",
+        "[\\W]",
+        "\\d+",
+        "\\D",
+        "[\\D]",
+        "[^\\D]",
+        "\\p{L}",
+        "[\\P{L}]",
+        "\\P{L}",
+        "[^\\p{L}]",
+        "\\p{Nd}",
+        "\\p{Lu}\\p{Ll}*",
+        "[\\p{Lu}-[A]]",
+        "\\p{Cn}",
+        "[^\\p{Cn}]",
+        "\\p{Co}",
+        "\\P{Co}",
+        "[\\P{Co}]",
+        "\\p{Zs}",
+        "\\p{Sc}",
+        "\\p{Lt}",
+        "\\p{Mn}",
+        "\\p{S}",
+        "\\p{P}",
+        "[\\p{P}\\p{S}]",
+        "\\p{C}",
+        "\\P{C}",
+        ".",
+        ".*",
+        "..",
+        "[.]",
+        "\\.",
+        "a.b",
+        ".\\r",
+        "[^\\n]",
+        "[^\\n\\r]",
+        "\\s",
+        "[^\\s]",
+        "\\S+",
+        "[\\s\\S]",
+        "(\\s|x)",
+        "\\s{2}",
+        "[ \\t]",
+        "\\r",
+        "[\\r\\n]",
+        "\\S",
+        "[\\S]",
+        "\\s*",
+        "\\i\\c*",
+        "[\\i-[:]]",
+        "[\\c-[\\d]]",
+        "\\I",
+        "\\C",
+        "[\\I]",
+        "[^\\i]",
+        "\\c+",
+        "[\\c]",
+        "[^\\c]",
+        "[\\C-[\\s]]",
+        "a{2,3}",
+        "(a|b)*c",
+        "[a\\-z]",
+        "[a-]",
+        "[-a]",
+        "[\\^a]",
+        "[a^]",
+        "a\\|b",
+        "a?b+",
+        "[^a]",
+        "[^a-z-[q]]",
+        "[a-c-e]",
+        "[\\-\\^\\]]",
+        "\\{",
+        "[A-z]",
+        "\u{e9}",
+        "[\u{e0}-\u{ff}]",
+        "a|",
+        "|a",
+        "()",
+        "(a)",
+        "a{0}",
+        "a{1,}",
+        "[a-z-[b-d-[c]]]",
+        "[^a-z-[^b]]",
+        "[a-z-[^b-d]]",
+        "\\p{IsBasicLatin}",
+        "[\\p{IsBasicLatin}-[a]]",
+        "\\P{IsGreek}",
+        "[\\P{IsPrivateUse}]",
+        "\\P{IsPrivateUse}",
+        "\\p{IsPrivateUse}",
+        "[\\P{IsBasicLatin}]",
+        "[^\\p{IsBasicLatin}]",
+        "\\p{IsLatin-1Supplement}",
+        "[\\w\\W]",
+        "[\\d\\D]",
+        "[\\d-[1]]",
+        "[\\w-[a]]",
+        "[\\W-[ ]]",
+        "[^\\w]",
+        "[^\\d]",
+        "[^\\W-[a]]",
+        "[a&]",
+        "a&b",
+        "[a&&[b]]",
+        "[a~~b]",
+        "[a--b]",
+        "^a",
+        "a$",
+        "[$]",
+        "[\\^$]",
+        "\\$",
+        "[+\\-]?[0-9]+",
+        "[A-Z]{2}[0-9]{3}",
+        "[^:]*",
+        "([a-z])+",
+        "(ab|a)(c|bc)",
+        "a*a",
+        "(a*)*b",
+        "(a|aa)+",
+        "[\u{10000}-\u{10ffff}]",
+        "[^\u{10000}-\u{10ffff}]",
+        "\u{10000}",
+        "[\u{e000}-\u{f8ff}]",
+        "\\p{Ll}",
+        "\\p{Lo}",
+        "\\p{N}",
+        "\\p{No}",
+        "\\p{Z}",
+        "[\\p{L}-[\\p{Lu}]]",
+        "[\\P{L}-[\\P{Lu}]]",
+        "\\w\\s\\d",
+        "[\\w\\s]",
+        "[^\\w\\s]",
+        "[\\i\\d]",
+        "\\n",
+        "\\t",
+        "[\\n\\t ]",
+        "\\p{IsCombiningDiacriticalMarks}",
+        "\\p{IsGeneralPunctuation}",
+        "[\\p{IsGeneralPunctuation}\\s]",
+        "\\p{IsArabic}",
+        "[\\p{IsArabic}\\d]",
+        "\\p{IsSupplementaryPrivateUseArea-A}",
+        "[\\P{IsSupplementaryPrivateUseArea-A}]",
+        "\\p{IsHighSurrogates}",
+        "[\\P{IsHighSurrogates}]",
+    ];
+
+    const CORNER_ALPHABET: &[char] = &[
+        'a',
+        'b',
+        'c',
+        'z',
+        'A',
+        'q',
+        '_',
+        ':',
+        '-',
+        '.',
+        '^',
+        '$',
+        '1',
+        '\u{663}',
+        '\u{e9}',
+        '\u{1c5}',
+        '\u{a0}',
+        '\u{2003}',
+        '\u{85}',
+        '\t',
+        '\n',
+        '\r',
+        ' ',
+        '\u{e000}',
+        '\u{f0000}',
+        '\u{10000}',
+        '\u{300}',
+        '\u{20ac}',
+        '+',
+        '~',
+        '|',
+        '`',
+        '<',
+        '=',
+        '&',
+        '\u{2028}',
+        '\u{3a9}',
+        '\u{378}',
+        '\u{d7ff}',
+        '\u{fffd}',
+        ']',
+        '[',
+        '\\',
+        '\u{2165}',
+        '\u{b2}',
+        '\u{2e2f}',
+        '\u{1885}',
+        '\u{ff10}',
+        '\u{10ffff}',
+        '\u{100000}',
+    ];
+
+    /// One step of a check: its patterns, table, alphabet and both engines.
+    struct Step {
+        patterns: Vec<String>,
+        table: EmittedTable,
+        alphabet: xsd_schema::plan::alphabet::ComposedAlphabet,
+        regexml: Vec<PatternFacet>,
+        regex: Vec<Option<regex::Regex>>,
+    }
+
+    fn step(patterns: &[&str], version: XsdVersion) -> Option<Step> {
+        let mut regexml = Vec::new();
+        for p in patterns {
+            regexml
+                .push(PatternFacet::new(p.to_string(), None, version, RegexCompat::Strict).ok()?);
+        }
+        Some(Step {
+            patterns: patterns.iter().map(|p| p.to_string()).collect(),
+            table: build_table(patterns, version).ok()?,
+            alphabet: step_alphabet(patterns, version).ok()?,
+            regexml,
+            regex: patterns
+                .iter()
+                .map(|p| {
+                    translation(p, version)
+                        .ok()
+                        .and_then(|t| regex::Regex::new(&t).ok())
+                })
+                .collect(),
+        })
+    }
+
+    fn xorshift(rng: &mut u64) -> u64 {
+        *rng ^= *rng << 13;
+        *rng ^= *rng >> 7;
+        *rng ^= *rng << 17;
+        *rng
+    }
+
+    /// Every string up to length `exhaustive` over `alphabet`, and `random`
+    /// longer ones.
+    fn corner_values(
+        rng: &mut u64,
+        alphabet: &[char],
+        exhaustive: usize,
+        random: usize,
+    ) -> Vec<String> {
+        let mut out = vec![String::new()];
+        let mut level = vec![String::new()];
+        for _ in 0..exhaustive {
+            let mut longer = Vec::new();
+            for s in &level {
+                for &c in alphabet {
+                    let mut q = s.clone();
+                    q.push(c);
+                    longer.push(q);
+                }
+            }
+            out.extend(longer.iter().cloned());
+            level = longer;
+        }
+        for _ in 0..random {
+            let len = exhaustive + 1 + (xorshift(rng) % 4) as usize;
+            out.push(
+                (0..len)
+                    .map(|_| alphabet[(xorshift(rng) % alphabet.len() as u64) as usize])
+                    .collect(),
+            );
+        }
+        out
+    }
+
+    /// Judge a chain of steps on `values`: where every step's table accepts
+    /// a value inside its alphabet, regexml must accept it for every step
+    /// (one of the step's patterns); and a table must never accept what the
+    /// `regex` engine refuses on every translation of its step.
+    fn judge(
+        steps: &[Step],
+        values: &[String],
+        label: &str,
+        stats: &mut BTreeMap<&'static str, usize>,
+        failures: &mut Vec<String>,
+    ) {
+        for v in values {
+            *stats.entry("corner values").or_default() += 1;
+            let mut claim = true;
+            for s in steps {
+                let accepted = s.table.accepts(v.as_bytes());
+                let translated = s.regex.iter().all(Option::is_some);
+                if accepted && translated && s.regex.iter().flatten().all(|r| !r.is_match(v)) {
+                    failures.push(format!(
+                        "TRIPWIRE {label} {:?}: table accepts {v:?}, regex refuses",
+                        s.patterns
+                    ));
+                }
+                claim &= accepted && v.chars().all(|c| s.alphabet.contains(c));
+            }
+            if claim {
+                *stats.entry("corner claims").or_default() += 1;
+                for s in steps {
+                    if !s.regexml.iter().any(|r| r.matches(v)) {
+                        failures.push(format!("UNSOUND {label} {:?} {v:?}", s.patterns));
+                    }
+                }
+            }
+        }
+    }
+
+    /// The corner patterns, each as a one-pattern step over every string up
+    /// to length 2 of the corner alphabet and 2,000 longer ones; then random
+    /// two-pattern steps and two-step chains of them over every string of
+    /// length 1 and 600 longer ones; under both XSD versions.
+    fn corner_patterns(stats: &mut BTreeMap<&'static str, usize>, failures: &mut Vec<String>) {
+        let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+        for version in [XsdVersion::V1_0, XsdVersion::V1_1] {
+            let label = format!("{version:?}");
+            let values = corner_values(&mut rng, CORNER_ALPHABET, 2, 2000);
+            let mut usable: Vec<&str> = Vec::new();
+            for p in CORNER_PATTERNS {
+                *stats.entry("corner patterns").or_default() += 1;
+                match step(&[p], version) {
+                    Some(s) => {
+                        usable.push(p);
+                        judge(&[s], &values, &label, stats, failures);
+                    }
+                    None => {
+                        *stats
+                            .entry(
+                                "corner patterns without a table, an alphabet or a regexml program",
+                            )
+                            .or_default() += 1
+                    }
+                }
+            }
+            let short = corner_values(&mut rng, CORNER_ALPHABET, 1, 600);
+            for _ in 0..400 {
+                let mut pick = || usable[(xorshift(&mut rng) % usable.len() as u64) as usize];
+                let (a, b, c, d) = (pick(), pick(), pick(), pick());
+                if let Some(s) = step(&[a, b], version) {
+                    *stats.entry("corner two-pattern steps").or_default() += 1;
+                    judge(&[s], &short, &label, stats, failures);
+                }
+                if let (Some(s1), Some(s2)) = (step(&[c], version), step(&[d], version)) {
+                    *stats.entry("corner two-step chains").or_default() += 1;
+                    judge(&[s1, s2], &short, &label, stats, failures);
+                }
+            }
+        }
     }
 }
