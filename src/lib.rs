@@ -206,6 +206,12 @@ pub mod compiler;
 // Instance validation
 pub mod validation;
 
+// Validation plan: table-driven "definitely valid" checks (no public API
+// yet).
+#[cfg(feature = "plan")]
+#[doc(hidden)]
+pub mod plan;
+
 // Re-export primary types
 pub use error::{FacetError, FacetResult, SchemaError, SchemaLimit, SchemaResult};
 pub use ids::*;
