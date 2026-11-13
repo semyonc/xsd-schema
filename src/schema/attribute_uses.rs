@@ -129,6 +129,28 @@ impl AttrNames {
     }
 }
 
+// ---------------------------------------------------------------------------
+// AttributeLookup — three-state result from find_attribute_in_type
+// ---------------------------------------------------------------------------
+
+/// Result of looking up an attribute in a complex type's attribute list.
+pub(crate) enum AttributeLookup {
+    /// Found a matching attribute declaration
+    /// (attr_key, type_key, fixed_value, the declaration the fixed value was
+    /// written on, inheritable)
+    Found(
+        Option<AttributeKey>,
+        Option<TypeKey>,
+        Option<String>,
+        Option<SourceRef>,
+        bool,
+    ),
+    /// The attribute is explicitly prohibited
+    Prohibited,
+    /// No matching attribute found
+    NotFound,
+}
+
 impl SchemaSet {
     /// Collect all attribute uses from resolved attribute groups (recursively).
     pub(crate) fn collect_group_attributes(
@@ -221,9 +243,11 @@ impl SchemaSet {
     /// The one walk behind every runtime consumer of the attribute uses: the
     /// required-attribute check, the defaulted attributes (identity-constraint
     /// fields, ID/IDREF, `get_default_attributes`), the inheritable defaults
-    /// and `get_expected_attributes`. The runtime's `find_attribute_in_type`
-    /// looks one name up by the same rule, and the validation plan builds its
-    /// attribute tables from this walk, so both see the same effective uses.
+    /// and `get_expected_attributes`. An attribute that is present is
+    /// looked up by name instead, with
+    /// [`find_attribute_in_type`](Self::find_attribute_in_type), which follows
+    /// this rule with one XSD 1.0 exception (see there); the validation plan
+    /// checks each use of this walk against that lookup.
     pub(crate) fn for_each_attribute_use(
         &self,
         ct_key: ComplexTypeKey,
@@ -411,6 +435,124 @@ impl SchemaSet {
         attr_key
             .and_then(|k| self.arenas.attributes.get(k))
             .is_some_and(|decl| decl.default_value.is_none() && decl.fixed_value.is_some())
+    }
+
+    /// Look the attribute (`local_name`, `namespace`) up among the {attribute
+    /// uses} of the complex type `ct_data` (Structures §3.4.2.4): what the
+    /// runtime validates an attribute that is present against. At each level
+    /// of the base chain, the type's own `<attribute>` uses, then its
+    /// attribute groups' uses; a prohibited `<attribute>` of that name keeps
+    /// the use from being inherited only when the level is a restriction
+    /// (clause 3.2.2) — it never hides a use of the type itself, an
+    /// extension's is ignored (clause 3.1), and a group's prohibited
+    /// `<attribute>` is no use at all (W3C Bugzilla #4043).
+    ///
+    /// That is the rule of
+    /// [`for_each_attribute_use`](Self::for_each_attribute_use) but for one
+    /// exception: under XSD 1.0 a type's own `<attribute use="prohibited">`
+    /// with a fixed value is *found*, with that use's type and fixed value,
+    /// before the groups and the base chain are looked at (W3C test
+    /// attP031), while the walk skips every prohibited use. So for that name
+    /// a present attribute and the walk's use (from a group or a base) can
+    /// differ.
+    ///
+    /// `Prohibited` means a restriction removed the name (the caller's
+    /// wildcard rescue may still admit the attribute), `NotFound` that no
+    /// level declares or removes it.
+    pub(crate) fn find_attribute_in_type(
+        &self,
+        ct_data: &ComplexTypeDefData,
+        local_name: NameId,
+        namespace: Option<NameId>,
+    ) -> AttributeLookup {
+        let any_type = self.any_type_key();
+        let mut ct_data = ct_data;
+        loop {
+            let mut prohibited_here = false;
+            for (i, attr_use) in ct_data.attributes.iter().enumerate() {
+                let resolved = ct_data.resolved_attributes.get(i);
+                let (attr_name, attr_ns) =
+                    self.resolve_attr_use_name_ns(attr_use, resolved, ct_data.target_namespace);
+                if attr_name != local_name || attr_ns != namespace {
+                    continue;
+                }
+                let attr_key = resolved.and_then(|r| r.resolved_ref);
+                let attr_type = resolved.and_then(|r| r.resolved_type).or_else(|| {
+                    attr_key
+                        .and_then(|k| self.arenas.attributes.get(k))
+                        .and_then(|d| d.resolved_type)
+                });
+
+                // Get fixed value from the attribute use or from the attribute declaration
+                let (fixed, fixed_source) = self.attribute_use_fixed(attr_use, attr_key);
+                let inheritable =
+                    attr_use.use_inheritable(attr_key.and_then(|k| self.arenas.attributes.get(k)));
+
+                if attr_use.use_kind == AttributeUseKind::Prohibited {
+                    // In XSD 1.0, use="prohibited" combined with fixed=X is a valid
+                    // schema construct (constraint au-props-correct.5 was added in XSD 1.1).
+                    // The combination means the attribute may appear with the fixed value.
+                    // (W3C test attP031: schema valid in 1.0, instance with fixed value valid.)
+                    if fixed.is_some() && self.is_xsd10() {
+                        return AttributeLookup::Found(
+                            attr_key,
+                            attr_type,
+                            fixed,
+                            fixed_source,
+                            inheritable,
+                        );
+                    }
+                    prohibited_here = true;
+                    continue;
+                }
+                return AttributeLookup::Found(
+                    attr_key,
+                    attr_type,
+                    fixed,
+                    fixed_source,
+                    inheritable,
+                );
+            }
+
+            // Search attribute groups. A prohibited use inside an attribute
+            // group is transparent — it does NOT propagate the prohibition to
+            // the referencing type (W3C Bugzilla #4043 / TSTF conclusion).
+            for ga in self.collect_group_attributes(ct_data) {
+                if ga.name == local_name
+                    && ga.namespace == namespace
+                    && ga.use_kind != AttributeUseKind::Prohibited
+                {
+                    #[cfg(feature = "xsd11")]
+                    let inheritable = ga.inheritable;
+                    #[cfg(not(feature = "xsd11"))]
+                    let inheritable = false;
+                    return AttributeLookup::Found(
+                        ga.attr_key,
+                        ga.type_key,
+                        ga.fixed_value,
+                        ga.fixed_source,
+                        inheritable,
+                    );
+                }
+            }
+
+            // Clause 3: the use is inherited from the base unless a
+            // restriction prohibits the name (an extension's prohibition is
+            // ignored).
+            let extension = matches!(
+                ct_data.derivation_method,
+                Some(crate::parser::frames::DerivationMethod::Extension)
+            );
+            if prohibited_here && !extension {
+                return AttributeLookup::Prohibited;
+            }
+            match ct_data.resolved_base_type {
+                Some(TypeKey::Complex(base)) if base != any_type => {
+                    ct_data = &self.arenas.complex_types[base];
+                }
+                _ => return AttributeLookup::NotFound,
+            }
+        }
     }
 
     /// An attribute use's fixed value — its own, otherwise its declaration's —
