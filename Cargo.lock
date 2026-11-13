@@ -1667,6 +1667,7 @@ dependencies = [
  "pretty_assertions",
  "quick-xml",
  "regex",
+ "regex-automata",
  "regexml-fork",
  "roxmltree",
  "rust_decimal",

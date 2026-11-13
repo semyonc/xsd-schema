@@ -65,6 +65,11 @@ unicode-normalization = { version = "0.1", optional = true }
 # so the code keeps the name `regexml`.
 regexml = { package = "regexml-fork", version = "0.4", optional = true }
 
+# Generation-time pattern DFAs for the validation plan (feature `codegen`,
+# host side only). Already in the build through `regex`; the DFA builder
+# needs the `dfa-build` feature, which `regex` does not enable.
+regex-automata = { version = "0.4", optional = true, default-features = false, features = ["std", "syntax", "unicode", "dfa-build"] }
+
 [build-dependencies]
 lalrpop = { version = "0.23.2", optional = true }
 
@@ -80,6 +85,10 @@ xsd11 = ["dep:lalrpop-util", "dep:lalrpop", "dep:bumpalo", "dep:regexml"]
 compose = ["xsd11"]
 unicode-normalization = ["dep:unicode-normalization"]
 async = ["dep:futures"]
+# Validation plan: the table interpreter (no new dependency).
+plan = []
+# Validation plan generator: builds plans from a SchemaSet (implies `plan`).
+codegen = ["plan", "dep:regex-automata"]
 
 [lib]
 name = "xsd_schema"
