@@ -16,6 +16,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use crate::compiler::NfaTerm;
 use crate::ids::{ComplexTypeKey, ElementKey, NameId, SimpleTypeKey, TypeKey};
 use crate::parser::frames::{AttributeUseKind, IdentityKind, SimpleTypeVariety};
+use crate::schema::attribute_uses::AttributeLookup;
 use crate::schema::model::{RegexCompat, XsdVersion};
 use crate::schema::SchemaSet;
 use crate::types::facets::WhitespaceMode;
@@ -487,7 +488,19 @@ impl<'a> Builder<'a> {
         }
         let mut out = Vec::with_capacity(uses.len());
         let mut required = 0u64;
+        let ct = &set.arenas.complex_types[ck];
         for (bit, (ns, local, use_kind, ty, value, fixed)) in uses.into_iter().enumerate() {
+            // The walk drives required and defaulted attributes; a present
+            // attribute is validated against the per-name lookup, which
+            // differs from the walk in one XSD 1.0 corner (a prohibited use
+            // with a fixed value). Take the use only where both agree on its
+            // type and fixed value.
+            let walk_fixed = if fixed { value.as_deref() } else { None };
+            match set.find_attribute_in_type(ct, local, ns) {
+                AttributeLookup::Found(_, found_ty, found_fixed, _, _)
+                    if found_ty == ty && found_fixed.as_deref() == walk_fixed => {}
+                _ => return None,
+            }
             let name = self.intern_name(ns, local);
             let check = match ty {
                 Some(TypeKey::Simple(_)) => self.check(ty?),

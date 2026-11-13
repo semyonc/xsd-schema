@@ -30,6 +30,13 @@
 //! and in random two-pattern steps and two-step chains (a value must then be
 //! accepted by every step).
 //!
+//! **Derived types and attribute uses (`--derived [--count N]`, no corpus).**
+//! Random schemas, `N` per XSD version: a base complex type and up to two
+//! levels of extension and restriction, with their own attribute uses (every
+//! use kind and value constraint, local and global declarations) and two
+//! attribute groups; 864 documents each over three attributes, a group
+//! attribute and the content. No `Valid` may contradict the runtime.
+//!
 //! Exit code 1 on any failure.
 
 use std::collections::HashMap;
@@ -42,13 +49,26 @@ use xsd_schema::{SchemaSet, SchemaSetBuilder};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    let mut failed = false;
+    if args.iter().any(|a| a == "--derived") {
+        let count = args
+            .iter()
+            .position(|a| a == "--count")
+            .and_then(|i| args.get(i + 1))
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(3000);
+        failed |= derived::run(count);
+    }
     let workspace = args
         .iter()
         .position(|a| a == "--workspace")
         .and_then(|i| args.get(i + 1))
         .map(PathBuf::from);
     let Some(ws) = workspace else {
-        println!("plan_differential: no --workspace given; nothing to run");
+        if failed {
+            std::process::exit(1);
+        }
+        println!("plan_differential: no --workspace given; no corpus to run");
         return;
     };
     let only = args
@@ -56,7 +76,6 @@ fn main() {
         .position(|a| a == "--only")
         .and_then(|i| args.get(i + 1))
         .cloned();
-    let mut failed = false;
     if args.iter().any(|a| a == "--mutations") {
         failed |= mutations(&ws, only.as_deref());
     }
@@ -1359,5 +1378,246 @@ mod patterns {
                 }
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Derived types and attribute uses
+// ---------------------------------------------------------------------------
+
+mod derived {
+    use super::*;
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+        fn pick<'a, T>(&mut self, v: &'a [T]) -> &'a T {
+            &v[self.below(v.len())]
+        }
+    }
+
+    /// An attribute use: a local `a`/`b`/`c`, or (`g`) a reference to one of
+    /// the global attributes, with a random type, use and value constraint.
+    fn attr_use(r: &mut Rng, name: &str) -> String {
+        let ty = *r.pick(&["xs:string", "xs:string", "xs:token", "K", "xs:int"]);
+        let lit = if ty == "xs:int" {
+            *r.pick(&["5", "7"])
+        } else {
+            *r.pick(&["x", "y"])
+        };
+        let vc = match r.below(6) {
+            0 => format!(" default=\"{lit}\""),
+            1 | 2 => format!(" fixed=\"{lit}\""),
+            _ => String::new(),
+        };
+        let usek = match r.below(8) {
+            0 | 1 => " use=\"required\"",
+            5..=7 => " use=\"prohibited\"",
+            _ => "",
+        };
+        let vc = if usek.contains("required") && vc.contains("default") {
+            String::new()
+        } else {
+            vc
+        };
+        if name == "g" {
+            let g = *r.pick(&["ga", "gf", "gd"]);
+            let vc = if g == "ga" {
+                vc.replace('5', "x").replace('7', "y")
+            } else {
+                String::new()
+            };
+            let usek = if g == "gd" && usek.contains("required") {
+                ""
+            } else {
+                usek
+            };
+            return format!("<xs:attribute ref=\"{g}\"{usek}{vc}/>");
+        }
+        format!("<xs:attribute name=\"{name}\" type=\"{ty}\"{usek}{vc}/>")
+    }
+
+    fn attr_set(r: &mut Rng, groups: &[&str]) -> String {
+        let mut s = String::new();
+        for n in ["a", "b", "c", "g"] {
+            if r.below(100) < 45 {
+                s.push_str(&attr_use(r, n));
+            }
+        }
+        if !groups.is_empty() && r.below(3) == 0 {
+            s.push_str(&format!("<xs:attributeGroup ref=\"{}\"/>", r.pick(groups)));
+        }
+        s
+    }
+
+    fn schema(r: &mut Rng) -> String {
+        let mut s = String::from(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">\
+             <xs:simpleType name=\"K\"><xs:restriction base=\"xs:token\"><xs:enumeration value=\"x\"/>\
+             <xs:enumeration value=\"y\"/></xs:restriction></xs:simpleType>\
+             <xs:attribute name=\"ga\" type=\"xs:string\"/><xs:attribute name=\"gf\" type=\"xs:string\" fixed=\"x\"/>\
+             <xs:attribute name=\"gd\" type=\"xs:string\" default=\"x\"/>",
+        );
+        s.push_str(&format!(
+            "<xs:attributeGroup name=\"G1\">{}</xs:attributeGroup>",
+            attr_set(r, &[])
+        ));
+        s.push_str(&format!(
+            "<xs:attributeGroup name=\"G2\">{}</xs:attributeGroup>",
+            attr_set(r, &["G1"])
+        ));
+        let groups = ["G1", "G2"];
+        let optional = |n: &str| {
+            format!("<xs:sequence><xs:element name=\"{n}\" type=\"xs:string\" minOccurs=\"0\"/></xs:sequence>")
+        };
+        let content0 = if r.below(2) == 0 {
+            String::new()
+        } else {
+            optional("e")
+        };
+        s.push_str(&format!(
+            "<xs:complexType name=\"T0\">{content0}{}</xs:complexType>",
+            attr_set(r, &groups)
+        ));
+        let mut prev = "T0";
+        let mut has_content = !content0.is_empty();
+        for (name, added) in [("T1", "f"), ("T2", "h")] {
+            let how = if r.below(2) == 0 {
+                "extension"
+            } else {
+                "restriction"
+            };
+            let content = if how == "restriction" && has_content {
+                [optional("e"), "<xs:sequence/>".to_string(), String::new()][r.below(3)].clone()
+            } else if how == "extension" && r.below(3) == 0 {
+                has_content = true;
+                optional(added)
+            } else {
+                String::new()
+            };
+            s.push_str(&format!(
+                "<xs:complexType name=\"{name}\"><xs:complexContent><xs:{how} base=\"{prev}\">{content}{}</xs:{how}></xs:complexContent></xs:complexType>",
+                attr_set(r, &groups)
+            ));
+            prev = name;
+            if r.below(4) == 0 {
+                break;
+            }
+        }
+        s.push_str(&format!(
+            "<xs:element name=\"r\" type=\"{prev}\"/></xs:schema>"
+        ));
+        s
+    }
+
+    fn load(xsd: &str, v11: bool) -> Option<SchemaSet> {
+        let b = if v11 {
+            SchemaSetBuilder::xsd11()
+        } else {
+            SchemaSetBuilder::new()
+        };
+        let b = b.add_bytes(xsd.as_bytes(), "derived.xsd").ok()?;
+        b.compile().ok().map(|c| c.into_schema_set())
+    }
+
+    pub fn run(count: usize) -> bool {
+        let mut failed = false;
+        for (v11, seed) in [
+            (false, 0x9E37_79B9_7F4A_7C15u64),
+            (true, 0x9E37_79B9_7F4A_7C40),
+        ] {
+            let t = Instant::now();
+            let mut r = Rng(seed);
+            let (
+                mut schemas,
+                mut refused,
+                mut docs,
+                mut dynamic_valid,
+                mut shipped_valid,
+                mut delegating_valid,
+                mut unsound,
+            ) = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+            let values: [Option<&str>; 6] = [
+                None,
+                Some("x"),
+                Some("y"),
+                Some("wrong"),
+                Some("5"),
+                Some(" x "),
+            ];
+            let bodies = [
+                "/>",
+                "/>",
+                "><e>t</e></r>",
+                "><e/><f/></r>",
+                "><f>t</f></r>",
+                "><e/><f/><h/></r>",
+                "><h/></r>",
+            ];
+            while schemas < count {
+                let xsd = schema(&mut r);
+                let Some(set) = load(&xsd, v11) else {
+                    refused += 1;
+                    continue;
+                };
+                schemas += 1;
+                let (data, _) = plan::build(&set);
+                let validator = SchemaValidator::new(&set, ValidationFlags::default());
+                let mut scratch = plan::Scratch::new();
+                for a in values {
+                    for b in values {
+                        for c in values {
+                            for g in [Some("ga"), Some("gf"), Some("gd"), None] {
+                                let mut d = String::from("<r");
+                                for (n, v) in [("a", a), ("b", b), ("c", c)] {
+                                    if let Some(v) = v {
+                                        d.push_str(&format!(" {n}=\"{v}\""));
+                                    }
+                                }
+                                if let Some(g) = g {
+                                    let gv = *r.pick(&["x", "y", "wrong"]);
+                                    d.push_str(&format!(" {g}=\"{gv}\""));
+                                }
+                                d.push_str(r.pick(&bodies));
+                                docs += 1;
+                                let bytes = d.as_bytes();
+                                let dynamic = plan::dynamic_valid(&validator, bytes);
+                                let shipped = plan::check(data.as_ref(), bytes, &mut scratch);
+                                let mut tier = plan::Delegating::new(&set, &data);
+                                let delegating =
+                                    plan::check_with(data.as_ref(), bytes, &mut scratch, &mut tier);
+                                dynamic_valid += usize::from(dynamic);
+                                shipped_valid += usize::from(shipped == Verdict::Valid);
+                                delegating_valid += usize::from(delegating == Verdict::Valid);
+                                for (run, v) in [("shipped", shipped), ("delegating", delegating)] {
+                                    if v == Verdict::Valid && !dynamic {
+                                        unsound += 1;
+                                        if unsound <= 20 {
+                                            println!("  UNSOUND [{run}] {d}\n    schema: {xsd}");
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            println!(
+                "derived types, XSD {}: {schemas} schemas ({refused} refused), {docs} documents, dynamically valid {dynamic_valid}, shipped Valid {shipped_valid}, delegating Valid {delegating_valid}, UNSOUND {unsound}, {:.1} s",
+                if v11 { "1.1" } else { "1.0" },
+                t.elapsed().as_secs_f64()
+            );
+            failed |= unsound > 0;
+        }
+        failed
     }
 }

@@ -440,3 +440,106 @@ fn a_subtrahend_that_looks_like_an_ascii_class_is_its_characters() {
         assert_eq!(verdicts(&set, &plan, "<r a='z'/>"), (true, true));
     }
 }
+
+/// XSD 1.0 lets an `<attribute use="prohibited">` carry a fixed value, and
+/// the runtime validates a present attribute of that name against that use
+/// (type and fixed value), while the attribute-use walk skips it and takes a
+/// base type's or a group's use instead. The plan must follow what a present
+/// attribute is validated against, so such a type is not covered. Each case:
+/// the types, the root's type, documents; `verdicts` asserts that no `Valid`
+/// contradicts the runtime.
+fn prohibited_fixed_case(types: &str, root: &str, docs: &[&str]) {
+    let xsd = format!(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"><xs:element name="r" type="{root}"/>{types}</xs:schema>"#
+    );
+    let set = load(&xsd);
+    let (plan, _) = build(&set);
+    for doc in docs {
+        verdicts(&set, &plan, doc);
+    }
+}
+
+const PF_BASE: &str =
+    r#"<xs:complexType name="B"><xs:attribute name="a" type="xs:string"/></xs:complexType>"#;
+
+fn pf_extension(ty: &str, fixed: &str) -> String {
+    format!(
+        r#"<xs:complexType name="D"><xs:complexContent><xs:extension base="B">
+             <xs:attribute name="a" type="{ty}" use="prohibited" fixed="{fixed}"/>
+           </xs:extension></xs:complexContent></xs:complexType>"#
+    )
+}
+
+const PF_DOCS: &[&str] = &["<r/>", "<r a='x'/>", "<r a='wrong'/>"];
+
+#[test]
+fn prohibited_fixed_in_an_extension() {
+    prohibited_fixed_case(
+        &format!("{PF_BASE}{}", pf_extension("xs:string", "x")),
+        "D",
+        PF_DOCS,
+    );
+}
+
+#[test]
+fn prohibited_fixed_beside_a_group_use() {
+    prohibited_fixed_case(
+        r#"<xs:attributeGroup name="G"><xs:attribute name="a" type="xs:string"/></xs:attributeGroup>
+           <xs:complexType name="D"><xs:attribute name="a" type="xs:string" use="prohibited" fixed="x"/>
+             <xs:attributeGroup ref="G"/></xs:complexType>"#,
+        "D",
+        PF_DOCS,
+    );
+}
+
+#[test]
+fn prohibited_fixed_two_extensions_down() {
+    prohibited_fixed_case(
+        &format!(
+            r#"{PF_BASE}{}<xs:complexType name="E"><xs:complexContent><xs:extension base="D">
+                 <xs:attribute name="b" type="xs:string"/></xs:extension></xs:complexContent></xs:complexType>"#,
+            pf_extension("xs:string", "x")
+        ),
+        "E",
+        PF_DOCS,
+    );
+}
+
+#[test]
+fn prohibited_fixed_of_another_type() {
+    prohibited_fixed_case(
+        &format!("{PF_BASE}{}", pf_extension("xs:int", "5")),
+        "D",
+        &["<r a='5'/>", "<r a='abc'/>"],
+    );
+}
+
+#[test]
+fn prohibited_fixed_over_a_base_default() {
+    prohibited_fixed_case(
+        &format!(
+            r#"<xs:complexType name="B"><xs:attribute name="a" type="xs:string" default="d"/></xs:complexType>{}"#,
+            pf_extension("xs:string", "x")
+        ),
+        "D",
+        &["<r/>", "<r a='d'/>", "<r a='x'/>", "<r a='wrong'/>"],
+    );
+}
+
+#[test]
+fn prohibited_fixed_in_a_restriction_or_without_a_base() {
+    prohibited_fixed_case(
+        &format!(
+            r#"{PF_BASE}<xs:complexType name="D"><xs:complexContent><xs:restriction base="B">
+                 <xs:attribute name="a" type="xs:string" use="prohibited" fixed="x"/>
+               </xs:restriction></xs:complexContent></xs:complexType>"#
+        ),
+        "D",
+        PF_DOCS,
+    );
+    prohibited_fixed_case(
+        r#"<xs:complexType name="D"><xs:attribute name="a" type="xs:string" use="prohibited" fixed="x"/></xs:complexType>"#,
+        "D",
+        PF_DOCS,
+    );
+}
