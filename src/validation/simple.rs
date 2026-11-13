@@ -1386,7 +1386,7 @@ fn facet_error(error: crate::error::FacetError) -> ValidationError {
 /// datatype but `string`), and `preserve` without a datatype (Structures
 /// §3.1.4: for `xs:anySimpleType` "the ·normalized value· must be determined
 /// as in the preserve case").
-fn atomic_whitespace(sk: SimpleTypeKey, schema_set: &SchemaSet) -> WhitespaceMode {
+pub(crate) fn atomic_whitespace(sk: SimpleTypeKey, schema_set: &SchemaSet) -> WhitespaceMode {
     schema_set
         .effective_facets(sk)
         .whitespace

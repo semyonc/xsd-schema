@@ -16,8 +16,27 @@
 mod interp;
 pub mod model;
 
+#[cfg(feature = "codegen")]
+pub mod alphabet;
+#[cfg(feature = "codegen")]
+pub mod builder;
+#[cfg(feature = "codegen")]
+pub mod delegate;
+#[cfg(feature = "codegen")]
+pub mod pattern;
+
+#[cfg(all(test, feature = "codegen", feature = "xsd11"))]
+mod t8;
+#[cfg(all(test, feature = "codegen"))]
+mod tests;
+
 pub use interp::{
     check, check_with, in_alphabet, table_accepts, Scratch, Shipped, UnknownReason, ValueTier,
     Verdict,
 };
 pub use model::{PlanData, PlanRef};
+
+#[cfg(feature = "codegen")]
+pub use builder::{build, BuildReport};
+#[cfg(feature = "codegen")]
+pub use delegate::{dynamic_valid, Delegating};

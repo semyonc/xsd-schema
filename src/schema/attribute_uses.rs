@@ -36,6 +36,8 @@ pub(crate) struct GroupAttribute {
     /// The element that value was written on (its namespace bindings read a
     /// QName value).
     pub(crate) value_source: Option<SourceRef>,
+    /// Whether `value` is a `fixed` value constraint.
+    pub(crate) value_fixed: bool,
     #[cfg(feature = "xsd11")]
     pub(crate) inheritable: bool,
 }
@@ -62,6 +64,10 @@ pub(crate) struct AttributeUseEntry<'s> {
     /// The element `value` was written on: its namespace bindings read a
     /// QName value.
     pub(crate) value_source: Option<&'s SourceRef>,
+    /// Whether `value` is a `fixed` value constraint (otherwise a
+    /// `default`). Read by the validation plan's builder.
+    #[cfg_attr(not(feature = "codegen"), allow(dead_code))]
+    pub(crate) fixed: bool,
     /// The use's `inheritable` (XSD 1.1).
     #[cfg(feature = "xsd11")]
     pub(crate) inheritable: bool,
@@ -169,6 +175,7 @@ impl SchemaSet {
                 self.resolve_attr_use_name_ns(attr_use, resolved, group_data.target_namespace);
             let (fixed_value, fixed_source) = self.attribute_use_fixed(attr_use, attr_key);
             let (value, value_source) = self.effective_value_constraint(attr_use, attr_key);
+            let value_fixed = self.value_constraint_is_fixed(attr_use, attr_key);
             result.push(GroupAttribute {
                 name,
                 namespace,
@@ -179,6 +186,7 @@ impl SchemaSet {
                 fixed_source,
                 value: value.map(str::to_string),
                 value_source: value_source.cloned(),
+                value_fixed,
                 #[cfg(feature = "xsd11")]
                 inheritable: attr_use
                     .use_inheritable(attr_key.and_then(|k| self.arenas.attributes.get(k))),
@@ -270,6 +278,7 @@ impl SchemaSet {
                         .or_else(|| decl.and_then(|d| d.resolved_type)),
                     value,
                     value_source,
+                    fixed: self.value_constraint_is_fixed(attr_use, attr_key),
                     #[cfg(feature = "xsd11")]
                     inheritable: attr_use.use_inheritable(decl),
                 });
@@ -290,6 +299,7 @@ impl SchemaSet {
                     type_key: ga.type_key,
                     value: ga.value.as_deref(),
                     value_source: ga.value_source.as_ref(),
+                    fixed: ga.value_fixed,
                     #[cfg(feature = "xsd11")]
                     inheritable: ga.inheritable,
                 });
@@ -381,6 +391,26 @@ impl SchemaSet {
             },
             None => (None, None),
         }
+    }
+
+    /// Whether the ·effective value constraint· of an attribute use (see
+    /// [`effective_value_constraint`](Self::effective_value_constraint)) is a
+    /// `fixed` one: the use's own `fixed`, or, when the use has no value
+    /// constraint of its own, its declaration's.
+    pub(crate) fn value_constraint_is_fixed(
+        &self,
+        attr_use: &AttributeUseResult,
+        attr_key: Option<AttributeKey>,
+    ) -> bool {
+        // The order of `effective_value_constraint`: `default` before
+        // `fixed`, the use before its declaration.
+        let own = &attr_use.attribute;
+        if own.default_value.is_some() || own.fixed_value.is_some() {
+            return own.default_value.is_none();
+        }
+        attr_key
+            .and_then(|k| self.arenas.attributes.get(k))
+            .is_some_and(|decl| decl.default_value.is_none() && decl.fixed_value.is_some())
     }
 
     /// An attribute use's fixed value — its own, otherwise its declaration's —
