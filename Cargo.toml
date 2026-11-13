@@ -100,6 +100,12 @@ path = "tests/conformance/driver.rs"
 harness = false
 
 [[test]]
+name = "plan_differential"
+path = "tests/plan_differential.rs"
+harness = false
+required-features = ["codegen"]
+
+[[test]]
 name = "xpath_integration"
 path = "tests/xpath_integration.rs"
 required-features = ["xsd11"]

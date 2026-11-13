@@ -24,6 +24,10 @@
 #[path = "report.rs"]
 mod report;
 
+#[cfg(feature = "codegen")]
+#[path = "plan_diff.rs"]
+mod plan_diff;
+
 use std::collections::HashMap;
 use std::env;
 use std::fs;
@@ -1210,7 +1214,18 @@ impl TestRunner {
                     }
                 };
 
-                match validate_instance(&schema_set, instance_file) {
+                let validated = validate_instance(&schema_set, instance_file);
+                #[cfg(feature = "codegen")]
+                plan_diff::observe(
+                    &schema_set,
+                    instance_file,
+                    &test.name,
+                    validated
+                        .as_ref()
+                        .ok()
+                        .map(|(outcome, _)| *outcome == InstanceActualOutcome::Valid),
+                );
+                match validated {
                     Ok((actual_outcome, error_msgs)) => match (test.expected, actual_outcome) {
                         (ExpectedOutcome::InstanceValid, InstanceActualOutcome::Valid) => {
                             (TestOutcome::Pass, None)
@@ -1864,6 +1879,15 @@ fn main() {
             "--versionless-1.1" => {
                 versionless_11 = true;
             }
+            "--plan-differential" => {
+                #[cfg(feature = "codegen")]
+                plan_diff::ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+                #[cfg(not(feature = "codegen"))]
+                {
+                    eprintln!("Error: --plan-differential needs the `codegen` feature");
+                    std::process::exit(2);
+                }
+            }
             "--help" | "-h" => {
                 println!("XSD Conformance Test Driver");
                 println!();
@@ -1883,6 +1907,10 @@ fn main() {
                 println!(
                     "                          manifest (run as 1.0 by default) under XSD 1.1"
                 );
+                println!(
+                    "  --plan-differential     Also run the validation plan on every instance"
+                );
+                println!("                          test and compare (feature `codegen`; T1)");
                 println!("  -h, --help              Show this help message");
                 return;
             }
@@ -1967,12 +1995,19 @@ fn main() {
 
     // Print summary
     print_summary(&stats_by_group);
+    #[cfg(feature = "codegen")]
+    let plan_unsound = plan_diff::print_summary();
+    #[cfg(not(feature = "codegen"))]
+    let plan_unsound = false;
 
     if expect_pass {
         let total_failed: usize = stats_by_group.values().map(|s| s.failed + s.errors).sum();
         if total_failed > 0 {
             std::process::exit(1);
         }
+    }
+    if plan_unsound {
+        std::process::exit(3);
     }
 }
 
