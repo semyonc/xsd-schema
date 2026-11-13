@@ -1650,30 +1650,6 @@ fn a_prohibition_in_an_extension_is_ignored() {
     defaulted_attributes_in_both_versions(&xsd, &[], &[("a", "urn:t", "A"), ("b", "", "B")]);
 }
 
-/// The name set of the attribute-use walk: inline up to `AttrNames::INLINE`
-/// names, spilled to a hash set past that, the same answers either way.
-#[test]
-fn attribute_name_sets_spill_past_the_inline_capacity() {
-    let name = |i: u32| (if i < 25 { None } else { Some(NameId(1000)) }, NameId(i));
-    let mut set = AttrNames::new();
-    for i in 0..40 {
-        assert!(set.insert(name(i)), "{i}");
-        assert!(!set.insert(name(i)), "{i} twice");
-    }
-    assert!((0..40).all(|i| set.contains(&name(i))));
-    assert!(!set.contains(&name(40)));
-    let mut other = AttrNames::new();
-    for i in 30..60 {
-        other.insert(name(i));
-    }
-    set.absorb(&mut other);
-    assert!((0..60).all(|i| set.contains(&name(i))));
-    assert!(!other.contains(&name(30)) && !other.contains(&name(59)));
-    set.clear();
-    assert!(!(0..60).any(|i| set.contains(&name(i))));
-    assert!(set.insert(name(5)));
-}
-
 /// A type with more attribute uses than the walk's inline name capacity, in
 /// a base chain: every inherited default is reported once, and a
 /// restriction's prohibitions still apply past the inline capacity.

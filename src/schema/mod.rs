@@ -18,6 +18,7 @@
 //! - `value_constraint` - an element declaration's {value constraint} for hosts
 
 pub mod annotation;
+pub(crate) mod attribute_uses;
 pub mod composition;
 #[cfg(feature = "xsd11")]
 pub mod cta;
