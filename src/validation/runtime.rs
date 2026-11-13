@@ -2250,7 +2250,6 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         namespace: Option<NameId>,
         match_info: Option<super::content::ElementMatchInfo>,
     ) -> GoverningDeclaration {
-        let matched_elem_key = match_info.and_then(|i| i.element_key);
         let matched_type = match_info.and_then(|i| i.resolved_type);
 
         // Was this element matched via a content-model wildcard (or open content)?
@@ -2278,14 +2277,15 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     .unwrap_or(ContentProcessing::Strict)
             });
 
-        // If the content model provided a resolved type for a local element,
-        // don't fall back to a global element with the same QName (it may have
-        // a different type).
-        let element_key = if matched_type.is_some() || process_contents == ContentProcessing::Skip {
-            matched_elem_key
-        } else {
-            matched_elem_key.or_else(|| self.schema_set.lookup_element(namespace, local_name))
-        };
+        // The term's declaration, else the global one — not for a skip
+        // wildcard, nor when the content model resolved a local element's
+        // type (a global element with the same QName may have another type).
+        let element_key = self.schema_set.governing_element_declaration(
+            local_name,
+            namespace,
+            match_info,
+            process_contents == ContentProcessing::Skip,
+        );
         GoverningDeclaration {
             element_key,
             matched_type,
@@ -2828,7 +2828,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         let has_deferred_type_error = elem_data.deferred_type_error.is_some();
 
         // 5. Resolve type from element declaration
-        let mut type_key = elem_data.resolved_type;
+        let mut type_key = self.schema_set.declared_element_type(elem_key);
 
         // 6. xsi:type override
         // Errors are deferred and emitted after push so they land on the child element.

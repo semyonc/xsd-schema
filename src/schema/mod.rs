@@ -27,6 +27,7 @@ pub mod dependencies;
 pub mod derivation;
 #[cfg(feature = "xsd11")]
 pub mod edc;
+pub(crate) mod governing;
 pub mod group;
 pub mod inline;
 pub mod model;
