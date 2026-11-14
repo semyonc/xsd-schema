@@ -684,14 +684,14 @@ fn end<T: ValueTier>(plan: &PlanRef<'_>, s: &mut Scratch, tier: &mut T, text: Te
             _ => Err(Structure),
         },
         Content::Simple => match text {
-            Text::None => simple_value(plan, &f, "", false, s, tier),
-            Text::One(value, clean) => simple_value(plan, &f, value, clean, s, tier),
             Text::Joined => {
                 let value = std::mem::take(&mut s.text);
                 let r = simple_value(plan, &f, &value, false, s, tier);
                 s.text = value;
                 r
             }
+            Text::One(value, clean) => simple_value(plan, &f, value, clean, s, tier),
+            Text::None => simple_value(plan, &f, "", false, s, tier),
         },
         Content::Empty => Ok(()),
         Content::Uncovered => Err(Construct),
@@ -701,6 +701,7 @@ fn end<T: ValueTier>(plan: &PlanRef<'_>, s: &mut Scratch, tier: &mut T, text: Te
 /// The value of the element `f`, of simple content: its character content
 /// `value` (`clean`: known to have no byte up to #x20), or its value
 /// constraint when it has no character content.
+#[inline]
 fn simple_value<T: ValueTier>(
     plan: &PlanRef<'_>,
     f: &Frame,
@@ -732,6 +733,7 @@ fn simple_value<T: ValueTier>(
 
 /// Run the check `id` (and the checks chained to it) on `value` (`clean`:
 /// known to have no byte up to #x20).
+#[inline]
 fn run_check<T: ValueTier>(
     plan: &PlanRef<'_>,
     id: u32,
