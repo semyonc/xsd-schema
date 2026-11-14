@@ -599,11 +599,12 @@ fn run_check<T: ValueTier>(
 ) -> Step {
     use UnknownReason::*;
     tier.note(id);
-    let head = *plan.checks.get(id as usize).ok_or(Construct)?;
+    let head = plan.checks.get(id as usize).ok_or(Construct)?;
     // What the delegating tier says where the plan does not decide: about
     // the whole value, for the head check's type.
+    let delegate = head.delegate;
     let fallback = |tier: &mut T| {
-        if tier.delegating() && head.delegate != NONE && tier.value(head.delegate, value) {
+        if tier.delegating() && delegate != NONE && tier.value(delegate, value) {
             Ok(())
         } else {
             Err(Value)
@@ -615,7 +616,7 @@ fn run_check<T: ValueTier>(
             CheckKind::Uncovered => return Err(Construct),
             CheckKind::Any => {}
             CheckKind::Delegate => return fallback(tier),
-            CheckKind::Value => match check_value(plan, &c, value, &mut s.norm) {
+            CheckKind::Value => match check_value(plan, c, value, &mut s.norm) {
                 Ok(v) => {
                     if c.flags & CHECK_ID != 0 {
                         // The ID's value is its collapsed literal; a hash
@@ -644,7 +645,7 @@ fn run_check<T: ValueTier>(
         if c.next == NONE {
             return Ok(());
         }
-        c = *plan.checks.get(c.next as usize).ok_or(Construct)?;
+        c = plan.checks.get(c.next as usize).ok_or(Construct)?;
     }
 }
 
