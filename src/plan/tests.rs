@@ -1057,3 +1057,47 @@ fn an_id_type_with_an_assertion_stays_an_id() {
     let (plan, _) = build(&set);
     let _ = verdicts(&set, &plan, "<r><f/><f/></r>");
 }
+
+/// A schema document may define types in the XML Schema namespace itself. A
+/// restriction of `xs:IDREF` (or `xs:QName`, …) named there is no built-in:
+/// the families the plan leaves out are told by the built-in type code the
+/// type derives from, not by the name of its nearest ancestor in that
+/// namespace.
+#[test]
+fn types_defined_in_the_xsd_namespace_are_told_by_their_built_in() {
+    let main = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:t="urn:t" targetNamespace="urn:t">
+      <xs:import namespace="http://www.w3.org/2001/XMLSchema"/>
+      <xs:element name="r"><xs:complexType><xs:sequence>
+        <xs:element name="f" minOccurs="0"><xs:complexType>
+          <xs:attribute name="x" type="xs:myRef" default="q"/></xs:complexType></xs:element>
+        <xs:element name="e" type="xs:myRef" minOccurs="0" form="unqualified"/>
+        <xs:element name="q" type="xs:myQName" minOccurs="0" form="unqualified"/>
+      </xs:sequence></xs:complexType></xs:element>
+    </xs:schema>"#;
+    let xs = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema" targetNamespace="http://www.w3.org/2001/XMLSchema">
+      <xs:simpleType name="myRef"><xs:restriction base="xs:IDREF"/></xs:simpleType>
+      <xs:simpleType name="myQName"><xs:restriction base="xs:QName"/></xs:simpleType>
+    </xs:schema>"#;
+    for v11 in [false, true] {
+        let builder = if v11 {
+            crate::SchemaSetBuilder::xsd11()
+        } else {
+            crate::SchemaSetBuilder::new()
+        };
+        let set = builder
+            .add_bytes(xs.as_bytes(), "xs.xsd")
+            .and_then(|b| b.add_bytes(main.as_bytes(), "main.xsd"))
+            .and_then(|b| b.compile())
+            .expect("schema")
+            .into_schema_set();
+        let (plan, _) = build(&set);
+        for doc in [
+            r#"<t:r xmlns:t="urn:t"><f/></t:r>"#,
+            r#"<t:r xmlns:t="urn:t"><e>q</e></t:r>"#,
+            r#"<t:r xmlns:t="urn:t"><q>zz:a</q></t:r>"#,
+        ] {
+            // `verdicts` asserts that neither tier answers `Valid`.
+            let _ = verdicts(&set, &plan, doc);
+        }
+    }
+}

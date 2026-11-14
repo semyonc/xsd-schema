@@ -894,6 +894,21 @@ impl<'a> Builder<'a> {
         let Some(code) = crate::validation::simple::resolve_type_code(sk, set) else {
             return Self::simple_check(CheckKind::Delegate, delegate);
         };
+        // The same families by the built-in type code the value is read
+        // with: a schema document may name its own types in the XML Schema
+        // namespace, so the name of the nearest ancestor there is not enough.
+        if matches!(
+            code,
+            XmlTypeCode::IdRef
+                | XmlTypeCode::IdRefs
+                | XmlTypeCode::Entity
+                | XmlTypeCode::Entities
+                | XmlTypeCode::Notation
+                | XmlTypeCode::QName
+                | XmlTypeCode::NmTokens
+        ) {
+            return Self::simple_check(CheckKind::Uncovered, delegate);
+        }
         let facets = set.effective_facets(sk);
         if matches!(
             code,
