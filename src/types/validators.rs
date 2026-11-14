@@ -854,6 +854,41 @@ pub fn is_valid_xsd_decimal_lexical(s: &str) -> bool {
     i == bytes.len()
 }
 
+/// Validate strict XSD lexical form for `xs:integer` and the types derived
+/// from it.
+///
+/// Datatypes 1.1 §3.4.13.1: "integer has a lexical representation consisting
+/// of a finite-length sequence of one or more decimal digits (#x30-#x39) with
+/// an optional leading sign" (`noDecimalPtNumeral`, production \[47\]).
+/// `num_bigint`'s `FromStr` also accepts `_` between and after the digits
+/// (`1_000`), so a value is checked here before that parser sees it.
+pub(crate) fn is_valid_xsd_integer_lexical(s: &str) -> bool {
+    let digits = s.strip_prefix(['+', '-']).unwrap_or(s);
+    !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// The `BigInt` of an `xs:integer`-family literal (`normalized` after white
+/// space collapse), rejecting what [`is_valid_xsd_integer_lexical`] rejects.
+fn parse_xsd_integer(
+    raw: &str,
+    normalized: &str,
+    type_name: &'static str,
+) -> ValidationResult<BigInt> {
+    let invalid = |message: String| ValidationError::InvalidLexical {
+        value: raw.to_string(),
+        type_name,
+        message,
+    };
+    if !is_valid_xsd_integer_lexical(normalized) {
+        return Err(invalid(format!(
+            "Invalid xs:{type_name} lexical form: '{normalized}'"
+        )));
+    }
+    normalized
+        .parse::<BigInt>()
+        .map_err(|e| invalid(e.to_string()))
+}
+
 /// The typed value of an `xs:decimal` lexical form (`raw` before, `normalized`
 /// after whitespace collapse) — see [`DecimalValidator::validate`].
 fn decimal_value(raw: &str, normalized: &str) -> ValidationResult<XmlValue> {
@@ -951,14 +986,7 @@ impl TypeValidator for IntegerValidator {
 
     fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
-        normalized
-            .parse::<BigInt>()
-            .map(XmlValue::integer)
-            .map_err(|e| ValidationError::InvalidLexical {
-                value: value.to_string(),
-                type_name: "integer",
-                message: e.to_string(),
-            })
+        parse_xsd_integer(value, &normalized, "integer").map(XmlValue::integer)
     }
 
     fn validate_with_facets(&self, value: &str, facets: &FacetSet) -> ValidationResult<XmlValue> {
@@ -2630,6 +2658,20 @@ fn parse_time_part(s: &str, type_name: &'static str) -> ValidationResult<(u8, u8
             message: "Time out of range".to_string(),
         });
     }
+    // Datatypes 1.1 §D.2.2 [62]: "endOfDayFrag ::= '24:00:00' ('.' '0'+)?".
+    // Decided on the seconds as written: `second` may have lost fraction
+    // digits beyond what a `Decimal` holds (`parse_seconds`), so
+    // `24:00:00.000…01` can read as zero seconds.
+    if hour == 24
+        && (minute != 0
+            || !(sec_int == "00" && sec_frac.is_none_or(|f| f.bytes().all(|b| b == b'0'))))
+    {
+        return Err(ValidationError::InvalidLexical {
+            value: s.to_string(),
+            type_name,
+            message: "24:00:00 requires minute=0 and second=0".to_string(),
+        });
+    }
 
     Ok((hour, minute, second))
 }
@@ -3301,13 +3343,7 @@ impl TypeValidator for NonNegativeIntegerValidator {
 
     fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
-        let bigint = normalized
-            .parse::<BigInt>()
-            .map_err(|e| ValidationError::InvalidLexical {
-                value: value.to_string(),
-                type_name: "nonNegativeInteger",
-                message: e.to_string(),
-            })?;
+        let bigint = parse_xsd_integer(value, &normalized, "nonNegativeInteger")?;
         if bigint < BigInt::from(0) {
             return Err(ValidationError::RangeError {
                 value: value.to_string(),
@@ -3361,13 +3397,7 @@ impl TypeValidator for PositiveIntegerValidator {
 
     fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
-        let bigint = normalized
-            .parse::<BigInt>()
-            .map_err(|e| ValidationError::InvalidLexical {
-                value: value.to_string(),
-                type_name: "positiveInteger",
-                message: e.to_string(),
-            })?;
+        let bigint = parse_xsd_integer(value, &normalized, "positiveInteger")?;
         if bigint <= BigInt::from(0) {
             return Err(ValidationError::RangeError {
                 value: value.to_string(),
@@ -3421,13 +3451,7 @@ impl TypeValidator for NonPositiveIntegerValidator {
 
     fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
-        let bigint = normalized
-            .parse::<BigInt>()
-            .map_err(|e| ValidationError::InvalidLexical {
-                value: value.to_string(),
-                type_name: "nonPositiveInteger",
-                message: e.to_string(),
-            })?;
+        let bigint = parse_xsd_integer(value, &normalized, "nonPositiveInteger")?;
         if bigint > BigInt::from(0) {
             return Err(ValidationError::RangeError {
                 value: value.to_string(),
@@ -3481,13 +3505,7 @@ impl TypeValidator for NegativeIntegerValidator {
 
     fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
-        let bigint = normalized
-            .parse::<BigInt>()
-            .map_err(|e| ValidationError::InvalidLexical {
-                value: value.to_string(),
-                type_name: "negativeInteger",
-                message: e.to_string(),
-            })?;
+        let bigint = parse_xsd_integer(value, &normalized, "negativeInteger")?;
         if bigint >= BigInt::from(0) {
             return Err(ValidationError::RangeError {
                 value: value.to_string(),
@@ -4691,5 +4709,106 @@ mod tests {
         assert!(DurationValidator.validate("PT1_0S").is_err());
         assert!(TimeValidator.validate("10:00:0_1").is_err());
         assert!(TimeValidator.validate("10:00:01._1").is_err());
+    }
+
+    /// Datatypes 1.1 §3.4.13.1: an optional sign and one or more decimal
+    /// digits — no `_` separators, which `num_bigint` would skip.
+    #[test]
+    fn integer_lexical_form_has_no_separators() {
+        for ok in ["0", "+0", "-0", "1000", "+1000", "-1000", "0001"] {
+            assert!(is_valid_xsd_integer_lexical(ok), "{ok}");
+        }
+        for bad in [
+            "", "+", "-", "1_000", "1_", "1__0", "_1", "+_1", "-_1", "+-1", "-+1", "1.0", "1e3",
+            "0x10", " 1", "١",
+        ] {
+            assert!(!is_valid_xsd_integer_lexical(bad), "{bad}");
+        }
+        let validators: [(&dyn TypeValidator, &str); 5] = [
+            (&IntegerValidator, ""),
+            (&NonNegativeIntegerValidator, ""),
+            (&PositiveIntegerValidator, ""),
+            (&NonPositiveIntegerValidator, "-"),
+            (&NegativeIntegerValidator, "-"),
+        ];
+        for (v, sign) in validators {
+            assert!(
+                v.validate(&format!("{sign}1000")).is_ok(),
+                "{}",
+                v.type_name()
+            );
+            assert!(
+                v.validate(&format!(" {sign}1000\n")).is_ok(),
+                "{}",
+                v.type_name()
+            );
+            for bad in ["1_000", "1_", "10_000_000"] {
+                assert!(
+                    matches!(
+                        v.validate(&format!("{sign}{bad}")),
+                        Err(ValidationError::InvalidLexical { .. })
+                    ),
+                    "{} {sign}{bad}",
+                    v.type_name()
+                );
+            }
+        }
+    }
+
+    /// Datatypes 1.1 §D.2.2 [62]: "endOfDayFrag ::= '24:00:00' ('.' '0'+)?",
+    /// decided on the fraction as written, not on the seconds a `Decimal`
+    /// keeps of it (28 fraction digits).
+    #[test]
+    fn end_of_day_needs_a_fraction_of_zeros_as_written() {
+        let frac29 = "00000000000000000000000000001";
+        let zeros40 = "0".repeat(40);
+        assert!(TimeValidator
+            .validate(&format!("24:00:00.{frac29}"))
+            .is_err());
+        assert!(TimeValidator
+            .validate(&format!("24:00:00.{frac29}Z"))
+            .is_err());
+        assert!(TimeValidator.validate("24:00:00.1").is_err());
+        assert!(TimeValidator.validate("24:00:01").is_err());
+        assert!(TimeValidator.validate("24:01:00").is_err());
+        assert!(TimeValidator.validate("24:00:00").is_ok());
+        assert!(TimeValidator.validate("24:00:00.000").is_ok());
+        let t = TimeValidator
+            .validate(&format!("24:00:00.{zeros40}+01:00"))
+            .unwrap();
+        assert_eq!(t.to_string_value(), "00:00:00+01:00");
+        assert!(TimeValidator
+            .validate(&format!("23:59:59.{frac29}"))
+            .is_ok());
+
+        for v in [
+            &DateTimeValidator as &dyn TypeValidator,
+            &DateTimeStampValidator,
+        ] {
+            assert!(
+                v.validate(&format!("2000-01-01T24:00:00.{frac29}Z"))
+                    .is_err(),
+                "{}",
+                v.type_name()
+            );
+            assert!(
+                v.validate(&format!("1999-12-31T24:00:00.{frac29}-05:00"))
+                    .is_err(),
+                "{}",
+                v.type_name()
+            );
+            let dt = v
+                .validate(&format!("1999-12-31T24:00:00.{zeros40}Z"))
+                .unwrap();
+            assert_eq!(
+                dt.to_string_value(),
+                "2000-01-01T00:00:00Z",
+                "{}",
+                v.type_name()
+            );
+            assert!(v
+                .validate(&format!("2000-01-01T23:59:59.{frac29}Z"))
+                .is_ok());
+        }
     }
 }
