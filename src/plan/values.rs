@@ -41,6 +41,11 @@ pub(crate) fn is_xml_space(b: u8) -> bool {
 /// dynamic path's `normalize_whitespace` normalizes it: borrowed when nothing
 /// changes, else written into `buf`.
 pub(crate) fn normalize<'a>(value: &'a str, ws: Ws, buf: &'a mut String) -> &'a str {
+    // The common case first: a value with no white space at all (and no
+    // other byte up to #x20) is its own normalized form.
+    if ws == Ws::Preserve || value.bytes().all(|b| b > b' ') {
+        return value;
+    }
     match ws {
         Ws::Preserve => value,
         Ws::Replace => {
