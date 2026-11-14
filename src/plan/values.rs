@@ -173,7 +173,13 @@ pub(crate) fn check_value<'a>(
             Read::Number {
                 mant: i,
                 scale: 0,
-                total: digit_count(i.unsigned_abs()),
+                // Counted only for the facet that reads it (below, on the
+                // same bounds).
+                total: if b.total_digits != NONE {
+                    digit_count(i.unsigned_abs())
+                } else {
+                    0
+                },
                 fraction: 0,
             }
         }
@@ -190,7 +196,9 @@ pub(crate) fn check_value<'a>(
             }
         }
         Lex::DateTime | Lex::Date | Lex::Time => {
-            let (whole, frac, tz) = read_moment(v, c.lex).ok_or(Bad)?;
+            // The position on the time line is read by the range facets
+            // only (below, under the same condition).
+            let (whole, frac, tz) = read_moment_as(v, c.lex, c.bounds != NONE).ok_or(Bad)?;
             Read::Moment { whole, frac, tz }
         }
         Lex::GYearMonth | Lex::GYear | Lex::GMonthDay | Lex::GDay | Lex::GMonth => {
@@ -492,12 +500,39 @@ fn read_hms(s: &[u8]) -> Option<(i128, &[u8])> {
     Some((i128::from(h * 3600 + m * 60 + sec), frac))
 }
 
+/// [`read_moment_as`] with the position: how the builder reads the literal
+/// of a range facet.
+#[cfg(feature = "codegen")]
+pub(crate) fn read_moment(v: &str, lex: Lex) -> Option<(i128, &str, bool)> {
+    read_moment_as(v, lex, true)
+}
+
 /// A `dateTime`, `date` or `time` value in the forms read here: its whole
 /// seconds on the time line (the time zone applied, a missing one read as
 /// `Z`), its fraction digits (no trailing zero) and whether it has a time
-/// zone.
-pub(crate) fn read_moment(v: &str, lex: Lex) -> Option<(i128, &str, bool)> {
+/// zone. Without `position` only the form is checked and the time zone
+/// reported (the seconds are 0 and the fraction empty).
+fn read_moment_as(v: &str, lex: Lex, position: bool) -> Option<(i128, &str, bool)> {
     let (body, tz) = split_zone(v.as_bytes());
+    if !position {
+        match lex {
+            Lex::Date => {
+                let (.., rest) = read_ymd(body)?;
+                if !rest.is_empty() {
+                    return None;
+                }
+            }
+            Lex::DateTime => {
+                let (.., rest) = read_ymd(body)?;
+                read_hms(rest.strip_prefix(b"T")?)?;
+            }
+            Lex::Time => {
+                read_hms(body)?;
+            }
+            _ => return None,
+        }
+        return Some((0, "", tz.is_some()));
+    }
     let (days, secs, frac) = match lex {
         Lex::Date => {
             let (y, m, d, rest) = read_ymd(body)?;
