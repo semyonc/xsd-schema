@@ -1138,6 +1138,9 @@ pub fn fixed_matches_typed(
 ///   out-of-range values via native parse / `RangeError`, not via bound facets.
 ///   See [`validate_numeric_lexical`]. Floats/doubles, lists, and unions also
 ///   fall back.
+///
+/// This resolves the type (its built-in type code and effective facets) and
+/// hands the rest to [`lexical_only_verdict`], which needs no `SchemaSet`.
 pub(crate) fn try_validate_lexical_only(
     value: &str,
     type_key: TypeKey,
@@ -1151,15 +1154,40 @@ pub(crate) fn try_validate_lexical_only(
         return None;
     }
     let code = resolve_type_code(sk, schema_set)?;
-    let is_string = matches!(
-        code,
-        XmlTypeCode::String | XmlTypeCode::NormalizedString | XmlTypeCode::Token
-    );
-    let is_numeric = is_numeric_fast_eligible(code);
-    if !is_string && !is_numeric {
+    if !is_lexical_only_eligible(code) {
         return None;
     }
     let facets = schema_set.effective_facets(sk);
+    lexical_only_verdict(code, value, &facets)
+}
+
+/// Whether [`lexical_only_verdict`] can decide a value of an atomic type
+/// whose built-in type code is `code`: the string family and the numeric
+/// family of [`try_validate_lexical_only`].
+pub(crate) fn is_lexical_only_eligible(code: XmlTypeCode) -> bool {
+    is_lexical_only_string(code) || is_numeric_fast_eligible(code)
+}
+
+fn is_lexical_only_string(code: XmlTypeCode) -> bool {
+    matches!(
+        code,
+        XmlTypeCode::String | XmlTypeCode::NormalizedString | XmlTypeCode::Token
+    )
+}
+
+/// The part of [`try_validate_lexical_only`] that needs no `SchemaSet`: the
+/// verdict on `value` for an atomic type with built-in type code `code` and
+/// effective facets `facets`, with the same answers (`None` for a type that is
+/// not eligible, and for a numeric value the fast check cannot accept).
+pub(crate) fn lexical_only_verdict(
+    code: XmlTypeCode,
+    value: &str,
+    facets: &FacetSet,
+) -> Option<Result<(), ValidationError>> {
+    let is_string = is_lexical_only_string(code);
+    if !is_string && !is_numeric_fast_eligible(code) {
+        return None;
+    }
     // XSD 1.1 assertions bind `$value`; they need the materialized value.
     #[cfg(feature = "xsd11")]
     if !facets.assertions.is_empty() {
@@ -1174,7 +1202,7 @@ pub(crate) fn try_validate_lexical_only(
         // Reuse the registered validator's facet logic for identical semantics,
         // discarding the produced value.
         let validator = VALIDATOR_REGISTRY.get_by_code(code)?;
-        return Some(match validator.validate_with_facets(value, &facets) {
+        return Some(match validator.validate_with_facets(value, facets) {
             Ok(_) => Ok(()),
             Err(type_err) => Err(errors::from_value_error_default(type_err, None)),
         });
@@ -1184,13 +1212,13 @@ pub(crate) fn try_validate_lexical_only(
     // a `BigInt` / `XmlValue`; defer everything else (including errors) to the
     // full path so diagnostics stay identical to the PSVI-on path.
     let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
-    validate_numeric_lexical(code, &normalized, &facets).map(|()| Ok(()))
+    validate_numeric_lexical(code, &normalized, facets).map(|()| Ok(()))
 }
 
 /// Integer-hierarchy and `xs:decimal` atomic codes eligible for the Phase 3
 /// allocation-free numeric fast path (PERF_LAZY_PSVI). `Float`/`Double` are
 /// excluded (already `Copy`/heap-free, and their NaN/INF facet semantics differ).
-fn is_numeric_fast_eligible(code: XmlTypeCode) -> bool {
+pub(crate) fn is_numeric_fast_eligible(code: XmlTypeCode) -> bool {
     matches!(
         code,
         XmlTypeCode::Decimal
@@ -1210,6 +1238,33 @@ fn is_numeric_fast_eligible(code: XmlTypeCode) -> bool {
     )
 }
 
+/// The integer-lexical gate of [`validate_numeric_lexical`]: the value of a
+/// whitespace-collapsed literal of the integer hierarchy, when `parse::<i128>`
+/// reads it. `parse::<i128>` accepts exactly the XSD integer lexical space
+/// and rejects fractional/garbage input; `None` is either an invalid lexical
+/// or an integer that does not fit `i128`, and both defer to the full
+/// (`BigInt`) path.
+pub(crate) fn integer_lexical_value(normalized: &str) -> Option<i128> {
+    normalized.parse::<i128>().ok()
+}
+
+/// The lexical gates of [`validate_numeric_lexical`] for the built-in type
+/// code `code` (`xs:decimal` or the integer hierarchy) and a
+/// whitespace-collapsed literal: [`integer_lexical_value`] for the integer
+/// hierarchy, and for `xs:decimal` the XSD decimal lexical form
+/// ([`is_valid_xsd_decimal_lexical`](crate::types::validators::is_valid_xsd_decimal_lexical)):
+/// the `rust_decimal` parse that follows it is NOT a lexical check —
+/// `rust_decimal` accepts forms outside the XSD decimal lexical space
+/// (scientific notation as of 1.42) — so those defer to the full path, where
+/// `DecimalValidator` rejects them with the proper diagnostic.
+pub(crate) fn numeric_lexical_gate(code: XmlTypeCode, normalized: &str) -> bool {
+    if code == XmlTypeCode::Decimal {
+        crate::types::validators::is_valid_xsd_decimal_lexical(normalized)
+    } else {
+        integer_lexical_value(normalized).is_some()
+    }
+}
+
 /// Phase 3 numeric fast path: decide whether a whitespace-collapsed
 /// integer-hierarchy or `xs:decimal` lexical is *definitively valid* against
 /// `facets`, without building a `BigInt` or an `XmlValue`.
@@ -1223,25 +1278,12 @@ fn is_numeric_fast_eligible(code: XmlTypeCode) -> bool {
 /// built-in integer validators reject out-of-range values via native parse /
 /// `RangeError` (e.g. `cvc-datatype-valid`), not via the bound facets this fast
 /// check consults. The win is on the common valid path; the error path is cold.
-fn validate_numeric_lexical(
+pub(crate) fn validate_numeric_lexical(
     code: XmlTypeCode,
     normalized: &str,
     facets: &crate::types::facets::FacetSet,
 ) -> Option<()> {
-    // Integer-lexical gate: `parse::<i128>` accepts exactly the XSD integer
-    // lexical space and rejects fractional/garbage input. `Err` is either an
-    // invalid lexical or an integer that does not fit `i128`; both defer to the
-    // full (`BigInt`) path. (`xs:decimal` is gated separately just below.)
-    if code != XmlTypeCode::Decimal && normalized.parse::<i128>().is_err() {
-        return None;
-    }
-    // `xs:decimal` lexical gate: `parse::<Decimal>` below is NOT a lexical
-    // check — `rust_decimal` accepts forms outside the XSD decimal lexical
-    // space (scientific notation as of 1.42). Defer those to the full path,
-    // where `DecimalValidator` rejects them with the proper diagnostic.
-    if code == XmlTypeCode::Decimal
-        && !crate::types::validators::is_valid_xsd_decimal_lexical(normalized)
-    {
+    if !numeric_lexical_gate(code, normalized) {
         return None;
     }
 

@@ -497,7 +497,7 @@ impl TypeValidator for NmTokenValidator {
 
     fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
-        if normalized.is_empty() || !normalized.chars().all(is_name_char) {
+        if !is_valid_nmtoken(&normalized) {
             return Err(ValidationError::InvalidLexical {
                 value: value.to_string(),
                 type_name: "NMTOKEN",
@@ -2995,7 +2995,7 @@ fn is_name_start_char(c: char) -> bool {
 }
 
 /// Check if a character is a valid XML name character
-fn is_name_char(c: char) -> bool {
+pub(crate) fn is_name_char(c: char) -> bool {
     is_name_start_char(c)
         || matches!(c,
             '-' | '.' | '0'..='9' | '\u{B7}' |
@@ -3014,7 +3014,7 @@ fn is_ncname_char(c: char) -> bool {
 }
 
 /// Validate an XML Name
-fn is_valid_name(s: &str) -> bool {
+pub(crate) fn is_valid_name(s: &str) -> bool {
     let mut chars = s.chars();
     match chars.next() {
         Some(c) if is_name_start_char(c) => chars.all(is_name_char),
@@ -3023,7 +3023,7 @@ fn is_valid_name(s: &str) -> bool {
 }
 
 /// Validate an NCName (Name without colons)
-fn is_valid_ncname(s: &str) -> bool {
+pub(crate) fn is_valid_ncname(s: &str) -> bool {
     let mut chars = s.chars();
     match chars.next() {
         Some(c) if is_ncname_start_char(c) => chars.all(is_ncname_char),
@@ -3031,27 +3031,27 @@ fn is_valid_ncname(s: &str) -> bool {
     }
 }
 
+/// Validate an NMTOKEN: one or more name characters (the lexical check of
+/// [`NmTokenValidator`], on the whitespace-collapsed value).
+pub(crate) fn is_valid_nmtoken(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(is_name_char)
+}
+
 /// Validate a language tag (RFC 3066 / BCP 47 simplified)
 pub fn is_valid_language(s: &str) -> bool {
     if s.is_empty() {
         return false;
     }
-    let parts: Vec<&str> = s.split('-').collect();
-    if parts.is_empty() {
-        return false;
-    }
+    let mut parts = s.split('-');
     // First subtag: 1-8 letters
-    let first = parts[0];
+    let first = parts.next().unwrap_or_default();
     if first.is_empty() || first.len() > 8 || !first.chars().all(|c| c.is_ascii_alphabetic()) {
         return false;
     }
     // Subsequent subtags: 1-8 alphanumeric characters
-    for part in parts.iter().skip(1) {
-        if part.is_empty() || part.len() > 8 || !part.chars().all(|c| c.is_ascii_alphanumeric()) {
-            return false;
-        }
-    }
-    true
+    parts.all(|part| {
+        !part.is_empty() && part.len() <= 8 && part.chars().all(|c| c.is_ascii_alphanumeric())
+    })
 }
 
 // ============================================================================
