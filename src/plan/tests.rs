@@ -978,3 +978,82 @@ fn simple_content_restriction_patterns_are_read_as_the_dynamic_path_reads_them()
     assert!(!verdicts(&set, &plan, "<r>\u{221}</r>").0);
     assert_eq!(verdicts(&set, &plan, "<r>-</r>"), (true, true));
 }
+
+fn load11(xsd: &str) -> SchemaSet {
+    let mut set = SchemaSet::xsd11();
+    load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut set, None).expect("schema");
+    set
+}
+
+/// An `xs:ID` type stays an ID type when the plan cannot check its facets
+/// (a `maxLength` past what the plan holds, an assertion): it is uncovered,
+/// never handed to the delegating tier as a plain value. Otherwise an ID
+/// attribute's `default` (XSD 1.1) would be counted by the runtime and not by
+/// the plan, and the delegating tier would not keep such IDs.
+#[test]
+fn an_id_type_the_plan_cannot_check_stays_an_id() {
+    let big = r#"<xs:simpleType name="BigId"><xs:restriction base="xs:ID"><xs:maxLength value="4294967295"/></xs:restriction></xs:simpleType>"#;
+    let defaulted = format!(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">{big}
+      <xs:element name="r"><xs:complexType><xs:sequence>
+        <xs:element name="f" minOccurs="0" maxOccurs="unbounded"><xs:complexType>
+          <xs:attribute name="id" type="BigId" default="a"/></xs:complexType></xs:element>
+        <xs:element name="g" minOccurs="0" maxOccurs="unbounded"><xs:complexType>
+          <xs:attribute name="id" type="xs:ID"/></xs:complexType></xs:element>
+        <xs:element name="h" type="xs:ID" minOccurs="0" maxOccurs="unbounded"/>
+      </xs:sequence></xs:complexType></xs:element></xs:schema>"#
+    );
+    let set = load11(&defaulted);
+    let (plan, _) = build(&set);
+    for doc in [
+        "<r><f/><f/></r>",
+        "<r><f/><g id='a'/></r>",
+        "<r><f/><h>a</h></r>",
+    ] {
+        // `verdicts` asserts that neither tier answers `Valid`.
+        let _ = verdicts(&set, &plan, doc);
+    }
+    let fixed = defaulted.replace(r#"default="a""#, r#"fixed="a""#);
+    let set = load11(&fixed);
+    let (plan, _) = build(&set);
+    let _ = verdicts(&set, &plan, "<r><f/><f/></r>");
+
+    // The delegating tier keeps such IDs too, both versions.
+    let plain = format!(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">{big}
+      <xs:complexType name="C"><xs:simpleContent><xs:extension base="BigId"/></xs:simpleContent></xs:complexType>
+      <xs:element name="r"><xs:complexType><xs:sequence>
+        <xs:element name="e" type="BigId" minOccurs="0" maxOccurs="unbounded"/>
+        <xs:element name="f" minOccurs="0" maxOccurs="unbounded"><xs:complexType><xs:attribute name="id" type="BigId"/></xs:complexType></xs:element>
+        <xs:element name="g" minOccurs="0" maxOccurs="unbounded"><xs:complexType><xs:attribute name="id" type="xs:ID"/></xs:complexType></xs:element>
+        <xs:element name="c" type="C" minOccurs="0" maxOccurs="unbounded"/>
+      </xs:sequence></xs:complexType></xs:element></xs:schema>"#
+    );
+    for set in [load(&plain), load11(&plain)] {
+        let (plan, _) = build(&set);
+        for doc in [
+            "<r><e>a</e><e>a</e></r>",
+            "<r><f id='a'/><f id='a'/></r>",
+            "<r><e>a</e><f id='a'/></r>",
+            "<r><f id='a'/><g id='a'/></r>",
+            "<r><c>a</c><c>a</c></r>",
+        ] {
+            let _ = verdicts(&set, &plan, doc);
+        }
+    }
+}
+
+/// The same with an assertion on the ID type (XSD 1.1, the `xsd11` build).
+#[cfg(feature = "xsd11")]
+#[test]
+fn an_id_type_with_an_assertion_stays_an_id() {
+    let xsd = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+      <xs:simpleType name="AId"><xs:restriction base="xs:ID"><xs:assertion test="string-length($value) lt 10"/></xs:restriction></xs:simpleType>
+      <xs:element name="r"><xs:complexType><xs:sequence>
+        <xs:element name="f" minOccurs="0" maxOccurs="unbounded"><xs:complexType>
+          <xs:attribute name="id" type="AId" default="a"/></xs:complexType></xs:element>
+      </xs:sequence></xs:complexType></xs:element></xs:schema>"#;
+    let set = load11(xsd);
+    let (plan, _) = build(&set);
+    let _ = verdicts(&set, &plan, "<r><f/><f/></r>");
+}

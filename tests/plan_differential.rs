@@ -2466,7 +2466,16 @@ mod values {
                 s.push_str(&format!("<xs:fractionDigits value=\"{n}\"/>"));
             }
         }
+        if r.chance(4) {
+            // An assertion (XSD 1.1): the plan checks no XPath.
+            s.push_str("<xs:assertion test=\"true()\"/>");
+        }
         if f.length {
+            if r.chance(5) {
+                // A bound past what the plan's lengths hold.
+                s.push_str("<xs:maxLength value=\"4294967295\"/>");
+                return s;
+            }
             match r.below(8) {
                 0 => s.push_str(&format!("<xs:length value=\"{}\"/>", r.below(5))),
                 1 => s.push_str(&format!("<xs:minLength value=\"{}\"/>", r.below(4))),
@@ -2507,7 +2516,7 @@ mod values {
     /// base of `f`), the same as element content, attribute value, element
     /// and attribute value constraints, and as simple content (an extension,
     /// and a restriction of it with facets of its own).
-    fn schema(r: &mut Rng, f: &Family, constraints: bool) -> (String, Vec<String>) {
+    fn schema(r: &mut Rng, f: &Family, constraints: bool, v11: bool) -> (String, Vec<String>) {
         let base = *r.pick(f.bases);
         let mut bounds = Vec::new();
         let mut s = String::from("<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">");
@@ -2527,7 +2536,7 @@ mod values {
         // Value constraints, now and then (an `xs:ID` takes none in 1.0, and
         // a literal its type refuses makes the schema invalid).
         let vc = |kind: &str, r: &mut Rng| {
-            if !constraints || base == "xs:ID" || !r.chance(60) {
+            if !constraints || !r.chance(60) {
                 String::new()
             } else {
                 format!(" {kind}=\"{}\"", esc(r.pick::<&str>(f.values)))
@@ -2543,7 +2552,7 @@ mod values {
             facets(r, f, base, &mut bounds)
         ));
         // XSD 1.0 allows one attribute of type ID per element.
-        let more = if base == "xs:ID" {
+        let more = if base == "xs:ID" && !v11 {
             String::new()
         } else {
             format!(
@@ -2675,6 +2684,7 @@ mod values {
             format!("<r><w a=\"{e}\"/></r>"),
             format!("<r><w af=\"{e}\" ad=\"{e}\"/></r>"),
             "<r><w/></r>".to_string(),
+            "<r><w/><w/></r>".to_string(),
             format!("<r><f>{raw}</f></r>"),
             "<r><f/></r>".to_string(),
             format!("<r><d>{raw}</d></r>"),
@@ -2707,12 +2717,12 @@ mod values {
                 // A schema refused with value constraints (a literal its type
                 // refuses) is tried again without them.
                 let saved = r.0;
-                let (mut xsd, mut bounds) = schema(&mut r, f, true);
+                let (mut xsd, mut bounds) = schema(&mut r, f, true, v11);
                 let mut set = load(&xsd, v11);
                 if set.is_none() {
                     refused += 1;
                     r.0 = saved;
-                    (xsd, bounds) = schema(&mut r, f, false);
+                    (xsd, bounds) = schema(&mut r, f, false, v11);
                     set = load(&xsd, v11);
                 }
                 let Some(set) = set else {

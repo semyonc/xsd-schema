@@ -929,7 +929,18 @@ impl<'a> Builder<'a> {
         delegate: u32,
     ) -> CheckPlan {
         use XmlTypeCode as C;
-        let fallback = Self::simple_check(CheckKind::Delegate, delegate);
+        // What the plan cannot check itself goes to the delegating tier,
+        // except an `xs:ID` value: the runtime counts it at document level
+        // (also as an absent attribute's default), which a delegated check
+        // does not see, so such a type is uncovered.
+        let fallback = Self::simple_check(
+            if id {
+                CheckKind::Uncovered
+            } else {
+                CheckKind::Delegate
+            },
+            delegate,
+        );
         let (lex, mut flags) = match code {
             C::String | C::NormalizedString | C::Token | C::AnyUri => (Lex::String, 0),
             C::Name => (Lex::Name, 0),
