@@ -34,6 +34,24 @@ pub(crate) fn resolve_general_ref(r: &BytesRef<'_>) -> Result<Cow<'static, str>,
     }
 }
 
+/// [`resolve_general_ref`] without an allocation: the replacement text of a
+/// character reference is written into `buf`.
+#[cfg(feature = "plan")]
+pub(crate) fn resolve_general_ref_in<'b>(
+    r: &BytesRef<'_>,
+    buf: &'b mut [u8; 4],
+) -> Result<&'b str, quick_xml::Error> {
+    if let Some(ch) = r.resolve_char_ref()? {
+        return Ok(ch.encode_utf8(buf));
+    }
+
+    let name: &str = r;
+    match resolve_predefined_entity(name) {
+        Some(replacement) => Ok(replacement),
+        None => Err(EscapeError::UnrecognizedEntity(0..name.len(), name.to_owned()).into()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -57,6 +75,26 @@ mod tests {
         assert_eq!(resolve_general_ref(&BytesRef::new("#65")).unwrap(), "A");
         assert_eq!(resolve_general_ref(&BytesRef::new("#x41")).unwrap(), "A");
         assert_eq!(resolve_general_ref(&BytesRef::new("#x20")).unwrap(), " ");
+    }
+
+    #[cfg(feature = "plan")]
+    #[test]
+    fn the_two_resolvers_agree() {
+        for name in [
+            "amp", "lt", "gt", "apos", "quot", "#65", "#x41", "#x20", "#xE9", "#x20AC", "#x1F600",
+            "#0", "#xD800", "#x110000", "#", "#x", "nope", "",
+        ] {
+            let r = BytesRef::new(name);
+            let mut buf = [0u8; 4];
+            match (
+                resolve_general_ref(&r),
+                resolve_general_ref_in(&r, &mut buf),
+            ) {
+                (Ok(a), Ok(b)) => assert_eq!(a, b, "{name}"),
+                (Err(a), Err(b)) => assert_eq!(a.to_string(), b.to_string(), "{name}"),
+                (a, b) => panic!("{name}: {a:?} and {b:?}"),
+            }
+        }
     }
 
     #[test]

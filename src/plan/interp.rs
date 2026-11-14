@@ -19,7 +19,7 @@ use quick_xml::XmlVersion;
 
 use crate::xml::reader::{AttrKind, AttrSpan, SliceWfReader, WfBuffers};
 use crate::xml::ParseLimits;
-use crate::xml_entity::resolve_general_ref;
+use crate::xml_entity::resolve_general_ref_in;
 
 use super::model::*;
 use super::values::{check_value, is_xml_space, normalize};
@@ -350,8 +350,9 @@ fn events<'a, T: ValueTier>(
                 if top_content(s) != Content::Simple {
                     return Err(UnknownReason::Construct);
                 }
-                let r = resolve_general_ref(g).map_err(|_| UnknownReason::Reader)?;
-                text.push_str(&r, &mut s.text);
+                let mut utf8 = [0u8; 4];
+                let r = resolve_general_ref_in(g, &mut utf8).map_err(|_| UnknownReason::Reader)?;
+                text.push_str(r, &mut s.text);
             }
             Event::CData(_) => {
                 if !s.stack.is_empty() {
