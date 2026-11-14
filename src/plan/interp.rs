@@ -14,7 +14,8 @@
 use std::borrow::Cow;
 use std::collections::HashSet;
 
-use quick_xml::events::{BytesStart, Event};
+use quick_xml::events::{BytesStart, BytesText, Event};
+use quick_xml::XmlVersion;
 
 use crate::xml::reader::{AttrKind, SliceWfReader};
 use crate::xml::ParseLimits;
@@ -122,18 +123,47 @@ struct Frame {
 enum Text<'a> {
     /// No character content yet.
     None,
-    /// One piece, borrowed from the input.
-    One(&'a str),
+    /// One piece, borrowed from the input, and whether it is known to have
+    /// no byte up to #x20 (so that no `whiteSpace` changes it).
+    One(&'a str, bool),
     /// Several pieces, joined in `Scratch::text`.
     Joined,
 }
 
+/// Whether `b` has a carriage return, and whether it has any byte up to #x20
+/// (white space; the reader lets no other such byte through).
+#[inline]
+fn scan_text(b: &[u8]) -> (bool, bool) {
+    let (mut cr, mut low) = (false, false);
+    for &x in b {
+        cr |= x == b'\r';
+        low |= x <= b' ';
+    }
+    (cr, low)
+}
+
 impl<'a> Text<'a> {
-    /// Append a piece that lives as long as the input.
+    /// Append the text event `t`, as `BytesText::xml_content` gives it for
+    /// `version`: with the line ends normalized.
     #[inline]
-    fn push(&mut self, piece: Cow<'a, str>, joined: &mut String) {
+    fn push_text(&mut self, t: BytesText<'a>, version: XmlVersion, joined: &mut String) {
+        let (cr, low) = scan_text(t.as_bytes());
+        if cr || version == XmlVersion::Explicit1_1 {
+            // A line end to normalize (XML 1.1 has more of them).
+            self.push(t.xml_content(version), false, joined);
+        } else {
+            // XML 1.0 normalizes #xD only: without one, the text as written
+            // is the content.
+            self.push(t.into_inner(), !low, joined);
+        }
+    }
+
+    /// Append a piece that lives as long as the input; `clean`: it is known
+    /// to have no byte up to #x20.
+    #[inline]
+    fn push(&mut self, piece: Cow<'a, str>, clean: bool, joined: &mut String) {
         match (*self, piece) {
-            (Text::None, Cow::Borrowed(p)) => *self = Text::One(p),
+            (Text::None, Cow::Borrowed(p)) => *self = Text::One(p, clean),
             (_, piece) => self.push_str(&piece, joined),
         }
     }
@@ -142,7 +172,7 @@ impl<'a> Text<'a> {
     fn push_str(&mut self, piece: &str, joined: &mut String) {
         match *self {
             Text::None => joined.clear(),
-            Text::One(first) => {
+            Text::One(first, _) => {
                 joined.clear();
                 joined.push_str(first);
             }
@@ -274,14 +304,12 @@ fn run<T: ValueTier>(plan: &PlanRef<'_>, input: &[u8], s: &mut Scratch, tier: &m
                 end(plan, s, tier, text)?;
                 text = Text::None;
             }
-            Event::Text(ref t) => {
+            Event::Text(t) => {
                 if s.stack.is_empty() {
                     continue; // white space outside the root
                 }
                 match top_content(s) {
-                    Content::Simple => {
-                        text.push(t.xml_content(reader.quick_xml_version()), &mut s.text)
-                    }
+                    Content::Simple => text.push_text(t, reader.quick_xml_version(), &mut s.text),
                     Content::ElementOnly
                         if t.as_bytes()
                             .iter()
@@ -462,7 +490,7 @@ fn start<T: ValueTier>(
                 return Err(Value);
             }
         }
-        run_check(plan, u.check, &value, s, tier)?;
+        run_check(plan, u.check, &value, false, s, tier)?;
         if let Some((attr, inst)) = parent_unique {
             if attr == aname {
                 // The builder admits only fields whose value is the
@@ -528,7 +556,7 @@ fn schema_location_hint<T: ValueTier>(
         b"schemaLocation" => {
             let mut n = 0usize;
             for t in value.split_ascii_whitespace() {
-                run_check(plan, plan.hint_check, t, s, tier)?;
+                run_check(plan, plan.hint_check, t, false, s, tier)?;
                 n += 1;
             }
             if !n.is_multiple_of(2) {
@@ -536,7 +564,7 @@ fn schema_location_hint<T: ValueTier>(
             }
             Ok(())
         }
-        b"noNamespaceSchemaLocation" => run_check(plan, plan.hint_check, value, s, tier),
+        b"noNamespaceSchemaLocation" => run_check(plan, plan.hint_check, value, false, s, tier),
         _ => Err(Construct),
     }
 }
@@ -553,11 +581,11 @@ fn end<T: ValueTier>(plan: &PlanRef<'_>, s: &mut Scratch, tier: &mut T, text: Te
             _ => Err(Structure),
         },
         Content::Simple => match text {
-            Text::None => simple_value(plan, &f, "", s, tier),
-            Text::One(value) => simple_value(plan, &f, value, s, tier),
+            Text::None => simple_value(plan, &f, "", false, s, tier),
+            Text::One(value, clean) => simple_value(plan, &f, value, clean, s, tier),
             Text::Joined => {
                 let value = std::mem::take(&mut s.text);
-                let r = simple_value(plan, &f, &value, s, tier);
+                let r = simple_value(plan, &f, &value, false, s, tier);
                 s.text = value;
                 r
             }
@@ -568,39 +596,44 @@ fn end<T: ValueTier>(plan: &PlanRef<'_>, s: &mut Scratch, tier: &mut T, text: Te
 }
 
 /// The value of the element `f`, of simple content: its character content
-/// `value`, or its value constraint when it has no character content.
+/// `value` (`clean`: known to have no byte up to #x20), or its value
+/// constraint when it has no character content.
 fn simple_value<T: ValueTier>(
     plan: &PlanRef<'_>,
     f: &Frame,
     value: &str,
+    clean: bool,
     s: &mut Scratch,
     tier: &mut T,
 ) -> Step {
     use UnknownReason::*;
     let constraint = f.flags & (CHILD_DEFAULT | CHILD_FIXED) != 0;
-    let value = if constraint && value.is_empty() {
+    let (value, clean) = if constraint && value.is_empty() {
         // An element with no character children takes its value constraint
         // as its value (cvc-elt.5.1).
         let lit = plan.literals.get(f.value as usize).ok_or(Construct)?;
-        std::str::from_utf8(plan.span(*lit)).map_err(|_| Construct)?
+        let lit = std::str::from_utf8(plan.span(*lit)).map_err(|_| Construct)?;
+        (lit, false)
     } else if f.flags & CHILD_FIXED != 0 {
         // Equal lexical forms have equal values (cvc-elt.5.2.2).
         let lit = plan.literals.get(f.value as usize).ok_or(Construct)?;
         if plan.span(*lit) != value.as_bytes() {
             return Err(Value);
         }
-        value
+        (value, clean)
     } else {
-        value
+        (value, clean)
     };
-    run_check(plan, f.check, value, s, tier)
+    run_check(plan, f.check, value, clean, s, tier)
 }
 
-/// Run the check `id` (and the checks chained to it) on `value`.
+/// Run the check `id` (and the checks chained to it) on `value` (`clean`:
+/// known to have no byte up to #x20).
 fn run_check<T: ValueTier>(
     plan: &PlanRef<'_>,
     id: u32,
     value: &str,
+    clean: bool,
     s: &mut Scratch,
     tier: &mut T,
 ) -> Step {
@@ -623,7 +656,7 @@ fn run_check<T: ValueTier>(
             CheckKind::Uncovered => return Err(Construct),
             CheckKind::Any => {}
             CheckKind::Delegate => return fallback(tier),
-            CheckKind::Value => match check_value(plan, c, value, &mut s.norm) {
+            CheckKind::Value => match check_value(plan, c, value, clean, &mut s.norm) {
                 Ok(v) => {
                     if c.flags & CHECK_ID != 0 {
                         // The ID's value is its collapsed literal; a hash

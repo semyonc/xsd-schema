@@ -143,16 +143,22 @@ enum Read<'v> {
 }
 
 /// Run a `Value` check on `value`: the normalized value when it passes,
-/// `Unknown` otherwise. The value is unique in nothing here; the caller
-/// keeps `xs:ID` values.
+/// `Unknown` otherwise. `clean` says the caller knows that `value` has no
+/// byte up to #x20, so that it is its own normalized form. The value is
+/// unique in nothing here; the caller keeps `xs:ID` values.
 pub(crate) fn check_value<'a>(
     plan: &PlanRef<'_>,
     c: &CheckPlan,
     value: &'a str,
+    clean: bool,
     buf: &'a mut String,
 ) -> Result<&'a str, UnknownReason> {
     use UnknownReason::Value as Bad;
-    let v = normalize(value, c.ws, buf);
+    let v = if clean {
+        value
+    } else {
+        normalize(value, c.ws, buf)
+    };
     let read = match c.lex {
         Lex::String => Read::Plain,
         Lex::Name => ok(is_valid_name(v), Read::Plain)?,

@@ -777,7 +777,7 @@ fn plan_lexical_forms_lie_inside_the_runtimes() {
         for (lex, code, v) in &cases {
             let (plan, c) = bare_check(*lex, xsd10);
             let mut buf = String::new();
-            let plan_ok = values::check_value(&plan.as_ref(), &c, v, &mut buf).is_ok();
+            let plan_ok = values::check_value(&plan.as_ref(), &c, v, false, &mut buf).is_ok();
             if plan_ok {
                 accepted += 1;
                 assert!(
