@@ -223,27 +223,70 @@ impl Max {
     }
 }
 
-/// One namespace binding in scope: the namespace name and its hash, computed
-/// once per declaration, so that attributes compare expanded names by hash
-/// first. An empty name is a prefix undeclared (Namespaces in XML 1.1).
-#[derive(Debug)]
+/// One namespace declaration in force: its prefix and its namespace name
+/// (bytes of [`Scope::bytes`]) and the hash of each. An empty name is a prefix
+/// undeclared (Namespaces in XML 1.1).
+#[derive(Debug, Clone, Copy)]
 struct Binding {
+    /// The hash of the namespace name, computed once per declaration, so
+    /// that attributes compare expanded names by hash first.
     hash: u64,
-    uri: Box<[u8]>,
+    /// The key of the prefix in [`Scope::heads`].
+    key: u64,
+    /// The prefix is `bytes[start..mid]`, the namespace name `bytes[mid..end]`.
+    start: usize,
+    mid: usize,
+    end: usize,
+    /// The next declaration in force with the same key (an index into
+    /// [`Scope::bindings`]): the one of the same prefix that this one hides
+    /// or, where two prefixes share a key, one of the other prefix.
+    older: Option<usize>,
+}
+
+/// The hasher of [`Scope::heads`], whose keys are hashes already.
+#[derive(Debug, Default, Clone, Copy)]
+struct KeyHasher(u64);
+
+impl std::hash::Hasher for KeyHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        // Not reached: the keys are `u64`.
+        for &b in bytes {
+            self.0 = self.0.rotate_left(8) ^ u64::from(b);
+        }
+    }
+
+    fn write_u64(&mut self, key: u64) {
+        self.0 = key;
+    }
 }
 
 /// The layer's own namespace scope: what each prefix is bound to, for NSC:
 /// Prefix Declared, NSC: Attributes Unique and the namespaces-in-scope limit.
 /// Changed only by elements that declare namespaces.
+///
+/// Everything is kept in three flat buffers that a declaration appends to
+/// and the end of its element truncates, so a declaration allocates nothing
+/// once they have grown, and the memory held is that of the declarations in
+/// force.
 #[derive(Debug, Default)]
 struct Scope {
-    /// Per prefix (the empty one for the default namespace), its bindings
-    /// from the outermost declaration in force to the innermost: the
-    /// restoration stack. An empty name is an undeclaration.
-    bindings: FastMap<Box<[u8]>, Vec<Binding>>,
-    /// The prefixes declared by the open elements, in order.
-    declared: Vec<Box<[u8]>>,
-    /// Per open element with declarations: its depth and `declared.len()`
+    /// The declarations of the open elements, in document order: the
+    /// restoration stack.
+    bindings: Vec<Binding>,
+    /// Their prefixes and namespace names, one after the other.
+    bytes: Vec<u8>,
+    /// Per prefix key (the keyed hash of the prefix, the empty one for the
+    /// default namespace), the innermost declaration in force with that key;
+    /// the older ones follow through [`Binding::older`].
+    heads: HashMap<u64, usize, BuildHasherDefault<KeyHasher>>,
+    /// The hash key of the prefixes: random per scope, so that no input
+    /// chooses its collisions.
+    keys: ahash::RandomState,
+    /// Per open element with declarations: its depth and `bindings.len()`
     /// before them.
     marks: Vec<(usize, usize)>,
     /// How many prefixes (the default namespace included, the `xml` prefix
@@ -258,33 +301,48 @@ impl Scope {
         self.active
     }
 
-    /// Whether `prefix` counts towards `active` with this innermost binding.
-    fn counts(prefix: &[u8], top: Option<&Binding>) -> bool {
-        prefix != b"xml" && top.is_some_and(|b| !b.uri.is_empty())
+    /// The key of a prefix in `heads`.
+    #[inline]
+    fn key(&self, prefix: &[u8]) -> u64 {
+        self.keys.hash_one(prefix)
+    }
+
+    /// The innermost declaration of `prefix` in force, in the chain that
+    /// starts at `at`.
+    fn find(&self, mut at: Option<usize>, prefix: &[u8]) -> Option<&Binding> {
+        while let Some(i) = at {
+            let b = &self.bindings[i];
+            if &self.bytes[b.start..b.mid] == prefix {
+                return Some(b);
+            }
+            at = b.older;
+        }
+        None
     }
 
     fn push(&mut self, depth: usize, prefix: &[u8], uri: &[u8]) {
         if self.marks.last().map(|m| m.0) != Some(depth) {
-            self.marks.push((depth, self.declared.len()));
+            self.marks.push((depth, self.bindings.len()));
         }
-        let binding = Binding {
-            hash: fnv1a(uri),
-            uri: uri.into(),
-        };
-        let was = match self.bindings.get_mut(prefix) {
-            Some(stack) => {
-                let was = Self::counts(prefix, stack.last());
-                stack.push(binding);
-                was
-            }
-            None => {
-                self.bindings.insert(prefix.into(), vec![binding]);
-                false
-            }
-        };
-        let now = prefix != b"xml" && !uri.is_empty();
+        let key = self.key(prefix);
+        let older = self.heads.insert(key, self.bindings.len());
+        // Whether the prefix counts towards `active` before and after.
+        let counted = prefix != b"xml";
+        let was = counted && self.find(older, prefix).is_some_and(|b| b.mid != b.end);
+        let now = counted && !uri.is_empty();
         self.active = self.active + usize::from(now) - usize::from(was);
-        self.declared.push(prefix.into());
+        let start = self.bytes.len();
+        self.bytes.extend_from_slice(prefix);
+        let mid = self.bytes.len();
+        self.bytes.extend_from_slice(uri);
+        self.bindings.push(Binding {
+            hash: fnv1a(uri),
+            key,
+            start,
+            mid,
+            end: self.bytes.len(),
+            older,
+        });
     }
 
     /// Closes the element at `depth`.
@@ -300,17 +358,20 @@ impl Scope {
     #[inline(never)]
     fn pop_declarations(&mut self) {
         let (_, mark) = self.marks.pop().expect("checked above");
-        while self.declared.len() > mark {
-            let prefix = self.declared.pop().expect("above the mark");
-            if let Some(stack) = self.bindings.get_mut(&prefix) {
-                let was = Self::counts(&prefix, stack.last());
-                stack.pop();
-                let now = Self::counts(&prefix, stack.last());
-                self.active = self.active + usize::from(now) - usize::from(was);
-                if stack.is_empty() {
-                    self.bindings.remove(&prefix);
-                }
-            }
+        while self.bindings.len() > mark {
+            // The last declaration is the head of its chain: every later
+            // one is gone and has put its `older` back.
+            let b = self.bindings.pop().expect("above the mark");
+            match b.older {
+                Some(older) => self.heads.insert(b.key, older),
+                None => self.heads.remove(&b.key),
+            };
+            let prefix = &self.bytes[b.start..b.mid];
+            let counted = prefix != b"xml";
+            let was = counted && b.mid != b.end;
+            let now = counted && self.find(b.older, prefix).is_some_and(|o| o.mid != o.end);
+            self.active = self.active + usize::from(now) - usize::from(was);
+            self.bytes.truncate(b.start);
         }
     }
 
@@ -320,11 +381,10 @@ impl Scope {
         if prefix == b"xml" {
             return Some((fnv1a(XML_NAMESPACE.as_bytes()), XML_NAMESPACE.as_bytes()));
         }
-        self.bindings
-            .get(prefix)
-            .and_then(|s| s.last())
-            .filter(|b| !b.uri.is_empty())
-            .map(|b| (b.hash, &*b.uri))
+        let head = self.heads.get(&self.key(prefix)).copied();
+        self.find(head, prefix)
+            .filter(|b| b.mid != b.end)
+            .map(|b| (b.hash, &self.bytes[b.mid..b.end]))
     }
 }
 
@@ -2810,4 +2870,117 @@ fn non_char_message(b: &[u8], j: usize) -> String {
         _ => decode_at(b, j).map_or(0xFFFF, |(cp, _)| cp),
     };
     format!("{} is not allowed as a character here", code_point(cp))
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::*;
+
+    /// The scope as a stack of bindings per prefix: what the flat [`Scope`]
+    /// is compared with.
+    #[derive(Default)]
+    struct Reference {
+        bindings: HashMap<Vec<u8>, Vec<Vec<u8>>>,
+        declared: Vec<Vec<u8>>,
+        marks: Vec<(usize, usize)>,
+    }
+
+    impl Reference {
+        fn push(&mut self, depth: usize, prefix: &[u8], uri: &[u8]) {
+            if self.marks.last().map(|m| m.0) != Some(depth) {
+                self.marks.push((depth, self.declared.len()));
+            }
+            self.bindings
+                .entry(prefix.to_vec())
+                .or_default()
+                .push(uri.to_vec());
+            self.declared.push(prefix.to_vec());
+        }
+
+        fn pop(&mut self, depth: usize) {
+            if self.marks.last().map(|m| m.0) != Some(depth) {
+                return;
+            }
+            let (_, mark) = self.marks.pop().unwrap();
+            while self.declared.len() > mark {
+                let prefix = self.declared.pop().unwrap();
+                let stack = self.bindings.get_mut(&prefix).unwrap();
+                stack.pop();
+                if stack.is_empty() {
+                    self.bindings.remove(&prefix);
+                }
+            }
+        }
+
+        fn resolve(&self, prefix: &[u8]) -> Option<&[u8]> {
+            if prefix == b"xml" {
+                return Some(XML_NAMESPACE.as_bytes());
+            }
+            let top = self.bindings.get(prefix)?.last()?;
+            (!top.is_empty()).then_some(top.as_slice())
+        }
+
+        fn in_scope(&self) -> usize {
+            self.bindings
+                .iter()
+                .filter(|(p, stack)| {
+                    p.as_slice() != b"xml" && stack.last().is_some_and(|u| !u.is_empty())
+                })
+                .count()
+        }
+    }
+
+    #[test]
+    fn the_flat_scope_follows_the_reference() {
+        let prefixes: [&[u8]; 7] = [b"", b"a", b"b", b"xml", b"a-long-prefix", b"p1", b"p2"];
+        let uris: [&[u8]; 5] = [
+            b"",
+            b"urn:a",
+            b"urn:b",
+            XML_NAMESPACE.as_bytes(),
+            b"http://example.org/a/rather/long/namespace/name",
+        ];
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        for _ in 0..200 {
+            let (mut flat, mut reference) = (Scope::default(), Reference::default());
+            let mut depth = 0usize;
+            for _ in 0..400 {
+                if depth == 0 || (depth < 40 && next(3) > 0) {
+                    // A start tag: up to three declarations, of distinct
+                    // prefixes (an empty name undeclares one).
+                    depth += 1;
+                    let (n, first) = (next(4), next(prefixes.len()));
+                    for k in 0..n {
+                        let prefix = prefixes[(first + k) % prefixes.len()];
+                        let uri = uris[next(uris.len())];
+                        flat.push(depth, prefix, uri);
+                        reference.push(depth, prefix, uri);
+                    }
+                } else {
+                    flat.pop(depth);
+                    reference.pop(depth);
+                    depth -= 1;
+                }
+                assert_eq!(flat.in_scope(), reference.in_scope());
+                for prefix in prefixes {
+                    let found = flat.resolve(prefix);
+                    assert_eq!(found.map(|f| f.1), reference.resolve(prefix));
+                    assert!(found.is_none_or(|(hash, uri)| hash == fnv1a(uri)));
+                }
+            }
+            while depth > 0 {
+                flat.pop(depth);
+                depth -= 1;
+            }
+            // Nothing is left of the declarations of closed elements.
+            assert!(flat.bindings.is_empty() && flat.bytes.is_empty() && flat.heads.is_empty());
+            assert!(flat.marks.is_empty() && flat.in_scope() == 0);
+        }
+    }
 }
