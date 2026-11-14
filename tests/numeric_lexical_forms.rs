@@ -10,11 +10,12 @@
 //! - Datatypes 1.1 §D.2.2 \[62\]: "endOfDayFrag ::= '24:00:00' ('.' '0'+)?"
 //!   — hour 24 only with zero minutes and seconds and a fraction of zeros
 //!   only, however many digits it has, also beyond the 28 a `Decimal` keeps.
-//! - Datatypes 1.1 §4.3.6.1: with `collapse`, "all occurrences of #x9 (tab),
-//!   #xA (line feed) and #xD (carriage return) are replaced with #x20
-//!   (space)", contiguous #x20s are collapsed and "initial and/or final #x20s
-//!   are deleted" — no other white space (U+00A0, U+3000, U+2028), which
-//!   `str::trim` would also remove.
+//! - Datatypes 1.1 §4.3.6.1: `replace` is "All occurrences of #x9 (tab), #xA
+//!   (line feed) and #xD (carriage return) are replaced with #x20 (space)";
+//!   `collapse` is "After the processing implied by replace, contiguous
+//!   sequences of #x20's are collapsed to a single #x20, and any #x20 at the
+//!   start or end of the string is then removed." Nothing else is removed:
+//!   not U+00A0, U+3000 or U+2028, which `str::trim` also removes.
 //! - Structures §4.2.2: `vc:minVersion` and `vc:maxVersion` "are treated as if
 //!   declared with type xs:decimal, and their ·actual values· are compared to
 //!   a decimal value representing the version of XSD supported by the
