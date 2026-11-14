@@ -41,6 +41,21 @@ struct Stats {
     lost_by: BTreeMap<String, usize>,
     /// Dynamically valid, not `Valid` as shipped, by a rough cause.
     lost_by_shipped: BTreeMap<String, usize>,
+    /// Per test group of interest: (instances, dynamically valid, shipped
+    /// `Valid`, delegating `Valid`, false `Valid`).
+    groups: BTreeMap<&'static str, [usize; 5]>,
+}
+
+/// The datatype-heavy groups the report shows apart, by instance path.
+fn group_of(instance: &Path) -> &'static str {
+    let p = instance.to_string_lossy();
+    if p.contains("nistData") {
+        "nistData"
+    } else if p.contains("msData/datatypes") {
+        "msData/datatypes"
+    } else {
+        "other"
+    }
 }
 
 static STATS: Mutex<Option<Stats>> = Mutex::new(None);
@@ -96,6 +111,12 @@ pub fn observe(set: &SchemaSet, instance: &Path, name: &str, driver_valid: Optio
         return;
     };
     stats.build_ms += build_ms;
+    let g = stats.groups.entry(group_of(instance)).or_default();
+    g[0] += 1;
+    g[1] += usize::from(dynamic);
+    g[2] += usize::from(shipped == Verdict::Valid);
+    g[3] += usize::from(delegating == Verdict::Valid);
+    g[4] += usize::from((shipped == Verdict::Valid || delegating == Verdict::Valid) && !dynamic);
     if dynamic {
         stats.dynamic_valid += 1;
         *stats
@@ -210,5 +231,19 @@ pub fn print_summary() -> bool {
         "PLAN valid instances not Valid as shipped, by rough cause: {:?}",
         s.lost_by_shipped
     );
+    for (g, [n, dv, sv, delv, unsound]) in &s.groups {
+        let pct = |k: usize| {
+            if *dv == 0 {
+                0.0
+            } else {
+                100.0 * k as f64 / *dv as f64
+            }
+        };
+        println!(
+            "PLAN group {g}: instances {n}, dynamically valid {dv}, shipped Valid {sv} ({:.1} %), delegating Valid {delv} ({:.1} %), false Valid {unsound}",
+            pct(*sv),
+            pct(*delv)
+        );
+    }
     s.unsound_shipped + s.unsound_delegating + s.plan_panics > 0
 }

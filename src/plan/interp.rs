@@ -67,6 +67,12 @@ pub trait ValueTier {
     /// Whether `value` is valid for the check's type (only asked when
     /// `delegating()`).
     fn value(&mut self, delegate: u32, value: &str) -> bool;
+    /// The value check `check` is about to run (a harness counts them; the
+    /// shipped tier does nothing).
+    #[inline]
+    fn note(&mut self, check: u32) {
+        let _ = check;
+    }
 }
 
 /// The shipped value tier: nothing behind the plan.
@@ -520,6 +526,7 @@ fn run_check<T: ValueTier>(
     tier: &mut T,
 ) -> Step {
     use UnknownReason::*;
+    tier.note(id);
     let head = *plan.checks.get(id as usize).ok_or(Construct)?;
     // What the delegating tier says where the plan does not decide: about
     // the whole value, for the head check's type.

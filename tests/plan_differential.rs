@@ -12,9 +12,9 @@
 //!
 //! **T2 (`--mutations`).** NF-e 4.00, FatturaPA 1.2.3 and UBL 2.1 (Invoice,
 //! Order, CreditNote): every valid document listed below must be
-//! answered `Valid` by the delegating tier, and no mutant of the mutated ones
-//! may be answered `Valid`, as shipped or delegating, unless the dynamic
-//! validator accepts it.
+//! answered `Valid`, as shipped and by the delegating tier, and no mutant of
+//! the mutated ones may be answered `Valid`, as shipped or delegating, unless
+//! the dynamic validator accepts it.
 //!
 //! **T8, pattern level (`--patterns`, needs `xsd11`).** Every pattern facet
 //! of the W3C schemas, GAEB, the WSDL corpus and UBL, as a one-pattern step
@@ -29,6 +29,21 @@
 //! string up to length 2 of a 50-character alphabet and random longer ones,
 //! and in random two-pattern steps and two-step chains (a value must then be
 //! accepted by every step).
+//!
+//! **T3 (`--fuzz [--count N]`).** `N` seeded byte-level mutants of each
+//! mutated document above (bytes replaced, inserted, deleted, duplicated and
+//! swapped, half of them inside character data): no `Valid` the dynamic
+//! validator refuses.
+//!
+//! **Value checks (`--values [--count N]`, no corpus).** Random simple
+//! types, `N` schemas per XSD version: one or two restriction steps over a
+//! built-in datatype of every family the plan checks, with random facets
+//! whose bounds and enumerations are values on the boundaries of the family's
+//! lexical space; the type as element content, attribute value, element and
+//! attribute `fixed` and `default`, simple content (an extension and a
+//! restriction of it with facets of its own) and repeated (`xs:ID`
+//! duplicates). Every value of the family's list in every position: no
+//! `Valid` may contradict the runtime.
 //!
 //! **Derived types and attribute uses (`--derived [--count N]`, no corpus).**
 //! Random schemas, `N` per XSD version: a base complex type and up to two
@@ -59,6 +74,15 @@ fn main() {
             .unwrap_or(3000);
         failed |= derived::run(count);
     }
+    if args.iter().any(|a| a == "--values") {
+        let count = args
+            .iter()
+            .position(|a| a == "--count")
+            .and_then(|i| args.get(i + 1))
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(3000);
+        failed |= values::run(count);
+    }
     let workspace = args
         .iter()
         .position(|a| a == "--workspace")
@@ -78,6 +102,15 @@ fn main() {
         .cloned();
     if args.iter().any(|a| a == "--mutations") {
         failed |= mutations(&ws, only.as_deref());
+    }
+    if args.iter().any(|a| a == "--fuzz") {
+        let count = args
+            .iter()
+            .position(|a| a == "--count")
+            .and_then(|i| args.get(i + 1))
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(20_000);
+        failed |= fuzz::run(&ws, count);
     }
     if args.iter().any(|a| a == "--patterns") {
         #[cfg(feature = "xsd11")]
@@ -218,6 +251,25 @@ fn mutations(ws: &Path, only: Option<&str>) -> bool {
                 println!("    FAIL: a valid document of the corpus is not answered Valid by the delegating tier");
                 failed = true;
             }
+            if dynamic && shipped != Verdict::Valid {
+                println!(
+                    "    FAIL: a valid document of the corpus is not answered Valid as shipped"
+                );
+                failed = true;
+            }
+            // Coverage by check kind: the value checks the document runs.
+            let mut counting = Counting(HashMap::new());
+            let mut scratch = plan::Scratch::new();
+            plan::check_with(data.as_ref(), &bytes, &mut scratch, &mut counting);
+            let mut by: HashMap<String, usize> = HashMap::new();
+            for (id, n) in counting.0 {
+                *by.entry(check_label(&data, id)).or_default() += n;
+            }
+            let mut by: Vec<_> = by.into_iter().collect();
+            by.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+            let total: usize = by.iter().map(|x| x.1).sum();
+            let rows: Vec<String> = by.iter().map(|(k, n)| format!("{k} {n}")).collect();
+            println!("    values checked {total}: {}", rows.join(", "));
             if !dynamic {
                 failed = true;
             }
@@ -249,6 +301,38 @@ fn mutations(ws: &Path, only: Option<&str>) -> bool {
     }
     println!("T2: {total_mutants} mutants in all");
     failed
+}
+
+/// The shipped tier, counting the value checks it runs.
+struct Counting(HashMap<u32, usize>);
+
+impl plan::ValueTier for Counting {
+    fn delegating(&self) -> bool {
+        false
+    }
+    fn value(&mut self, _: u32, _: &str) -> bool {
+        false
+    }
+    fn note(&mut self, check: u32) {
+        *self.0.entry(check).or_default() += 1;
+    }
+}
+
+/// A check's kind and lexical space, as a table row label.
+fn check_label(data: &PlanData, id: u32) -> String {
+    use plan::model::CheckKind;
+    match data.checks.get(id as usize) {
+        Some(c) if c.kind == CheckKind::Value => {
+            let chained = if c.next != plan::model::NONE {
+                " (simple content layers)"
+            } else {
+                ""
+            };
+            format!("{:?}{chained}", c.lex)
+        }
+        Some(c) => format!("{:?}", c.kind),
+        None => "?".into(),
+    }
 }
 
 fn verdicts(set: &SchemaSet, data: &PlanData, bytes: &[u8]) -> (Verdict, Verdict) {
@@ -1587,7 +1671,7 @@ mod derived {
                                     let gv = *r.pick(&["x", "y", "wrong"]);
                                     d.push_str(&format!(" {g}=\"{gv}\""));
                                 }
-                                d.push_str(r.pick(&bodies));
+                                d.push_str(r.pick::<&str>(&bodies));
                                 docs += 1;
                                 let bytes = d.as_bytes();
                                 let dynamic = plan::dynamic_valid(&validator, bytes);
@@ -1619,5 +1703,1193 @@ mod derived {
             failed |= unsound > 0;
         }
         failed
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Value checks: random derived types against values on their boundaries
+// ---------------------------------------------------------------------------
+
+mod values {
+    use super::*;
+
+    pub struct Rng(pub u64);
+
+    impl Rng {
+        pub fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        pub fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+        pub fn pick<'a, T>(&mut self, v: &'a [T]) -> &'a T {
+            &v[self.below(v.len())]
+        }
+        fn chance(&mut self, percent: usize) -> bool {
+            self.below(100) < percent
+        }
+    }
+
+    /// A family of built-in datatypes: the bases a type may restrict, the
+    /// facets it takes, and values on the boundaries of its lexical space.
+    struct Family {
+        bases: &'static [&'static str],
+        /// Range facets take their bounds from `values`.
+        range: bool,
+        digits: bool,
+        length: bool,
+        whitespace: bool,
+        patterns: &'static [&'static str],
+        values: &'static [&'static str],
+    }
+
+    const INTEGERS: &[&str] = &[
+        "0",
+        "-0",
+        "+0",
+        "00",
+        "1",
+        "-1",
+        "+1",
+        "007",
+        "-007",
+        "2",
+        "5",
+        "9",
+        "10",
+        "99",
+        "100",
+        "127",
+        "128",
+        "-128",
+        "-129",
+        "255",
+        "256",
+        "32767",
+        "32768",
+        "-32768",
+        "-32769",
+        "65535",
+        "65536",
+        "2147483647",
+        "2147483648",
+        "-2147483648",
+        "-2147483649",
+        "4294967295",
+        "4294967296",
+        "9223372036854775807",
+        "9223372036854775808",
+        "-9223372036854775808",
+        "-9223372036854775809",
+        "18446744073709551615",
+        "18446744073709551616",
+        "79228162514264337593543950335",
+        "79228162514264337593543950336",
+        "170141183460469231731687303715884105727",
+        "170141183460469231731687303715884105728",
+        "-170141183460469231731687303715884105728",
+        "-170141183460469231731687303715884105729",
+        "999999999999999999999999999999999999999",
+        "12345",
+        "-12345",
+        "1000",
+        "0001000",
+        "1.0",
+        "1.",
+        ".0",
+        "1e3",
+        "1E3",
+        "",
+        " ",
+        "+",
+        "-",
+        "--1",
+        "+-1",
+        "1_000",
+        "1,0",
+        "0x10",
+        "١",
+        "1 2",
+        " 5",
+        "5 ",
+        "\n 42\t",
+        "\u{a0}5",
+        "INF",
+        "NaN",
+    ];
+    const DECIMALS: &[&str] = &[
+        "0",
+        "-0",
+        "+0",
+        "0.0",
+        "-0.0",
+        "+0.000",
+        ".0",
+        "0.",
+        ".5",
+        "5.",
+        "+.5",
+        "-.5",
+        "1.5",
+        "1.50",
+        "-1.50",
+        "001.500",
+        "0.05",
+        "0.050",
+        "100",
+        "100.0",
+        "99.99",
+        "99.995",
+        "100.00",
+        "100.01",
+        "-100",
+        "12345.6789",
+        "0.000000000000000000000000000001",
+        "79228162514264337593543950335",
+        "79228162514264337593543950335.5",
+        "123456789012345678901234567890123456",
+        "1234567890123456789012345678901234567",
+        "12345678901234567890123456789012345678",
+        "0.123456789012345678901234567890123456",
+        "9.99",
+        "10",
+        "10.0",
+        "-9.99",
+        "1",
+        "-1",
+        "2",
+        "1e5",
+        "1E-2",
+        "INF",
+        "NaN",
+        "",
+        ".",
+        "-",
+        "+.",
+        "1..2",
+        "1.2.3",
+        "1,5",
+        " 1.5 ",
+        "\t2.5\n",
+        "1 .5",
+    ];
+    const BOOLEANS: &[&str] = &[
+        "true", "false", "1", "0", " true ", "\nfalse", "TRUE", "True", "yes", "", "01", "t",
+    ];
+    const FLOATS: &[&str] = &[
+        "0",
+        "-0",
+        "+0",
+        "1",
+        "1.5",
+        "-1.5",
+        ".5",
+        "5.",
+        "1e10",
+        "1E+10",
+        "1e-10",
+        "1.5E-3",
+        "+1.5e3",
+        "1e45",
+        "1e-45",
+        "1e-46",
+        "3.4028235e38",
+        "3.4028236e38",
+        "3.5e38",
+        "1e309",
+        "1e999",
+        "1e-999",
+        "INF",
+        "-INF",
+        "+INF",
+        "NaN",
+        "-NaN",
+        "+NaN",
+        "nan",
+        "inf",
+        "Infinity",
+        "",
+        ".",
+        "e5",
+        "1e",
+        "1.e5",
+        "0x1p3",
+        " 1.5 ",
+        "\t-INF\n",
+        "1 5",
+        "1,5",
+        "1d",
+    ];
+    const DATETIMES: &[&str] = &[
+        "2000-01-01T00:00:00",
+        "2000-01-01T00:00:00Z",
+        "2000-01-01T00:00:00+00:00",
+        "2000-01-01T00:00:00-00:00",
+        "2000-01-01T00:00:00+14:00",
+        "2000-01-01T00:00:00-14:00",
+        "2000-01-01T00:00:00+14:01",
+        "2000-01-01T00:00:00+13:59",
+        "2000-01-01T00:00:00+15:00",
+        "2000-01-01T00:00:00+05",
+        "2000-01-01T00:00:00+0500",
+        "2000-01-01T12:30:45.5",
+        "2000-01-01T12:30:45.50",
+        "2000-01-01T12:30:45.123456789012345678901234567890",
+        "2000-01-01T12:30:45.",
+        "2000-01-01T24:00:00",
+        "2000-01-01T24:00:00Z",
+        "2000-12-31T24:00:00",
+        "2000-01-01T24:00:00.000",
+        "2000-01-01T24:00:01",
+        "2000-01-01T24:01:00",
+        "2000-01-01T23:59:59",
+        "2000-01-01T23:59:60",
+        "2000-01-01T23:60:00",
+        "2000-01-01T25:00:00",
+        "2000-02-29T00:00:00",
+        "1900-02-29T00:00:00",
+        "2100-02-29T00:00:00",
+        "2004-02-29T10:00:00",
+        "1999-12-31T23:59:59",
+        "1999-12-31T23:59:59Z",
+        "2000-01-02T00:00:00",
+        "1999-12-31T10:00:00-14:00",
+        "2000-01-01T09:59:59+14:00",
+        "0001-01-01T00:00:00",
+        "0000-01-01T00:00:00",
+        "-0001-01-01T00:00:00",
+        "9999-12-31T23:59:59",
+        "10000-01-01T00:00:00",
+        "02000-01-01T00:00:00",
+        "2000-1-01T00:00:00",
+        "2000-01-1T00:00:00",
+        "2000-01-01T0:00:00",
+        "2000-01-01 00:00:00",
+        "2000-01-01T00:00",
+        "2000-01-01",
+        "2000-13-01T00:00:00",
+        "2000-00-01T00:00:00",
+        "2000-04-31T00:00:00",
+        "",
+        "T",
+        " 2000-01-01T00:00:00 ",
+        "\n2000-01-01T00:00:00Z\t",
+        "2000-01-01T00:00:00 Z",
+        "2000-01-01T00:00:00z",
+        "+2000-01-01T00:00:00",
+    ];
+    const DATES: &[&str] = &[
+        "2000-01-01",
+        "2000-01-01Z",
+        "2000-01-01+14:00",
+        "2000-01-01-14:00",
+        "2000-01-01+14:01",
+        "2000-01-01-00:00",
+        "1999-12-31",
+        "1999-12-31Z",
+        "2000-01-02",
+        "2000-02-29",
+        "1900-02-29",
+        "2100-02-28",
+        "2004-02-29",
+        "1970-01-01",
+        "1969-12-31",
+        "0001-01-01",
+        "0000-01-01",
+        "-0001-01-01",
+        "9999-12-31",
+        "10000-01-01",
+        "2000-1-1",
+        "2000-01-32",
+        "2000-04-31",
+        "2000-13-01",
+        "2000-01",
+        "",
+        " 1970-01-01 ",
+        "2000-01-01T00:00:00",
+        "2000-01-01+05",
+        "2000-01-01Z ",
+        "2000-01-01+13:00",
+        "2000-01-01-11:00",
+    ];
+    const TIMES: &[&str] = &[
+        "00:00:00",
+        "00:00:00Z",
+        "12:00:00",
+        "12:00:00.5",
+        "12:00:00.500",
+        "23:59:59",
+        "23:59:59.999999999999999999999999999999",
+        "24:00:00",
+        "24:00:00Z",
+        "24:00:00.0",
+        "24:00:01",
+        "23:59:60",
+        "23:60:00",
+        "25:00:00",
+        "12:00:00+14:00",
+        "12:00:00-14:00",
+        "12:00:00+14:30",
+        "12:00:00+05:30",
+        "1:00:00",
+        "12:0:00",
+        "12:00",
+        "12:00:00.",
+        "",
+        " 12:00:00 ",
+        "12:00:00 Z",
+        "11:59:59",
+        "12:00:01",
+    ];
+    const GREGORIAN: &[&str] = &[
+        "2000",
+        "2000Z",
+        "2000+14:00",
+        "2000-14:00",
+        "0000",
+        "-0001",
+        "0001",
+        "9999",
+        "10000",
+        "02000",
+        "200",
+        "2000-01",
+        "2000-12",
+        "2000-13",
+        "2000-00",
+        "2000-01Z",
+        "--01",
+        "--12",
+        "--13",
+        "--00",
+        "--01Z",
+        "--01--",
+        "--02-29",
+        "--02-30",
+        "--04-31",
+        "--12-31",
+        "--01-01Z",
+        "---01",
+        "---31",
+        "---32",
+        "---00",
+        "---15Z",
+        "---15-14:00",
+        "",
+        " 2000 ",
+        "--1",
+    ];
+    const DURATIONS: &[&str] = &[
+        "P1Y",
+        "P1M",
+        "P1D",
+        "PT1H",
+        "PT1M",
+        "PT1S",
+        "PT1.5S",
+        "PT0S",
+        "P0D",
+        "-P1D",
+        "-PT1S",
+        "P1Y2M3DT4H5M6.7S",
+        "P1Y2M",
+        "P3DT4H",
+        "PT4H5M",
+        "P",
+        "PT",
+        "-P",
+        "P1YT",
+        "P1.5Y",
+        "PT1.S",
+        "PT.5S",
+        "P1M1Y",
+        "P1D1M",
+        "PT1S1M",
+        "P1Y1Y",
+        "P999999999Y",
+        "P4294967295Y",
+        "P4294967296Y",
+        "P0000000001Y",
+        "PT999999999999999999S",
+        "PT9999999999999999999S",
+        "PT99999999999999999999999999999S",
+        "P1W",
+        "1Y",
+        "",
+        " P1Y ",
+        "P1Y ",
+        "P-1Y",
+        "+P1Y",
+        "pT1S",
+        "P1y",
+    ];
+    const HEX: &[&str] = &[
+        "",
+        "00",
+        "0a",
+        "0A",
+        "ff",
+        "FF",
+        "00ff",
+        "0",
+        "abc",
+        "0g",
+        "00 11",
+        " 00ff ",
+        "0x00",
+        "deadbeef",
+        "DEADBEEF",
+        "0102030405060708090a0b0c0d0e0f10",
+    ];
+    const BASE64: &[&str] = &[
+        "",
+        "QQ==",
+        "QUI=",
+        "QUJD",
+        "QUJDRA==",
+        "QUJDREU=",
+        "QUJDREVG",
+        "QQ",
+        "QUI",
+        "QUJ",
+        "QR==",
+        "QUJ=",
+        "Q===",
+        "=QQ=",
+        "QQ==QQ==",
+        "QUJD RA==",
+        "QUJD\nRA==",
+        " QUJD ",
+        "QUJD  RA==",
+        "Q U J D",
+        "QUJD!",
+        "QUJD-_==",
+        "+/+/",
+        "////",
+        "AAAA",
+        "A===",
+    ];
+    const URIS: &[&str] = &[
+        "http://example.com/a",
+        "",
+        "a",
+        "#f",
+        "urn:x:y",
+        " http://a/b ",
+        "a b",
+        "%zz",
+        "ä",
+        "http://a/b?c=d&e",
+        "\\\\x",
+        "1:a",
+        "::",
+    ];
+    const NAMES: &[&str] = &[
+        "a", "ab", "a1", "a-b", "a.b", "_a", "a:b", ":a", "1a", "-a", ".a", "ä", "aä", "a b", "",
+        " a ", "\na\t", "a\u{b7}", "\u{300}a", "xml", "a\u{37e}", "日本",
+    ];
+    const LANGUAGES: &[&str] = &[
+        "en",
+        "en-US",
+        "e",
+        "abcdefgh",
+        "abcdefghi",
+        "en-",
+        "-en",
+        "en-12345678",
+        "en-123456789",
+        "x-a",
+        "1en",
+        "en_US",
+        "",
+        " en ",
+        "en-US-x-y",
+        "EN",
+    ];
+    const STRINGS: &[&str] = &[
+        "",
+        "a",
+        "ab",
+        "abc",
+        "abcd",
+        "a b",
+        "a  b",
+        " a",
+        "a ",
+        " a b ",
+        "a\tb",
+        "a\nb",
+        "a\r\nb",
+        "\t",
+        "  ",
+        "x",
+        "xyz",
+        "é",
+        "日本語",
+        "a\u{a0}b",
+        "A1",
+        "1",
+        "-",
+    ];
+
+    const FAMILIES: &[Family] = &[
+        Family {
+            bases: &[
+                "xs:integer",
+                "xs:long",
+                "xs:int",
+                "xs:short",
+                "xs:byte",
+                "xs:nonNegativeInteger",
+                "xs:positiveInteger",
+                "xs:nonPositiveInteger",
+                "xs:negativeInteger",
+                "xs:unsignedLong",
+                "xs:unsignedInt",
+                "xs:unsignedShort",
+                "xs:unsignedByte",
+            ],
+            range: true,
+            digits: true,
+            length: false,
+            whitespace: false,
+            patterns: &[
+                "\\d{1,3}",
+                "-?[0-9]+",
+                "[0-9]*5",
+                "[^0]*",
+                "[1-9][0-9]*|0",
+                "\\d*",
+            ],
+            values: INTEGERS,
+        },
+        Family {
+            bases: &["xs:decimal"],
+            range: true,
+            digits: true,
+            length: false,
+            whitespace: false,
+            patterns: &[
+                "-?\\d+\\.\\d{2}",
+                "[0-9.]+",
+                "\\d*\\.?\\d*",
+                "-?[0-9]{1,3}(\\.[0-9]+)?",
+            ],
+            values: DECIMALS,
+        },
+        Family {
+            bases: &["xs:boolean"],
+            range: false,
+            digits: false,
+            length: false,
+            whitespace: false,
+            patterns: &["true|false", "[01]", "\\w+"],
+            values: BOOLEANS,
+        },
+        Family {
+            bases: &["xs:float", "xs:double"],
+            range: false,
+            digits: false,
+            length: false,
+            whitespace: false,
+            patterns: &["[0-9.]+", "-?\\d+(\\.\\d+)?", ".*E.*|[^E]*"],
+            values: FLOATS,
+        },
+        Family {
+            bases: &["xs:dateTime"],
+            range: true,
+            digits: false,
+            length: false,
+            whitespace: false,
+            patterns: &[".*Z", "\\d{4}-.*", "[^+]*"],
+            values: DATETIMES,
+        },
+        Family {
+            bases: &["xs:date"],
+            range: true,
+            digits: false,
+            length: false,
+            whitespace: false,
+            patterns: &["\\d{4}-\\d{2}-\\d{2}", "2.*"],
+            values: DATES,
+        },
+        Family {
+            bases: &["xs:time"],
+            range: true,
+            digits: false,
+            length: false,
+            whitespace: false,
+            patterns: &["\\d{2}:\\d{2}:\\d{2}", "1.*"],
+            values: TIMES,
+        },
+        Family {
+            bases: &["xs:gYear"],
+            range: false,
+            digits: false,
+            length: false,
+            whitespace: false,
+            patterns: &["[0-9-]+", ".*Z"],
+            values: GREGORIAN,
+        },
+        Family {
+            bases: &["xs:gYearMonth"],
+            range: false,
+            digits: false,
+            length: false,
+            whitespace: false,
+            patterns: &["[0-9-]+", ".*Z"],
+            values: GREGORIAN,
+        },
+        Family {
+            bases: &["xs:gMonthDay", "xs:gDay", "xs:gMonth"],
+            range: false,
+            digits: false,
+            length: false,
+            whitespace: false,
+            patterns: &["[0-9-]+", ".*Z"],
+            values: GREGORIAN,
+        },
+        Family {
+            bases: &["xs:duration"],
+            range: false,
+            digits: false,
+            length: false,
+            whitespace: false,
+            patterns: &["P.*", "-?P\\d+Y"],
+            values: DURATIONS,
+        },
+        Family {
+            bases: &["xs:hexBinary"],
+            range: false,
+            digits: false,
+            length: true,
+            whitespace: false,
+            patterns: &["[0-9a-f]*", "(..)+"],
+            values: HEX,
+        },
+        Family {
+            bases: &["xs:base64Binary"],
+            range: false,
+            digits: false,
+            length: true,
+            whitespace: false,
+            patterns: &["[A-Z]+=*", ".{4}"],
+            values: BASE64,
+        },
+        Family {
+            bases: &["xs:anyURI"],
+            range: false,
+            digits: false,
+            length: true,
+            whitespace: false,
+            patterns: &["http:.*", "[a-z]*"],
+            values: URIS,
+        },
+        Family {
+            bases: &["xs:Name", "xs:NCName", "xs:NMTOKEN", "xs:ID"],
+            range: false,
+            digits: false,
+            length: true,
+            whitespace: false,
+            patterns: &["[a-z]+", "\\i\\c*", "a.*"],
+            values: NAMES,
+        },
+        Family {
+            bases: &["xs:language"],
+            range: false,
+            digits: false,
+            length: true,
+            whitespace: false,
+            patterns: &["[a-z]{2}", "en.*"],
+            values: LANGUAGES,
+        },
+        Family {
+            bases: &["xs:string", "xs:normalizedString", "xs:token"],
+            range: false,
+            digits: false,
+            length: true,
+            whitespace: true,
+            patterns: &["a.*", "[a-z ]*", "\\s*a\\s*b", ".{2,3}", "\\S+", "[^\\t]*"],
+            values: STRINGS,
+        },
+    ];
+
+    fn esc(v: &str) -> String {
+        let mut out = String::new();
+        for c in v.chars() {
+            match c {
+                '&' => out.push_str("&amp;"),
+                '<' => out.push_str("&lt;"),
+                '>' => out.push_str("&gt;"),
+                '"' => out.push_str("&quot;"),
+                '\'' => out.push_str("&apos;"),
+                '\t' => out.push_str("&#x9;"),
+                '\n' => out.push_str("&#xA;"),
+                '\r' => out.push_str("&#xD;"),
+                c => out.push(c),
+            }
+        }
+        out
+    }
+
+    /// One restriction step's facets, bounds taken from the family's values;
+    /// the bound literals go to `bounds`. Now and then none at all.
+    fn facets(r: &mut Rng, f: &Family, base: &str, bounds: &mut Vec<String>) -> String {
+        let mut s = String::new();
+        if r.chance(20) {
+            return s;
+        }
+        if f.range {
+            for facet in [
+                "minInclusive",
+                "maxInclusive",
+                "minExclusive",
+                "maxExclusive",
+            ] {
+                if r.chance(22) {
+                    let b = *r.pick(f.values);
+                    bounds.push(b.to_string());
+                    s.push_str(&format!("<xs:{facet} value=\"{}\"/>", esc(b)));
+                }
+            }
+        }
+        if f.digits {
+            if r.chance(20) {
+                let n = *r.pick(&[1, 2, 3, 4, 5, 9, 18, 28, 29, 36, 38, 39]);
+                s.push_str(&format!("<xs:totalDigits value=\"{n}\"/>"));
+            }
+            if base == "xs:decimal" && r.chance(20) {
+                let n = *r.pick(&[0, 1, 2, 3, 30]);
+                s.push_str(&format!("<xs:fractionDigits value=\"{n}\"/>"));
+            }
+        }
+        if f.length {
+            match r.below(8) {
+                0 => s.push_str(&format!("<xs:length value=\"{}\"/>", r.below(5))),
+                1 => s.push_str(&format!("<xs:minLength value=\"{}\"/>", r.below(4))),
+                2 => s.push_str(&format!("<xs:maxLength value=\"{}\"/>", r.below(5))),
+                3 => s.push_str(&format!(
+                    "<xs:minLength value=\"{}\"/><xs:maxLength value=\"{}\"/>",
+                    r.below(2),
+                    2 + r.below(3)
+                )),
+                _ => {}
+            }
+        }
+        if f.whitespace && r.chance(30) {
+            let ws = *r.pick(&["preserve", "replace", "collapse"]);
+            s.push_str(&format!("<xs:whiteSpace value=\"{ws}\"/>"));
+        }
+        if r.chance(25) {
+            let n = 1 + r.below(2);
+            for _ in 0..n {
+                s.push_str(&format!(
+                    "<xs:pattern value=\"{}\"/>",
+                    esc(r.pick::<&str>(f.patterns))
+                ));
+            }
+        }
+        if r.chance(20) {
+            for _ in 0..1 + r.below(3) {
+                s.push_str(&format!(
+                    "<xs:enumeration value=\"{}\"/>",
+                    esc(r.pick::<&str>(f.values))
+                ));
+            }
+        }
+        s
+    }
+
+    /// A schema: a simple type `T` (one or two restriction steps over a
+    /// base of `f`), the same as element content, attribute value, element
+    /// and attribute value constraints, and as simple content (an extension,
+    /// and a restriction of it with facets of its own).
+    fn schema(r: &mut Rng, f: &Family, constraints: bool) -> (String, Vec<String>) {
+        let base = *r.pick(f.bases);
+        let mut bounds = Vec::new();
+        let mut s = String::from("<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">");
+        s.push_str(&format!(
+            "<xs:simpleType name=\"T1\"><xs:restriction base=\"{base}\">{}</xs:restriction></xs:simpleType>",
+            facets(r, f, base, &mut bounds)
+        ));
+        let t = if r.chance(40) {
+            s.push_str(&format!(
+                "<xs:simpleType name=\"T2\"><xs:restriction base=\"T1\">{}</xs:restriction></xs:simpleType>",
+                facets(r, f, base, &mut bounds)
+            ));
+            "T2"
+        } else {
+            "T1"
+        };
+        // Value constraints, now and then (an `xs:ID` takes none in 1.0, and
+        // a literal its type refuses makes the schema invalid).
+        let vc = |kind: &str, r: &mut Rng| {
+            if !constraints || base == "xs:ID" || !r.chance(60) {
+                String::new()
+            } else {
+                format!(" {kind}=\"{}\"", esc(r.pick::<&str>(f.values)))
+            }
+        };
+        let (fixed_e, default_e) = (vc("fixed", r), vc("default", r));
+        let (fixed_a, default_a) = (vc("fixed", r), vc("default", r));
+        s.push_str(&format!(
+            "<xs:complexType name=\"C\"><xs:simpleContent><xs:extension base=\"{t}\">\
+             <xs:attribute name=\"a\" type=\"{t}\"/></xs:extension></xs:simpleContent></xs:complexType>\
+             <xs:complexType name=\"R\"><xs:simpleContent><xs:restriction base=\"C\">{}</xs:restriction>\
+             </xs:simpleContent></xs:complexType>",
+            facets(r, f, base, &mut bounds)
+        ));
+        // XSD 1.0 allows one attribute of type ID per element.
+        let more = if base == "xs:ID" {
+            String::new()
+        } else {
+            format!(
+                "<xs:attribute name=\"af\" type=\"{t}\"{fixed_a}/><xs:attribute name=\"ad\" type=\"{t}\"{default_a}/>"
+            )
+        };
+        s.push_str(&format!(
+            "<xs:element name=\"r\"><xs:complexType><xs:choice>\
+             <xs:element name=\"v\" type=\"{t}\"/>\
+             <xs:element name=\"w\" maxOccurs=\"2\"><xs:complexType><xs:attribute name=\"a\" type=\"{t}\"/>{more}\
+             </xs:complexType></xs:element>\
+             <xs:element name=\"f\" type=\"{t}\"{fixed_e}/>\
+             <xs:element name=\"d\" type=\"{t}\"{default_e}/>\
+             <xs:element name=\"c\" type=\"C\"/>\
+             <xs:element name=\"s\" type=\"R\"/>\
+             <xs:element name=\"l\" maxOccurs=\"3\" type=\"{t}\"/>\
+             </xs:choice></xs:complexType></xs:element></xs:schema>"
+        ));
+        (s, bounds)
+    }
+
+    /// Values next to a bound: the bound itself in other spellings, and its
+    /// neighbours one unit away at its own scale and one digit finer
+    /// (numbers), or one second away and with other time zones (dates and
+    /// times).
+    fn neighbours(lit: &str) -> Vec<String> {
+        let mut out = vec![lit.to_string(), format!(" {lit} ")];
+        let t = lit.trim();
+        // Numbers.
+        let (neg, body) = match t.as_bytes().first() {
+            Some(b'-') => (true, &t[1..]),
+            Some(b'+') => (false, &t[1..]),
+            _ => (false, t),
+        };
+        let (int, frac) = body.split_once('.').unwrap_or((body, ""));
+        if !body.is_empty()
+            && int.bytes().all(|b| b.is_ascii_digit())
+            && frac.bytes().all(|b| b.is_ascii_digit())
+            && int.len() + frac.len() <= 36
+            && !(int.is_empty() && frac.is_empty())
+        {
+            let scale = frac.len() as u32;
+            let digits = format!("{int}{frac}");
+            let mant: i128 = digits.parse().unwrap_or(0) * if neg { -1 } else { 1 };
+            let fmt = |m: i128, sc: u32| {
+                let sign = if m < 0 { "-" } else { "" };
+                let a = m.unsigned_abs().to_string();
+                if sc == 0 {
+                    format!("{sign}{a}")
+                } else {
+                    let a = format!("{a:0>width$}", width = sc as usize + 1);
+                    let (i, f) = a.split_at(a.len() - sc as usize);
+                    format!("{sign}{i}.{f}")
+                }
+            };
+            for (m, sc) in [
+                (mant - 1, scale),
+                (mant + 1, scale),
+                (mant * 10 - 1, scale + 1),
+                (mant * 10 + 1, scale + 1),
+                (mant * 10, scale + 1),
+                (-mant, scale),
+            ] {
+                out.push(fmt(m, sc));
+            }
+            out.push(format!("0{t}"));
+            out.push(format!("+{}", t.trim_start_matches(['+', '-'])));
+            return out;
+        }
+        // Dates and times: the seconds or the day one away, other zones.
+        let zones = ["", "Z", "+14:00", "-14:00", "+01:00", "-00:00"];
+        let (core, _) = match t.rfind(['Z', '+']) {
+            Some(i) if t[i..].len() <= 6 => (&t[..i], &t[i..]),
+            _ => match t.len().checked_sub(6) {
+                Some(i) if t.as_bytes()[i] == b'-' && t[i..].contains(':') => (&t[..i], &t[i..]),
+                _ => (t, ""),
+            },
+        };
+        let mut cores = vec![core.to_string()];
+        let b = core.as_bytes();
+        // The last two digits of the core (seconds, or a day): one away.
+        if b.len() >= 2 && b[b.len() - 1].is_ascii_digit() && b[b.len() - 2].is_ascii_digit() {
+            let n: u32 = core[core.len() - 2..].parse().unwrap_or(0);
+            for m in [n.wrapping_sub(1), n + 1] {
+                if m < 100 {
+                    cores.push(format!("{}{m:02}", &core[..core.len() - 2]));
+                }
+            }
+        }
+        if core.contains(':') {
+            cores.push(format!("{core}.5"));
+            cores.push(format!("{core}.000001"));
+        }
+        for c in &cores {
+            for z in zones {
+                out.push(format!("{c}{z}"));
+            }
+        }
+        out
+    }
+
+    fn load(xsd: &str, v11: bool) -> Option<SchemaSet> {
+        let b = if v11 {
+            SchemaSetBuilder::xsd11()
+        } else {
+            SchemaSetBuilder::new()
+        };
+        let b = b.add_bytes(xsd.as_bytes(), "values.xsd").ok()?;
+        b.compile().ok().map(|c| c.into_schema_set())
+    }
+
+    /// The documents for one value: every position of the schema.
+    fn documents(v: &str, other: &str) -> Vec<String> {
+        let e = esc(v);
+        let o = esc(other);
+        // Content as written (only the markup characters escaped), so that
+        // literal tabs and line ends reach the value too.
+        let raw: String = v
+            .chars()
+            .map(|c| match c {
+                '&' => "&amp;".to_string(),
+                '<' => "&lt;".to_string(),
+                c => c.to_string(),
+            })
+            .collect();
+        vec![
+            format!("<r><v>{raw}</v></r>"),
+            format!("<r><v>{e}</v></r>"),
+            format!("<r><w a=\"{e}\"/></r>"),
+            format!("<r><w af=\"{e}\" ad=\"{e}\"/></r>"),
+            "<r><w/></r>".to_string(),
+            format!("<r><f>{raw}</f></r>"),
+            "<r><f/></r>".to_string(),
+            format!("<r><d>{raw}</d></r>"),
+            "<r><d/></r>".to_string(),
+            format!("<r><c a=\"{o}\">{raw}</c></r>"),
+            format!("<r><s>{raw}</s></r>"),
+            format!("<r><s a=\"{e}\">{e}</s></r>"),
+            format!("<r><l>{e}</l><l>{o}</l></r>"),
+            format!("<r><l>{e}</l><l>{e}</l></r>"),
+            format!("<r><w a=\"{e}\"/><w a=\"{e}\"/></r>"),
+            format!("<r><w a=\"{e}\"/><w a=\"{o}\"/></r>"),
+            format!("<r><w a=\"{}\"/></r>", raw.replace('"', "&quot;")),
+        ]
+    }
+
+    pub fn run(count: usize) -> bool {
+        let mut failed = false;
+        for (v11, seed) in [
+            (false, 0xD1B5_4A32_D192_ED03u64),
+            (true, 0xD1B5_4A32_D192_ED31),
+        ] {
+            let t = Instant::now();
+            let mut r = Rng(seed);
+            let (mut schemas, mut refused, mut docs, mut dynamic_valid) = (0usize, 0, 0, 0);
+            let (mut shipped_valid, mut delegating_valid, mut unsound) = (0usize, 0, 0);
+            let mut by_family: Vec<(usize, usize, usize)> = vec![(0, 0, 0); FAMILIES.len()];
+            while schemas < count {
+                let fi = r.below(FAMILIES.len());
+                let f = &FAMILIES[fi];
+                // A schema refused with value constraints (a literal its type
+                // refuses) is tried again without them.
+                let saved = r.0;
+                let (mut xsd, mut bounds) = schema(&mut r, f, true);
+                let mut set = load(&xsd, v11);
+                if set.is_none() {
+                    refused += 1;
+                    r.0 = saved;
+                    (xsd, bounds) = schema(&mut r, f, false);
+                    set = load(&xsd, v11);
+                }
+                let Some(set) = set else {
+                    refused += 1;
+                    continue;
+                };
+                schemas += 1;
+                let (data, _) = plan::build(&set);
+                let validator = SchemaValidator::new(&set, ValidationFlags::default());
+                let mut scratch = plan::Scratch::new();
+                let mut vals: Vec<String> = f.values.iter().map(|v| v.to_string()).collect();
+                for b in &bounds {
+                    vals.extend(neighbours(b));
+                }
+                vals.sort();
+                vals.dedup();
+                for v in &vals {
+                    let other = *r.pick(f.values);
+                    for d in documents(v, other) {
+                        docs += 1;
+                        let bytes = d.as_bytes();
+                        let dynamic = plan::dynamic_valid(&validator, bytes);
+                        let shipped = plan::check(data.as_ref(), bytes, &mut scratch);
+                        let mut tier = plan::Delegating::new(&set, &data);
+                        let delegating =
+                            plan::check_with(data.as_ref(), bytes, &mut scratch, &mut tier);
+                        dynamic_valid += usize::from(dynamic);
+                        shipped_valid += usize::from(shipped == Verdict::Valid);
+                        delegating_valid += usize::from(delegating == Verdict::Valid);
+                        let fam = &mut by_family[fi];
+                        fam.0 += usize::from(dynamic);
+                        fam.1 += usize::from(dynamic && shipped == Verdict::Valid);
+                        for (run, verdict) in [("shipped", shipped), ("delegating", delegating)] {
+                            if verdict == Verdict::Valid && !dynamic {
+                                unsound += 1;
+                                fam.2 += 1;
+                                if unsound <= 25 {
+                                    println!("  UNSOUND [{run}] {d:?}\n    schema: {xsd}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            println!(
+                "value checks, XSD {}: {schemas} schemas ({refused} refused), {docs} documents, dynamically valid {dynamic_valid}, shipped Valid {shipped_valid}, delegating Valid {delegating_valid}, UNSOUND {unsound}, {:.1} s",
+                if v11 { "1.1" } else { "1.0" },
+                t.elapsed().as_secs_f64()
+            );
+            for (f, (dv, sv, u)) in FAMILIES.iter().zip(&by_family) {
+                println!(
+                    "    {:<24} dynamically valid {dv:>6}, shipped Valid {sv:>6}, UNSOUND {u}",
+                    f.bases[0]
+                );
+            }
+            failed |= unsound > 0;
+        }
+        failed
+    }
+}
+
+// ---------------------------------------------------------------------------
+// T3: seeded byte-level fuzz over the corpus documents
+// ---------------------------------------------------------------------------
+
+mod fuzz {
+    use super::*;
+    use values::Rng;
+
+    /// Bytes a fuzzed byte is drawn from: markup, white space, digits,
+    /// letters, signs, and bytes that are not UTF-8 on their own.
+    const BYTES: &[u8] =
+        b"<>&;\"'=/:!?- \t\r\n0123456789.+eEZTabcxyzAQ#%_\x00\x7f\x80\xa0\xc3\xa9\xe2\xff";
+
+    /// Positions inside character data (between `>` and `<`), where the
+    /// values are.
+    fn text_positions(d: &[u8]) -> Vec<usize> {
+        let mut out = Vec::new();
+        let mut inside = false;
+        for (i, &b) in d.iter().enumerate() {
+            match b {
+                b'>' => inside = true,
+                b'<' => inside = false,
+                _ if inside => out.push(i),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    fn mutate(r: &mut Rng, d: &[u8], text: &[usize]) -> Vec<u8> {
+        let mut m = d.to_vec();
+        for _ in 0..1 + r.below(3) {
+            if m.is_empty() {
+                break;
+            }
+            let at = if r.below(2) == 0 && !text.is_empty() {
+                text[r.below(text.len())].min(m.len() - 1)
+            } else {
+                r.below(m.len())
+            };
+            match r.below(7) {
+                0 => m[at] = *r.pick(BYTES),
+                1 => m.insert(at, *r.pick(BYTES)),
+                2 => {
+                    let n = (1 + r.below(4)).min(m.len() - at);
+                    m.drain(at..at + n);
+                }
+                3 => {
+                    let n = (1 + r.below(64)).min(m.len() - at);
+                    let dup: Vec<u8> = m[at..at + n].to_vec();
+                    m.splice(at..at, dup);
+                }
+                4 if at + 1 < m.len() => m.swap(at, at + 1),
+                5 if m[at].is_ascii_digit() => m[at] = b'0' + r.below(10) as u8,
+                _ => m[at] = *r.pick(BYTES),
+            }
+        }
+        m
+    }
+
+    pub fn run(ws: &Path, per_document: usize) -> bool {
+        let mut failed = false;
+        let mut r = Rng(0xF00D_5EED_1234_ABCD);
+        let (mut total, mut dynamic_valid, mut shipped_valid, mut delegating_valid, mut unsound) =
+            (0usize, 0, 0, 0, 0);
+        let t = Instant::now();
+        for case in CASES {
+            if case.mutate.is_empty() {
+                continue;
+            }
+            let set = match load(&ws.join(case.xsd)) {
+                Ok(s) => s,
+                Err(e) => {
+                    println!("  SCHEMA REFUSED: {e}");
+                    failed = true;
+                    continue;
+                }
+            };
+            let (data, _) = plan::build(&set);
+            let validator = SchemaValidator::new(&set, ValidationFlags::default());
+            let mut scratch = plan::Scratch::new();
+            for doc in case.mutate {
+                let bytes = std::fs::read(ws.join(doc)).expect("document");
+                let text = text_positions(&bytes);
+                for _ in 0..per_document {
+                    let m = mutate(&mut r, &bytes, &text);
+                    total += 1;
+                    let dynamic = plan::dynamic_valid(&validator, &m);
+                    let shipped = plan::check(data.as_ref(), &m, &mut scratch);
+                    let mut tier = plan::Delegating::new(&set, &data);
+                    let delegating = plan::check_with(data.as_ref(), &m, &mut scratch, &mut tier);
+                    dynamic_valid += usize::from(dynamic);
+                    shipped_valid += usize::from(shipped == Verdict::Valid);
+                    delegating_valid += usize::from(delegating == Verdict::Valid);
+                    for (run, v) in [("shipped", shipped), ("delegating", delegating)] {
+                        if v == Verdict::Valid && !dynamic {
+                            unsound += 1;
+                            if unsound <= 10 {
+                                let at =
+                                    m.iter().zip(&bytes).position(|(a, b)| a != b).unwrap_or(0);
+                                let lo = at.saturating_sub(60);
+                                let hi = (at + 60).min(m.len());
+                                println!(
+                                    "  UNSOUND [{run}] {doc} at {at}: …{}…",
+                                    String::from_utf8_lossy(&m[lo..hi])
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        println!(
+            "T3: {total} mutants, dynamically valid {dynamic_valid}, shipped Valid {shipped_valid}, delegating Valid {delegating_valid}, UNSOUND {unsound}, {:.1} s",
+            t.elapsed().as_secs_f64()
+        );
+        failed | (unsound > 0)
     }
 }
