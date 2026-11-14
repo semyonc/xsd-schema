@@ -17,7 +17,7 @@ use std::collections::HashSet;
 use quick_xml::events::{BytesStart, BytesText, Event};
 use quick_xml::XmlVersion;
 
-use crate::xml::reader::{AttrKind, SliceWfReader};
+use crate::xml::reader::{AttrKind, AttrSpan, SliceWfReader};
 use crate::xml::ParseLimits;
 use crate::xml_entity::resolve_general_ref;
 
@@ -233,7 +233,18 @@ impl Scratch {
         self.unique_counter = 0;
     }
 
+    /// The namespace id of a prefix (the empty one: the default namespace).
+    #[inline]
     fn resolve(&self, prefix: &[u8]) -> Option<u32> {
+        if prefix.is_empty() && self.scope.is_empty() {
+            // No declaration in scope: no namespace.
+            return Some(0);
+        }
+        self.resolve_declared(prefix)
+    }
+
+    #[inline(never)]
+    fn resolve_declared(&self, prefix: &[u8]) -> Option<u32> {
         if prefix == b"xml" {
             return None;
         }
@@ -361,6 +372,10 @@ fn split_name(name: &[u8]) -> (&[u8], &[u8]) {
     }
 }
 
+/// Open an element. The common tag has no attribute and no namespace
+/// declaration: what only the others need is out of line
+/// ([`declare_namespaces`], [`attributes`], and [`root_child`] for the
+/// document's first tag).
 fn start<T: ValueTier>(
     plan: &PlanRef<'_>,
     reader: &SliceWfReader<'_>,
@@ -372,22 +387,12 @@ fn start<T: ValueTier>(
     use UnknownReason::*;
     let tag = e.as_bytes();
     let spans = reader.attributes();
-    let version = reader.quick_xml_version();
     let scope_len = s.scope.len() as u32;
     let scope_bytes = s.scope_bytes.len() as u32;
 
     // 1. Namespace declarations.
-    for span in spans.iter().filter(|a| a.kind != AttrKind::Attribute) {
-        let prefix = span.prefix(tag);
-        let uri = span.value(tag, version).map_err(|_| Reader)?;
-        let ns = if uri.as_bytes() == XSI_NAMESPACE {
-            XSI_NS
-        } else {
-            plan.namespace_id(uri.as_bytes())
-        };
-        let a = s.scope_bytes.len() as u32;
-        s.scope_bytes.extend_from_slice(prefix);
-        s.scope.push((a, s.scope_bytes.len() as u32, ns));
+    if !spans.is_empty() {
+        declare_namespaces(plan, reader, tag, spans, s)?;
     }
 
     // 2. The element's name.
@@ -398,17 +403,7 @@ fn start<T: ValueTier>(
     //    transition, found by comparing the name with the transitions'.
     let mut parent_unique = None;
     let child_id = match s.stack.last_mut() {
-        None => {
-            if *root_seen {
-                return Err(Structure);
-            }
-            *root_seen = true;
-            let name = plan.lookup(ns, local);
-            if name == NONE {
-                return Err(Construct);
-            }
-            plan.root(name)
-        }
+        None => root_child(plan, ns, local, root_seen)?,
         Some(f) => {
             if f.content != Content::ElementOnly {
                 return Err(Structure);
@@ -423,12 +418,20 @@ fn start<T: ValueTier>(
                 .get(st.t_start as usize..st.t_end as usize)
                 .ok_or(Construct)?;
             // A few transitions: compare names; many: one hashed lookup.
-            let found = if ts.len() <= 4 {
-                ts.iter().find(|t| plan.name_is(t.name, ns, local))
+            let mut found = None;
+            if ts.len() <= 4 {
+                for t in ts {
+                    if plan.name_is(t.name, ns, local) {
+                        found = Some(t);
+                        break;
+                    }
+                }
             } else {
                 let name = plan.lookup(ns, local);
-                ts.iter().find(|t| name != NONE && t.name == name)
-            };
+                if name != NONE {
+                    found = ts.iter().find(|t| t.name == name);
+                }
+            }
             match found {
                 Some(t) => {
                     f.state = t.next;
@@ -457,6 +460,107 @@ fn start<T: ValueTier>(
         .attrs
         .get(ty.attr_start as usize..ty.attr_end as usize)
         .ok_or(Construct)?;
+    if spans.is_empty() {
+        if ty.required != 0 {
+            return Err(Structure);
+        }
+    } else {
+        attributes(
+            plan,
+            reader,
+            tag,
+            spans,
+            uses,
+            ty.required,
+            parent_unique,
+            s,
+            tier,
+        )?;
+    }
+    let unique_inst = if child.unique != NONE {
+        s.unique_counter += 1;
+        s.unique_counter
+    } else {
+        0
+    };
+    s.stack.push(Frame {
+        content: ty.content,
+        flags: child.flags,
+        state: ty.start,
+        check: ty.check,
+        value: child.value,
+        unique: child.unique,
+        unique_inst,
+        scope_len,
+        scope_bytes,
+    });
+    Ok(())
+}
+
+/// Bring the namespace declarations of a start tag into scope.
+#[inline(never)]
+fn declare_namespaces(
+    plan: &PlanRef<'_>,
+    reader: &SliceWfReader<'_>,
+    tag: &[u8],
+    spans: &[AttrSpan],
+    s: &mut Scratch,
+) -> Step {
+    let version = reader.quick_xml_version();
+    for span in spans.iter().filter(|a| a.kind != AttrKind::Attribute) {
+        let prefix = span.prefix(tag);
+        let uri = span
+            .value(tag, version)
+            .map_err(|_| UnknownReason::Reader)?;
+        let ns = if uri.as_bytes() == XSI_NAMESPACE {
+            XSI_NS
+        } else {
+            plan.namespace_id(uri.as_bytes())
+        };
+        let a = s.scope_bytes.len() as u32;
+        s.scope_bytes.extend_from_slice(prefix);
+        s.scope.push((a, s.scope_bytes.len() as u32, ns));
+    }
+    Ok(())
+}
+
+/// The child plan of the document's first tag: a global element.
+#[inline(never)]
+fn root_child(
+    plan: &PlanRef<'_>,
+    ns: u32,
+    local: &[u8],
+    root_seen: &mut bool,
+) -> Result<u32, UnknownReason> {
+    if *root_seen {
+        return Err(UnknownReason::Structure);
+    }
+    *root_seen = true;
+    let name = plan.lookup(ns, local);
+    if name == NONE {
+        return Err(UnknownReason::Construct);
+    }
+    Ok(plan.root(name))
+}
+
+/// The attributes of a start tag against the attribute uses `uses` of its
+/// type, `required` being the bits of the required ones. `parent_unique` is
+/// the field attribute and the instance of the parent's narrow `xs:unique`.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn attributes<T: ValueTier>(
+    plan: &PlanRef<'_>,
+    reader: &SliceWfReader<'_>,
+    tag: &[u8],
+    spans: &[AttrSpan],
+    uses: &[AttrUse],
+    required: u64,
+    parent_unique: Option<(u32, u32)>,
+    s: &mut Scratch,
+    tier: &mut T,
+) -> Step {
+    use UnknownReason::*;
+    let version = reader.quick_xml_version();
     let mut seen = 0u64;
     for span in spans.iter().filter(|a| a.kind == AttrKind::Attribute) {
         let prefix = span.prefix(tag);
@@ -504,26 +608,9 @@ fn start<T: ValueTier>(
             }
         }
     }
-    if seen & ty.required != ty.required {
+    if seen & required != required {
         return Err(Structure);
     }
-    let unique_inst = if child.unique != NONE {
-        s.unique_counter += 1;
-        s.unique_counter
-    } else {
-        0
-    };
-    s.stack.push(Frame {
-        content: ty.content,
-        flags: child.flags,
-        state: ty.start,
-        check: ty.check,
-        value: child.value,
-        unique: child.unique,
-        unique_inst,
-        scope_len,
-        scope_bytes,
-    });
     Ok(())
 }
 
