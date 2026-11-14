@@ -17,7 +17,7 @@ use std::collections::HashSet;
 use quick_xml::events::{BytesStart, BytesText, Event};
 use quick_xml::XmlVersion;
 
-use crate::xml::reader::{AttrKind, AttrSpan, SliceWfReader};
+use crate::xml::reader::{AttrKind, AttrSpan, SliceWfReader, WfBuffers};
 use crate::xml::ParseLimits;
 use crate::xml_entity::resolve_general_ref;
 
@@ -199,6 +199,8 @@ pub struct Scratch {
     uniques: HashSet<(u32, u64)>,
     unique_counter: u32,
     norm: String,
+    /// The reader's buffers, lent to the reader of each document.
+    reader: WfBuffers,
 }
 
 impl Default for Scratch {
@@ -220,6 +222,7 @@ impl Scratch {
             uniques: HashSet::new(),
             unique_counter: 0,
             norm: String::new(),
+            reader: WfBuffers::default(),
         }
     }
 
@@ -283,7 +286,22 @@ type Step = Result<(), UnknownReason>;
 
 fn run<T: ValueTier>(plan: &PlanRef<'_>, input: &[u8], s: &mut Scratch, tier: &mut T) -> Step {
     let limits = ParseLimits::default();
-    let mut reader = SliceWfReader::from_slice(input, &limits, false);
+    // The reader works in the scratch's buffers and hands them back,
+    // whatever the outcome.
+    let buffers = std::mem::take(&mut s.reader);
+    let mut reader = SliceWfReader::from_slice_reusing(input, &limits, false, buffers);
+    let outcome = events(plan, &mut reader, s, tier);
+    s.reader = reader.into_buffers();
+    outcome
+}
+
+/// The loop over the reader's events.
+fn events<'a, T: ValueTier>(
+    plan: &PlanRef<'_>,
+    reader: &mut SliceWfReader<'a>,
+    s: &mut Scratch,
+    tier: &mut T,
+) -> Step {
     let mut root_seen = false;
     // The character content of the innermost open element.
     let mut text = Text::None;
@@ -300,11 +318,11 @@ fn run<T: ValueTier>(plan: &PlanRef<'_>, input: &[u8], s: &mut Scratch, tier: &m
             }
             Event::DocType(_) => return Err(UnknownReason::Prolog),
             Event::Start(ref e) => {
-                start(plan, &reader, e, s, tier, &mut root_seen)?;
+                start(plan, reader, e, s, tier, &mut root_seen)?;
                 text = Text::None;
             }
             Event::Empty(ref e) => {
-                start(plan, &reader, e, s, tier, &mut root_seen)?;
+                start(plan, reader, e, s, tier, &mut root_seen)?;
                 end(plan, s, tier, Text::None)?;
                 text = Text::None;
             }

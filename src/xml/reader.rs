@@ -301,6 +301,17 @@ impl Scope {
         self.active
     }
 
+    /// Forgets every declaration and keeps the buffers: the scope of the
+    /// next document.
+    #[cfg(feature = "plan")]
+    fn clear(&mut self) {
+        self.bindings.clear();
+        self.bytes.clear();
+        self.heads.clear();
+        self.marks.clear();
+        self.active = 0;
+    }
+
     /// The key of a prefix in `heads`.
     #[inline]
     fn key(&self, prefix: &[u8]) -> u64 {
@@ -588,6 +599,20 @@ struct WfState {
     open_at: Vec<usize>,
 }
 
+/// The growable buffers of a reader. A caller that reads one document after
+/// another takes them from the reader that is done (`WfReader::into_buffers`)
+/// and gives them to the next ([`SliceWfReader::from_slice_reusing`]): this
+/// layer then allocates nothing for a document like the ones read before it.
+/// Empty by default.
+#[derive(Debug, Default)]
+pub(crate) struct WfBuffers {
+    scope: Scope,
+    attrs: Vec<AttrSpan>,
+    open: Vec<u8>,
+    open_at: Vec<usize>,
+    decl_text: String,
+}
+
 /// What the reader keeps of the XML declaration (the text is in
 /// [`WfState::decl_text`]).
 #[derive(Debug, Clone, Copy)]
@@ -646,6 +671,7 @@ impl<B: BufRead> WfReader<B> {
             configured(Reader::from_reader(reader), trim_text_start),
             (),
             limits,
+            WfBuffers::default(),
         )
     }
 
@@ -703,10 +729,22 @@ impl<'a> SliceWfReader<'a> {
     /// A reader over the whole input `input`, otherwise as
     /// [`WfReader::new`].
     pub(crate) fn from_slice(input: &'a [u8], limits: &ParseLimits, trim_text_start: bool) -> Self {
+        Self::from_slice_reusing(input, limits, trim_text_start, WfBuffers::default())
+    }
+
+    /// [`from_slice`](Self::from_slice) with the buffers of a reader that is
+    /// done (`WfReader::into_buffers`).
+    pub(crate) fn from_slice_reusing(
+        input: &'a [u8],
+        limits: &ParseLimits,
+        trim_text_start: bool,
+        buffers: WfBuffers,
+    ) -> Self {
         WfReader::with_parts(
             configured(Reader::from_reader(input), trim_text_start),
             input,
             limits,
+            buffers,
         )
     }
 
@@ -819,9 +857,17 @@ impl<'i> NextEvent<'i> for SliceWfReader<'i> {
 }
 
 impl<B: BufRead, W> WfReader<B, W> {
-    /// A reader over the configured quick-xml reader `inner`.
-    fn with_parts(inner: Reader<B>, whole: W, limits: &ParseLimits) -> Self {
+    /// A reader over the configured quick-xml reader `inner`, with the
+    /// (empty) buffers `buffers`.
+    fn with_parts(inner: Reader<B>, whole: W, limits: &ParseLimits, buffers: WfBuffers) -> Self {
         let trim = inner.config().trim_text_start;
+        let WfBuffers {
+            scope,
+            attrs,
+            open,
+            open_at,
+            decl_text,
+        } = buffers;
         WfReader {
             inner,
             whole,
@@ -839,15 +885,41 @@ impl<B: BufRead, W> WfReader<B, W> {
                 doctype_pending: None,
                 nodes: 0,
                 run: None,
-                scope: Scope::default(),
-                attrs: Vec::new(),
+                scope,
+                attrs,
                 version: XmlVersion::V1_0,
                 declaration: None,
-                decl_text: String::new(),
+                decl_text,
                 last_start: 0,
-                open: Vec::new(),
-                open_at: Vec::new(),
+                open,
+                open_at,
             },
+        }
+    }
+
+    /// The reader's buffers, emptied, for the reader of the next document
+    /// ([`SliceWfReader::from_slice_reusing`]).
+    #[cfg(feature = "plan")]
+    pub(crate) fn into_buffers(self) -> WfBuffers {
+        let WfState {
+            mut scope,
+            mut attrs,
+            mut open,
+            mut open_at,
+            mut decl_text,
+            ..
+        } = self.st;
+        scope.clear();
+        attrs.clear();
+        open.clear();
+        open_at.clear();
+        decl_text.clear();
+        WfBuffers {
+            scope,
+            attrs,
+            open,
+            open_at,
+            decl_text,
         }
     }
 

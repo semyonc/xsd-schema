@@ -19,6 +19,14 @@ fn trace<'i, B: BufRead, W>(mut r: WfReader<B, W>) -> (Vec<String>, Result<(), W
 where
     WfReader<B, W>: NextEvent<'i>,
 {
+    trace_of(&mut r)
+}
+
+/// [`trace`] of a reader that the caller keeps.
+fn trace_of<'i, B: BufRead, W>(r: &mut WfReader<B, W>) -> (Vec<String>, Result<(), WfError>)
+where
+    WfReader<B, W>: NextEvent<'i>,
+{
     let mut buf = Vec::new();
     let mut out = Vec::new();
     loop {
@@ -404,6 +412,46 @@ fn quick_xml_moves_past_refused_bytes_alike_in_both_readers() {
                     (x, y) => panic!("{xml:?}: {x:?} against {y:?}"),
                 }
             }
+        }
+    }
+}
+
+/// A reader that works in the buffers of the readers before it reads as a
+/// fresh one does, whatever those left: open elements and declarations of a
+/// document that stopped half-way, an XML declaration, attributes.
+#[cfg(feature = "plan")]
+#[test]
+fn the_buffers_of_one_reader_serve_the_next() {
+    use super::reader::WfBuffers;
+    let docs: [&[u8]; 7] = [
+        b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\" standalone=\"yes\"?><r a=\"1\" b=\"2\"/>",
+        b"<p:r xmlns:p=\"urn:p\" xmlns=\"urn:d\"><p:a xmlns:p=\"urn:q\" p:x=\"1\"><b xmlns=\"\"/></p:a><p:c/></p:r>",
+        // Stops inside three elements, with declarations in force.
+        b"<r xmlns=\"urn:d\" xmlns:p=\"urn:p\"><p:a><b xmlns:q=\"urn:q\" q:k=\"v\">text",
+        // The prefixes of the documents before are not bound here.
+        b"<r><p:a/></r>",
+        b"<?xml version=\"1.1\"?><r>&#x1;</r>",
+        b"<r/>",
+        b"<r xmlns:p=\"urn:p\" p:a=\"1\" p:a=\"2\"/>",
+    ];
+    let limits = ParseLimits::default();
+    let declaration = |r: &SliceWfReader<'_>| r.declaration().map(|d| d.to_declaration());
+    let mut buffers = WfBuffers::default();
+    for _ in 0..2 {
+        for doc in docs {
+            let mut fresh = SliceWfReader::from_slice(doc, &limits, false);
+            let expected = trace_of(&mut fresh);
+            let mut reusing = SliceWfReader::from_slice_reusing(doc, &limits, false, buffers);
+            let found = trace_of(&mut reusing);
+            assert_eq!(
+                (&expected.0, format!("{:?}", expected.1)),
+                (&found.0, format!("{:?}", found.1)),
+                "{:?}",
+                String::from_utf8_lossy(doc)
+            );
+            assert_eq!(declaration(&fresh), declaration(&reusing));
+            assert_eq!(fresh.xml_version(), reusing.xml_version());
+            buffers = reusing.into_buffers();
         }
     }
 }
