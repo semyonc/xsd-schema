@@ -436,19 +436,26 @@ pub(crate) fn parse_not_qname(
 ///
 /// Applies whitespace collapse (the schema-for-schemas types these attributes
 /// as `nonNegativeInteger`/`positiveInteger`) and strips an optional leading `+`.
+/// The digits are checked before the parse: `u32::from_str` would take a
+/// second `+` (`++5`).
 fn parse_nonneg_integer<T: std::str::FromStr>(value: &str, facet_name: &str) -> SchemaResult<T> {
-    let trimmed = value.trim();
-    // An `xs:nonNegativeInteger`: zero "may be preceded by a positive ("+") or
-    // a negative ("-") sign" (XSD 1.0 §3.3.20.1, Datatypes 1.1 §3.4.20.1).
-    let trimmed = crate::types::validators::unsigned_lexical(trimmed);
-    let text = trimmed.strip_prefix('+').unwrap_or(trimmed);
-    text.parse().map_err(|_| {
+    use crate::types::facets::{normalize_whitespace, WhitespaceMode};
+    let invalid = || {
         SchemaError::structural(
             "st-props-correct",
             format!("Invalid {} value '{}': must be a nonNegativeInteger", facet_name, value),
             None,
         )
-    })
+    };
+    let collapsed = normalize_whitespace(value, WhitespaceMode::Collapse);
+    // An `xs:nonNegativeInteger`: zero "may be preceded by a positive ("+") or
+    // a negative ("-") sign" (XSD 1.0 §3.3.20.1, Datatypes 1.1 §3.4.20.1).
+    let trimmed = crate::types::validators::unsigned_lexical(&collapsed);
+    let text = trimmed.strip_prefix('+').unwrap_or(trimmed);
+    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(invalid());
+    }
+    text.parse().map_err(|_| invalid())
 }
 
 /// Apply a facet to a facet set

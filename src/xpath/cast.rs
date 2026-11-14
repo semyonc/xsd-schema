@@ -238,10 +238,11 @@ pub fn cast_to(value: &XmlValue, target_type: XmlTypeCode) -> Result<XmlValue, X
                 return result;
             }
             let type_name = target_type.local_name().unwrap_or("unknown");
+            let lexical = trim_xml_whitespace(&string_val);
             VALIDATOR_REGISTRY
-                .validate(target_type, string_val.trim())
+                .validate(target_type, lexical)
                 .map_err(|_| {
-                    beyond_value_limits(target_type, string_val.trim()).unwrap_or_else(|| {
+                    beyond_value_limits(target_type, lexical).unwrap_or_else(|| {
                         XPathError::invalid_cast_value(&string_val, format!("xs:{}", type_name))
                     })
                 })
@@ -255,7 +256,7 @@ pub fn cast_to(value: &XmlValue, target_type: XmlTypeCode) -> Result<XmlValue, X
             }
             let type_name = target_type.local_name().unwrap_or("unknown");
             VALIDATOR_REGISTRY
-                .validate(target_type, string_val.trim())
+                .validate(target_type, trim_xml_whitespace(&string_val))
                 .map_err(|_| {
                     XPathError::invalid_cast_value(&string_val, format!("xs:{}", type_name))
                 })
@@ -307,7 +308,7 @@ fn cast_to_boolean(value: &XmlValue, string_val: &str) -> Result<XmlValue, XPath
                 .is_some_and(|d| !d.is_zero())
         }
         _ => {
-            let s = string_val.trim();
+            let s = trim_xml_whitespace(string_val);
             match s {
                 "true" | "1" => true,
                 "false" | "0" => false,
@@ -548,7 +549,7 @@ fn beyond_value_limits(target: XmlTypeCode, lexical: &str) -> Option<XPathError>
 /// rather than round.
 pub(crate) fn decimal_from_lexical(text: &str) -> Result<Decimal, XPathError> {
     use crate::types::exact_decimal::{parse_decimal_exact, DecimalParseError, ExactDecimal};
-    let trimmed = text.trim();
+    let trimmed = trim_xml_whitespace(text);
     if !crate::types::validators::is_valid_xsd_decimal_lexical(trimmed) {
         return Err(XPathError::invalid_cast_value(text, "xs:decimal"));
     }
@@ -606,10 +607,18 @@ fn cast_to_integer(value: &XmlValue, string_val: &str) -> Result<XmlValue, XPath
                 .map(|d| d.trunc_to_bigint())
                 .ok_or_else(|| XPathError::invalid_cast_value(string_val, "xs:integer"))?
         }
-        _ => string_val
-            .trim()
-            .parse::<BigInt>()
-            .map_err(|_| XPathError::invalid_cast_value(string_val, "xs:integer"))?,
+        // F&O §17.1.1: the whitespace-normalized string "must be a valid
+        // lexical form for the datatype" — `num_bigint` would also read
+        // `1_000`.
+        _ => {
+            let lexical = trim_xml_whitespace(string_val);
+            if !crate::types::validators::is_valid_xsd_integer_lexical(lexical) {
+                return Err(XPathError::invalid_cast_value(string_val, "xs:integer"));
+            }
+            lexical
+                .parse::<BigInt>()
+                .map_err(|_| XPathError::invalid_cast_value(string_val, "xs:integer"))?
+        }
     };
     Ok(XmlValue::integer(result))
 }
@@ -634,7 +643,7 @@ fn cast_to_float(value: &XmlValue, string_val: &str) -> Result<XmlValue, XPathEr
                 0.0
             }
         }
-        _ => parse_float_with_special(string_val.trim())
+        _ => parse_float_with_special(string_val)
             .map_err(|_| XPathError::invalid_cast_value(string_val, "xs:float"))?,
     };
     Ok(XmlValue::float(result))
@@ -660,7 +669,7 @@ fn cast_to_double(value: &XmlValue, string_val: &str) -> Result<XmlValue, XPathE
                 0.0
             }
         }
-        _ => parse_double_with_special(string_val.trim())
+        _ => parse_double_with_special(string_val)
             .map_err(|_| XPathError::invalid_cast_value(string_val, "xs:double"))?,
     };
     Ok(XmlValue::double(result))
@@ -714,6 +723,9 @@ pub(crate) fn parse_xsd_float(lexical: &str) -> Option<f32> {
     }
 }
 
+/// `s` without leading and trailing XML white space (#x20, #x9, #xD, #xA) —
+/// what `whiteSpace="collapse"` removes there; not [`str::trim`], which also
+/// removes U+00A0, U+3000 and the other Unicode white space.
 fn trim_xml_whitespace(s: &str) -> &str {
     s.trim_matches(|c| matches!(c, ' ' | '\t' | '\r' | '\n'))
 }
@@ -1838,5 +1850,47 @@ mod tests {
             XmlTypeCode::AnyAtomicType
         ));
         assert!(!type_matches(XmlTypeCode::IdRefs, XmlTypeCode::IdRef));
+    }
+
+    /// F&O 1.0 §17.1.1: "Whitespace normalization is applied as indicated by
+    /// the whiteSpace facet for the datatype. The resulting
+    /// whitespace-normalized string must be a valid lexical form for the
+    /// datatype" — no `_` separators (`num_bigint`), and no white space but
+    /// #x20, #x9, #xD, #xA around the value (`str::trim` removes U+00A0, …).
+    #[test]
+    fn casts_from_strings_read_the_xsd_lexical_space() {
+        let cast = |s: &str, t: XmlTypeCode| cast_to(&XmlValue::string(s), t);
+        for t in [
+            XmlTypeCode::Integer,
+            XmlTypeCode::Long,
+            XmlTypeCode::NonNegativeInteger,
+            XmlTypeCode::UnsignedByte,
+        ] {
+            for bad in [
+                "1_0",
+                "1_",
+                "1__0",
+                "+_1",
+                "\u{a0}1",
+                "1\u{3000}",
+                "\u{2028}1",
+            ] {
+                assert!(cast(bad, t).is_err(), "{bad:?} as {t:?}");
+            }
+            assert_eq!(cast(" +10\n", t).unwrap().to_string_value(), "10");
+        }
+        for (bad, t) in [
+            ("\u{a0}1.5", XmlTypeCode::Decimal),
+            ("\u{a0}1", XmlTypeCode::Double),
+            ("1\u{3000}", XmlTypeCode::Float),
+            ("\u{a0}true", XmlTypeCode::Boolean),
+            ("\u{a0}2000-01-01", XmlTypeCode::Date),
+            ("10:00:00\u{3000}", XmlTypeCode::Time),
+            ("\u{a0}0F", XmlTypeCode::HexBinary),
+        ] {
+            assert!(cast(bad, t).is_err(), "{bad:?} as {t:?}");
+            let good = bad.trim();
+            assert!(cast(&format!("\t{good} "), t).is_ok(), "{good:?} as {t:?}");
+        }
     }
 }

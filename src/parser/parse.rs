@@ -1136,10 +1136,18 @@ fn should_skip_for_vc(
     let Some(vc_ns_id) = name_table.get(VC_NAMESPACE) else {
         return Ok(false);
     };
-    let current: f64 = match xsd_version {
-        XsdVersion::V1_0 => 1.0,
-        XsdVersion::V1_1 => 1.1,
-    };
+    use crate::types::exact_decimal::ExactDecimal;
+    use crate::types::facets::{normalize_whitespace, WhitespaceMode};
+    // Structures §4.2.2: "the attributes vc:minVersion and vc:maxVersion are
+    // treated as if declared with type xs:decimal, and their ·actual values·
+    // are compared to a decimal value representing the version of XSD
+    // supported by the processor" — as decimals, exactly: as `f64`,
+    // `1.1000000000000000001` would equal 1.1.
+    let current = ExactDecimal::parse(match xsd_version {
+        XsdVersion::V1_0 => "1.0",
+        XsdVersion::V1_1 => "1.1",
+    })
+    .expect("a decimal literal");
     for attr in foreign_attrs {
         if attr.namespace != Some(vc_ns_id) {
             continue;
@@ -1147,14 +1155,19 @@ fn should_skip_for_vc(
         let local = name_table.resolve_ref(attr.local_name);
         let include = match local {
             "minVersion" | "maxVersion" | "minVersionExclusive" | "maxVersionExclusive" => {
-                let bound = match attr.value.trim().parse::<f64>() {
-                    Ok(v) => v,
-                    Err(_) => {
+                // "its ·initial value· must be locally ·valid· with respect
+                // to xs:decimal" (Conditional Inclusion Constraints) — the
+                // `xs:decimal` lexical space after white space collapse, not
+                // `f64::from_str`'s (`inf`, `NaN`, `1e0`); `ExactDecimal::parse`
+                // reads exactly that lexical space.
+                let lexical = normalize_whitespace(&attr.value, WhitespaceMode::Collapse);
+                let bound = match ExactDecimal::parse(&lexical) {
+                    Some(v) => v,
+                    None => {
                         if xsd_version == XsdVersion::V1_1 {
                             return Err(err_versioning(format!(
                                 "Invalid vc:{} value '{}': must be a valid xs:decimal",
-                                local,
-                                attr.value.trim()
+                                local, lexical
                             )));
                         }
                         // XSD 1.0: vc: attributes are informational only; ignore invalid values
@@ -1344,6 +1357,46 @@ mod tests {
     use super::*;
     use crate::ids::TypeKey;
     use crate::schema::model::FormChoice;
+
+    /// Structures §4.2.2: `vc:minVersion` / `vc:maxVersion` are `xs:decimal`
+    /// values compared with the processor's version exactly — not `f64`s.
+    #[test]
+    fn vc_version_bounds_are_exact_decimals() {
+        let names = NameTable::new();
+        let vc = names.add("http://www.w3.org/2007/XMLSchema-versioning");
+        let snapshot = crate::namespace::NamespaceContextSnapshot::default();
+        let skip = |local: &str, value: &str, version| {
+            let attr = ForeignAttribute::new(Some(vc), names.add(local), value.to_string());
+            should_skip_for_vc(&[attr], &names, &snapshot, version)
+        };
+        use XsdVersion::{V1_0, V1_1};
+        assert!(matches!(skip("minVersion", "1.1", V1_1), Ok(false)));
+        assert!(matches!(skip("minVersion", " 1.10\n", V1_1), Ok(false)));
+        assert!(matches!(
+            skip("minVersion", "1.1000000000000000001", V1_1),
+            Ok(true)
+        ));
+        assert!(matches!(
+            skip("maxVersion", "1.0999999999999999999", V1_1),
+            Ok(true)
+        ));
+        assert!(matches!(
+            skip("maxVersion", "1.1000000000000000001", V1_1),
+            Ok(false)
+        ));
+        assert!(matches!(
+            skip("minVersion", "1.0000000000000000001", V1_0),
+            Ok(true)
+        ));
+        for bad in ["inf", "NaN", "1e0", "1_0", "\u{a0}1.0", "", "+"] {
+            assert!(skip("minVersion", bad, V1_1).is_err(), "{bad:?}");
+            // XSD 1.0: an invalid value is ignored.
+            assert!(
+                matches!(skip("minVersion", bad, V1_0), Ok(false)),
+                "{bad:?}"
+            );
+        }
+    }
 
     #[test]
     fn test_parse_minimal_schema() {

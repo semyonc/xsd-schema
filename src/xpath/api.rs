@@ -1115,10 +1115,13 @@ fn xpath_value_to_number<N: DomNavigator>(value: &XPathValue<N>) -> f64 {
     }
 }
 
-/// Convert an XmlItem to a number.
+/// Convert an XmlItem to a number. A string is read as `fn:number` reads it
+/// — the `xs:double` lexical space after white space collapse — not as
+/// `f64::from_str` would (which also reads `inf`, `infinity` and `nan`).
 fn item_to_number<N: DomNavigator>(item: &XmlItem<N>) -> f64 {
+    use crate::xpath::cast::parse_xsd_double;
     match item {
-        XmlItem::Node(nav) => nav.value().trim().parse().unwrap_or(f64::NAN),
+        XmlItem::Node(nav) => parse_xsd_double(&nav.value()).unwrap_or(f64::NAN),
         XmlItem::Atomic(val) => {
             if let Some(d) = val.as_double() {
                 d
@@ -1127,7 +1130,7 @@ fn item_to_number<N: DomNavigator>(item: &XmlItem<N>) -> f64 {
                 i.to_string().parse().unwrap_or(f64::NAN)
             } else {
                 // Try string conversion
-                val.to_string_value().trim().parse().unwrap_or(f64::NAN)
+                parse_xsd_double(&val.to_string_value()).unwrap_or(f64::NAN)
             }
         }
     }
@@ -1574,5 +1577,25 @@ mod tests {
         // The inner run found the outer run's program.
         assert_eq!(regexes.compiles(), 1);
         assert_eq!(regexes.hits(), 1);
+    }
+
+    /// `run_number` reads a string result as `fn:number` does: `inf`,
+    /// `Infinity`, `nan` are not `xs:double` lexical forms.
+    #[test]
+    fn run_number_reads_a_string_as_fn_number() {
+        let names = NameTable::new();
+        let ctx = XPathContext::new(&names);
+        let number = |expr: &str| {
+            XPathExpr::compile(expr, &ctx)
+                .unwrap()
+                .evaluator(&ctx)
+                .run_number::<RoXmlNavigator<'static>>()
+                .unwrap()
+        };
+        for s in ["inf", "Infinity", "-infinity", "nan", "1_0", "\u{a0}1"] {
+            assert!(number(&format!("'{s}'")).is_nan(), "{s:?}");
+        }
+        assert_eq!(number("'-INF'"), f64::NEG_INFINITY);
+        assert_eq!(number("' 2.5e1 '"), 25.0);
     }
 }
