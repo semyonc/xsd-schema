@@ -134,7 +134,7 @@ enum Read<'v> {
 /// `Unknown` otherwise. The value is unique in nothing here; the caller
 /// keeps `xs:ID` values.
 pub(crate) fn check_value<'a>(
-    plan: PlanRef<'_>,
+    plan: &PlanRef<'_>,
     c: &CheckPlan,
     value: &'a str,
     buf: &'a mut String,

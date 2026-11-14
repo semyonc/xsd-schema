@@ -174,7 +174,8 @@ pub fn check_with<T: ValueTier>(
     tier: &mut T,
 ) -> Verdict {
     scratch.reset();
-    match run(plan, input, scratch, tier) {
+    // The plan is twenty slices: every function below takes it by reference.
+    match run(&plan, input, scratch, tier) {
         Ok(()) => Verdict::Valid,
         Err(reason) => Verdict::Unknown(reason),
     }
@@ -182,7 +183,7 @@ pub fn check_with<T: ValueTier>(
 
 type Step = Result<(), UnknownReason>;
 
-fn run<T: ValueTier>(plan: PlanRef<'_>, input: &[u8], s: &mut Scratch, tier: &mut T) -> Step {
+fn run<T: ValueTier>(plan: &PlanRef<'_>, input: &[u8], s: &mut Scratch, tier: &mut T) -> Step {
     let limits = ParseLimits::default();
     let mut reader = SliceWfReader::from_slice(input, &limits, false);
     let mut root_seen = false;
@@ -251,7 +252,7 @@ fn run<T: ValueTier>(plan: PlanRef<'_>, input: &[u8], s: &mut Scratch, tier: &mu
     }
 }
 
-fn top_content(plan: PlanRef<'_>, s: &Scratch) -> Content {
+fn top_content(plan: &PlanRef<'_>, s: &Scratch) -> Content {
     s.stack
         .last()
         .and_then(|f| plan.types.get(f.ty as usize))
@@ -266,7 +267,7 @@ fn split_name(name: &[u8]) -> (&[u8], &[u8]) {
 }
 
 fn start<T: ValueTier>(
-    plan: PlanRef<'_>,
+    plan: &PlanRef<'_>,
     reader: &SliceWfReader<'_>,
     e: &BytesStart<'_>,
     s: &mut Scratch,
@@ -437,7 +438,7 @@ fn start<T: ValueTier>(
 /// as the runtime checks it: `xs:anyURI` tokens, an even number of them for
 /// `schemaLocation`. Every other `xsi:` attribute is not covered.
 fn schema_location_hint<T: ValueTier>(
-    plan: PlanRef<'_>,
+    plan: &PlanRef<'_>,
     local: &[u8],
     value: &str,
     root: bool,
@@ -473,7 +474,7 @@ fn schema_location_hint<T: ValueTier>(
     }
 }
 
-fn end<T: ValueTier>(plan: PlanRef<'_>, s: &mut Scratch, tier: &mut T) -> Step {
+fn end<T: ValueTier>(plan: &PlanRef<'_>, s: &mut Scratch, tier: &mut T) -> Step {
     use UnknownReason::*;
     let f = s.stack.pop().ok_or(Structure)?;
     s.scope.truncate(f.scope_len as usize);
@@ -519,7 +520,7 @@ fn end<T: ValueTier>(plan: PlanRef<'_>, s: &mut Scratch, tier: &mut T) -> Step {
 
 /// Run the check `id` (and the checks chained to it) on `value`.
 fn run_check<T: ValueTier>(
-    plan: PlanRef<'_>,
+    plan: &PlanRef<'_>,
     id: u32,
     value: &str,
     s: &mut Scratch,
@@ -577,7 +578,7 @@ fn run_check<T: ValueTier>(
 }
 
 /// Whether a pattern table accepts the whole of `v`.
-pub fn table_accepts(plan: PlanRef<'_>, t: &PatternTable, v: &[u8]) -> bool {
+pub fn table_accepts(plan: &PlanRef<'_>, t: &PatternTable, v: &[u8]) -> bool {
     let Some(classes) = plan.bytes.get(t.classes as usize..t.classes as usize + 256) else {
         return false;
     };
@@ -600,7 +601,7 @@ pub fn table_accepts(plan: PlanRef<'_>, t: &PatternTable, v: &[u8]) -> bool {
 }
 
 /// Whether every character of `v` is in the alphabet.
-pub fn in_alphabet(plan: PlanRef<'_>, a: &Alphabet, v: &str) -> bool {
+pub fn in_alphabet(plan: &PlanRef<'_>, a: &Alphabet, v: &str) -> bool {
     let excluded = plan
         .excluded
         .get(a.excl_start as usize..a.excl_end as usize)
