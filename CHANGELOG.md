@@ -144,7 +144,11 @@ corpora give the same results.
   in any case); it now reads the `xs:double` lexical space (`INF`, `-INF`,
   `NaN`, or a numeral). `XPathEvaluator::run_number` gives `NaN` for a string
   or node result that is not an `xs:double` lexical form, as `fn:number` does
-  (it gave infinity for `inf` and `Infinity`).
+  (it gave infinity for `inf` and `Infinity`), and 1 and 0 for `true()` and
+  `false()` (it gave `NaN`).
+- `TypeConverter::to_integer` (and `TypeConverter::cast` to `xs:integer`) of an
+  `xs:float` or `xs:double` beyond the range of `i64` gives the exact integral
+  part (`1e20` is 100000000000000000000); it gave ±9223372036854775807.
 - Schemas that were accepted are now rejected: a `length`, `minLength`,
   `maxLength`, `totalDigits` or `fractionDigits` value with two signs (`++5`)
   or with white space other than #x20, #x9, #xD, #xA around it.

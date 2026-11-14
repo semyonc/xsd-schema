@@ -419,6 +419,12 @@ fn type_converter_reads_untyped_values_as_xsd() {
     assert_eq!(tc.to_double(&u(" 1e3 ")).unwrap(), 1000.0);
     assert!(tc.to_double(&u("-INF")).unwrap().is_infinite());
     assert!(tc.to_double(&u("NaN")).unwrap().is_nan());
+    // F&O §17.1.3.4: a double cast to `xs:integer` keeps every digit of its
+    // integral part (it saturated at the range of `i64`).
+    assert_eq!(
+        tc.to_integer(&XmlValue::double(1e20)).unwrap().to_string(),
+        "100000000000000000000"
+    );
 }
 
 #[cfg(feature = "xsd11")]
@@ -552,6 +558,9 @@ mod xpath {
                 assert!(number(&format!("number('{s}')")).is_nan(), "number({s:?})");
             }
             assert!(number("'INF'").is_infinite());
+            // F&O §17.1.3.2: true casts to 1.0E0 and false to 0.0E0.
+            assert_eq!(number("true()"), 1.0);
+            assert_eq!(number("false()"), 0.0);
             assert_eq!(number("' 1e3 '"), 1000.0);
         });
     }

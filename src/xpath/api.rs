@@ -1125,6 +1125,13 @@ fn item_to_number<N: DomNavigator>(item: &XmlItem<N>) -> f64 {
         XmlItem::Atomic(val) => {
             if let Some(d) = val.as_double() {
                 d
+            } else if let Some(b) = val.as_boolean() {
+                // F&O §17.1.3.2: true casts to 1.0E0, false to 0.0E0.
+                if b {
+                    1.0
+                } else {
+                    0.0
+                }
             } else if let Some(i) = val.as_integer() {
                 // Convert BigInt to f64 (may lose precision for very large numbers)
                 i.to_string().parse().unwrap_or(f64::NAN)
@@ -1597,5 +1604,7 @@ mod tests {
         }
         assert_eq!(number("'-INF'"), f64::NEG_INFINITY);
         assert_eq!(number("' 2.5e1 '"), 25.0);
+        assert_eq!(number("true()"), 1.0);
+        assert_eq!(number("false()"), 0.0);
     }
 }

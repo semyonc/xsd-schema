@@ -354,9 +354,11 @@ impl TypeConverter {
                         message: "Cannot convert NaN or Infinity to integer".to_string(),
                     });
                 }
+                // Every digit of the truncated value (F&O §17.1.3.4: "SV with
+                // the fractional part discarded"), not `as i64`, which
+                // saturates beyond ±2⁶³.
                 let truncated = f.trunc();
-                (truncated as i64)
-                    .to_string()
+                format!("{truncated:.0}")
                     .parse()
                     .map_err(|_| ConversionError::Overflow {
                         value: f.to_string(),
@@ -372,8 +374,7 @@ impl TypeConverter {
                     });
                 }
                 let truncated = d.trunc();
-                (truncated as i64)
-                    .to_string()
+                format!("{truncated:.0}")
                     .parse()
                     .map_err(|_| ConversionError::Overflow {
                         value: d.to_string(),
@@ -1174,5 +1175,24 @@ mod tests {
         assert_eq!(tc.to_decimal(&u("\t.5 ")).unwrap(), Decimal::new(5, 1));
         assert_eq!(tc.to_double(&u(" 1.5E1 ")).unwrap(), 15.0);
         assert_eq!(tc.to_double(&u("-INF")).unwrap(), f64::NEG_INFINITY);
+    }
+
+    /// F&O §17.1.3.4: a float or double cast to `xs:integer` is "SV with the
+    /// fractional part discarded" — exactly, beyond the range of `i64` too.
+    #[test]
+    fn float_to_integer_keeps_every_digit() {
+        let tc = TypeConverter::new();
+        let int = |v: XmlValue| tc.to_integer(&v).unwrap().to_string();
+        assert_eq!(int(XmlValue::double(1e20)), "100000000000000000000");
+        assert_eq!(int(XmlValue::double(-1e19)), "-10000000000000000000");
+        assert_eq!(int(XmlValue::double(-2.9)), "-2");
+        assert_eq!(int(XmlValue::double(-0.5)), "0");
+        assert_eq!(int(XmlValue::float(1e20)), "100000002004087734272");
+        assert_eq!(
+            tc.cast(&XmlValue::double(1e20), XmlTypeCode::Integer)
+                .unwrap()
+                .to_string_value(),
+            "100000000000000000000"
+        );
     }
 }
