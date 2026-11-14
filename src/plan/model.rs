@@ -516,6 +516,41 @@ pub fn hash_name(ns: u32, local: &[u8]) -> u32 {
     h ^ (h >> 15)
 }
 
+/// Whether two names are the same bytes. Names are short: compared here,
+/// eight bytes at a time (the last eight overlapping), where the general
+/// comparison is a call.
+#[inline]
+fn same_bytes(a: &[u8], b: &[u8]) -> bool {
+    #[inline(always)]
+    fn word(s: &[u8], at: usize) -> u64 {
+        let mut w = [0u8; 8];
+        w.copy_from_slice(&s[at..at + 8]);
+        u64::from_ne_bytes(w)
+    }
+    let n = a.len();
+    if n != b.len() {
+        return false;
+    }
+    if n < 8 {
+        let mut i = 0;
+        while i < n {
+            if a[i] != b[i] {
+                return false;
+            }
+            i += 1;
+        }
+        return true;
+    }
+    let mut i = 0;
+    while i + 8 < n {
+        if word(a, i) != word(b, i) {
+            return false;
+        }
+        i += 8;
+    }
+    word(a, n - 8) == word(b, n - 8)
+}
+
 impl<'a> PlanRef<'a> {
     /// The bytes of a span.
     #[inline]
@@ -558,10 +593,14 @@ impl<'a> PlanRef<'a> {
     pub fn name_is(&self, id: u32, ns: u32, local: &[u8]) -> bool {
         self.names.get(id as usize).is_some_and(|n| {
             n.ns == ns
-                && self.span(Span {
-                    start: n.start,
-                    len: n.len,
-                }) == local
+                && n.len as usize == local.len()
+                && same_bytes(
+                    self.span(Span {
+                        start: n.start,
+                        len: n.len,
+                    }),
+                    local,
+                )
         })
     }
 
