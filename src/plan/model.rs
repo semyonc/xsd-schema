@@ -289,6 +289,20 @@ pub struct Bounds {
     pub zoned: bool,
 }
 
+impl Bounds {
+    /// Whether a range or digit facet is present (an integer type's built-in
+    /// range is not one).
+    #[inline]
+    pub fn has_facets(&self) -> bool {
+        self.min_incl.set
+            || self.min_excl.set
+            || self.max_incl.set
+            || self.max_excl.set
+            || self.total_digits != NONE
+            || self.fraction_digits != NONE
+    }
+}
+
 /// One pattern step (a restriction step's patterns, joined): a value must be
 /// accepted by its table and lie inside its trusted alphabet.
 #[derive(Clone, Copy, Debug)]

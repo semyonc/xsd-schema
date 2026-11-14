@@ -187,7 +187,19 @@ pub(crate) fn check_value<'a>(
             if !is_valid_xsd_decimal_lexical(v) {
                 return Err(Bad);
             }
-            let (mant, scale, total, fraction) = read_decimal(v).ok_or(Bad)?;
+            // The number is read by the range and digit facets only (below,
+            // on the same bounds). Where the check has none, a form short
+            // enough to be read for certain is not read at all.
+            let compared = plan
+                .bounds
+                .get(c.bounds as usize)
+                .is_some_and(Bounds::has_facets);
+            let (mant, scale, total, fraction) = if !compared && v.len() <= DECIMAL_DIGITS as usize
+            {
+                (0, 0, 0, 0)
+            } else {
+                read_decimal(v).ok_or(Bad)?
+            };
             Read::Number {
                 mant,
                 scale,
