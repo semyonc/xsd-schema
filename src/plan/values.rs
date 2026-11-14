@@ -40,12 +40,19 @@ pub(crate) fn is_xml_space(b: u8) -> bool {
 /// `value` normalized as `ws` says (Datatypes §4.3.6), byte for byte as the
 /// dynamic path's `normalize_whitespace` normalizes it: borrowed when nothing
 /// changes, else written into `buf`.
+#[inline]
 pub(crate) fn normalize<'a>(value: &'a str, ws: Ws, buf: &'a mut String) -> &'a str {
-    // The common case first: a value with no white space at all (and no
-    // other byte up to #x20) is its own normalized form.
+    // The common case first, in the caller: a value with no white space at
+    // all (and no other byte up to #x20) is its own normalized form.
     if ws == Ws::Preserve || value.bytes().all(|b| b > b' ') {
         return value;
     }
+    normalize_spaced(value, ws, buf)
+}
+
+/// [`normalize`] for a value that has a byte up to #x20.
+#[inline(never)]
+fn normalize_spaced<'a>(value: &'a str, ws: Ws, buf: &'a mut String) -> &'a str {
     match ws {
         Ws::Preserve => value,
         Ws::Replace => {
@@ -293,6 +300,9 @@ pub(crate) fn check_value<'a>(
             .get(c.bounds as usize)
             .ok_or(UnknownReason::Construct)?;
         match read {
+            // Bounds without a facet (the built-in range of an integer
+            // type was checked above) compare nothing.
+            Read::Number { .. } | Read::Moment { .. } if !b.has_facets() => {}
             Read::Number {
                 mant,
                 scale,
@@ -694,6 +704,7 @@ pub(crate) fn read_duration(v: &str, lex: Lex) -> bool {
 
 /// The octet count of a `hexBinary` lexical form, decoded as the validator
 /// decodes it (`hex`), in chunks: no allocation.
+#[inline(never)]
 pub(crate) fn hex_octets(v: &str) -> Option<usize> {
     let b = v.as_bytes();
     if !b.len().is_multiple_of(2) {
@@ -710,6 +721,7 @@ pub(crate) fn hex_octets(v: &str) -> Option<usize> {
 /// decoded as the validator decodes it (`base64`'s standard engine: padding
 /// required, canonical trailing bits), in chunks of whole quanta: no
 /// allocation. A chunk before the last one with padding answers `None`.
+#[inline(never)]
 pub(crate) fn base64_octets(v: &str) -> Option<usize> {
     use base64::Engine;
     const CHUNK: usize = 1024;
