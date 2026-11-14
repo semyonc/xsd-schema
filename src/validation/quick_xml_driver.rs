@@ -777,7 +777,7 @@ where
             Ok(Event::Decl(_)) => {
                 if let Some(declaration) = xml_reader.declaration() {
                     handler
-                        .on_xml_declaration(declaration)
+                        .on_xml_declaration(&declaration.to_declaration())
                         .map_err(DriveWithError::Hook)?;
                 }
             }

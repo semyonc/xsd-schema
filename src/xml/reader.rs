@@ -575,7 +575,10 @@ struct WfState {
     /// The attributes of the last start tag.
     attrs: Vec<AttrSpan>,
     version: XmlVersion,
-    declaration: Option<XmlDeclaration>,
+    /// The XML declaration, once read: what it says, with its `version` and
+    /// its `encoding` kept one after the other in `decl_text`.
+    declaration: Option<DeclSeen>,
+    decl_text: String,
     /// Where the last event's markup starts, in quick-xml offsets.
     last_start: u64,
     /// The qualified names of the open elements, as written, one after the
@@ -583,6 +586,39 @@ struct WfState {
     /// when the input ends inside it.
     open: Vec<u8>,
     open_at: Vec<usize>,
+}
+
+/// What the reader keeps of the XML declaration (the text is in
+/// [`WfState::decl_text`]).
+#[derive(Debug, Clone, Copy)]
+struct DeclSeen {
+    /// The length of `version` in the text; `encoding` is the rest.
+    version_len: usize,
+    has_encoding: bool,
+    standalone: Option<bool>,
+}
+
+/// The XML declaration of the document being read, borrowed from the reader:
+/// an [`XmlDeclaration`] without its strings.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct XmlDeclRef<'r> {
+    /// The `version` pseudo-attribute, e.g. `"1.0"`.
+    pub(crate) version: &'r str,
+    /// The `encoding` pseudo-attribute, if any, as written.
+    pub(crate) encoding: Option<&'r str>,
+    /// The `standalone` pseudo-attribute, if any.
+    pub(crate) standalone: Option<bool>,
+}
+
+impl XmlDeclRef<'_> {
+    /// The declaration as the public type.
+    pub(crate) fn to_declaration(self) -> XmlDeclaration {
+        XmlDeclaration {
+            version: self.version.to_string(),
+            encoding: self.encoding.map(str::to_string),
+            standalone: self.standalone,
+        }
+    }
 }
 
 /// A [`WfReader`] over input that is in memory as a whole: its events borrow
@@ -807,6 +843,7 @@ impl<B: BufRead, W> WfReader<B, W> {
                 attrs: Vec::new(),
                 version: XmlVersion::V1_0,
                 declaration: None,
+                decl_text: String::new(),
                 last_start: 0,
                 open: Vec::new(),
                 open_at: Vec::new(),
@@ -860,8 +897,14 @@ impl<B: BufRead, W> WfReader<B, W> {
     }
 
     /// The XML declaration, once it has been read.
-    pub(crate) fn declaration(&self) -> Option<&XmlDeclaration> {
-        self.st.declaration.as_ref()
+    pub(crate) fn declaration(&self) -> Option<XmlDeclRef<'_>> {
+        let d = self.st.declaration?;
+        let (version, encoding) = self.st.decl_text.split_at(d.version_len);
+        Some(XmlDeclRef {
+            version,
+            encoding: d.has_encoding.then_some(encoding),
+            standalone: d.standalone,
+        })
     }
 
     /// For a caller decoding the event returned last: its start and the
@@ -1629,15 +1672,24 @@ impl WfState {
                 &format!("unexpected {} in the XML declaration", shown_at(d, s)),
             ));
         }
-        // The grammar is ASCII, so these are UTF-8.
-        let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
-        let declaration = XmlDeclaration {
-            version: text(version),
-            encoding: encoding.map(text),
-            standalone,
+        // The grammar is ASCII, so these are UTF-8. Kept in one buffer, with
+        // no string per pseudo-attribute.
+        self.decl_text.clear();
+        self.decl_text.push_str(&String::from_utf8_lossy(version));
+        let version_len = self.decl_text.len();
+        if let Some(encoding) = encoding {
+            self.decl_text.push_str(&String::from_utf8_lossy(encoding));
+        }
+        self.version = if &self.decl_text[..version_len] == "1.1" {
+            XmlVersion::V1_1
+        } else {
+            XmlVersion::V1_0
         };
-        self.version = declaration.xml_version();
-        self.declaration = Some(declaration);
+        self.declaration = Some(DeclSeen {
+            version_len,
+            has_encoding: encoding.is_some(),
+            standalone,
+        });
         Ok(())
     }
 

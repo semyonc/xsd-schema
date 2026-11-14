@@ -293,10 +293,7 @@ fn run<T: ValueTier>(plan: &PlanRef<'_>, input: &[u8], s: &mut Scratch, tier: &m
         match event {
             Event::Decl(_) => {
                 let d = reader.declaration().ok_or(UnknownReason::Reader)?;
-                let utf8 = d
-                    .encoding
-                    .as_deref()
-                    .is_none_or(|e| e.eq_ignore_ascii_case("UTF-8"));
+                let utf8 = d.encoding.is_none_or(|e| e.eq_ignore_ascii_case("UTF-8"));
                 if d.version != "1.0" || !utf8 {
                     return Err(UnknownReason::Prolog);
                 }

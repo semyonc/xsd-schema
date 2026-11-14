@@ -1709,7 +1709,7 @@ impl<'a> BufferDocumentBuilder<'a> {
                 }
                 Ok(Event::Decl(_)) => {
                     if let Some(declaration) = xml_reader.declaration() {
-                        self.set_xml_declaration(declaration.clone());
+                        self.set_xml_declaration(declaration.to_declaration());
                     }
                 }
                 // Not kept; its keyword is checked at the next read.
