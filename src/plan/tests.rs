@@ -189,14 +189,13 @@ fn string_family_as_shipped() {
     ] {
         assert_eq!(verdicts(&set, &plan, doc), (false, false), "{doc}");
     }
-    // A schema-location hint on the root: in the delegating tier in this
-    // stage, checked as the runtime checks it.
+    // A schema-location hint on the root, checked as the runtime checks it.
     for doc in [
         "<r xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance' xsi:noNamespaceSchemaLocation='x.xsd'><s>x</s></r>",
         "<r xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance' xsi:schemaLocation='urn:a a.xsd urn:b b.xsd'><s>x</s></r>",
         "<r xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance' xsi:schemaLocation=' urn:a\n\ta.xsd '><s>x</s></r>",
     ] {
-        assert_eq!(verdicts(&set, &plan, doc), (false, true), "{doc}");
+        assert_eq!(verdicts(&set, &plan, doc), (true, true), "{doc}");
     }
     for doc in [
         "<r></r>",
@@ -251,24 +250,23 @@ const IDS: &str = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
 </xs:schema>"#;
 
 #[test]
-fn identity_and_defaults_in_the_delegating_tier() {
+fn identity_and_defaults() {
     let set = load(IDS);
     let (plan, report) = build(&set);
     assert!(report.uncovered.is_empty(), "{:?}", report.uncovered);
-    assert_eq!(
-        verdicts(
-            &set,
-            &plan,
-            "<r><i id='a' n='1'/><i id='b' n='2' d='1.50'/><v>x</v></r>"
-        ),
-        (false, true)
-    );
+    for doc in [
+        "<r><i id='a' n='1'/><i id='b' n='2' d='1.50'/><v>x</v></r>",
+        "<r><i id=' a '/><i id='b'/><v/></r>",
+        "<r><i/><v></v></r>",
+    ] {
+        assert_eq!(verdicts(&set, &plan, doc), (true, true), "{doc}");
+    }
     for doc in [
         "<r><i id='a'/><i id='a'/></r>",
+        "<r><i id='a'/><i id=' a'/></r>",
         "<r><i n='1'/><i n='1'/></r>",
         "<r><i id='1a'/></r>",
         "<r><i d='x'/></r>",
-        "<r><i/><v/></r>",
     ] {
         assert!(!verdicts(&set, &plan, doc).1, "{doc}");
     }
@@ -286,7 +284,7 @@ fn unique_compares_normalized_values() {
     assert!(report.uncovered.is_empty(), "{:?}", report.uncovered);
     assert_eq!(
         verdicts(&set, &plan, "<r><i n='a b'/><i n='a  c'/></r>"),
-        (false, true)
+        (true, true)
     );
     assert_eq!(
         verdicts(&set, &plan, "<r><i n='a b'/><i n='a  b'/></r>"),
@@ -907,6 +905,54 @@ fn numbers_dates_and_times_as_shipped() {
         // `24:00:00` of a time is `00:00:00`: anything later is out of range.
         "<r><t>12:00:00</t></r>",
         "<r><t>24:00:00</t><t/></r>",
+    ] {
+        assert!(!verdicts(&set, &plan, doc).0, "{doc}");
+    }
+}
+
+const CONSTRAINTS: &str = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:element name="r">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element name="f" type="xs:decimal" fixed="1.50" minOccurs="0"/>
+        <xs:element name="d" type="xs:date" default="2000-01-01" minOccurs="0"/>
+        <xs:element name="s" minOccurs="0">
+          <xs:complexType>
+            <xs:simpleContent>
+              <xs:extension base="xs:base64Binary">
+                <xs:attribute name="Id" type="xs:ID"/>
+                <xs:attribute name="Algorithm" type="xs:anyURI" fixed="urn:a"/>
+              </xs:extension>
+            </xs:simpleContent>
+          </xs:complexType>
+        </xs:element>
+      </xs:sequence>
+      <xs:attribute name="Id" type="xs:ID"/>
+    </xs:complexType>
+  </xs:element>
+</xs:schema>"#;
+
+#[test]
+fn value_constraints_and_ids_as_shipped() {
+    let set = load(CONSTRAINTS);
+    let (plan, report) = build(&set);
+    assert!(report.uncovered.is_empty(), "{:?}", report.uncovered);
+    for doc in [
+        "<r><f/><d/></r>",
+        "<r><f>1.50</f><d>2001-12-31</d></r>",
+        "<r Id='a'><s Id='b'>QUJD</s></r>",
+        "<r Id='a'><s Id='b' Algorithm='urn:a'>QUJDRA==</s></r>",
+    ] {
+        assert_eq!(verdicts(&set, &plan, doc), (true, true), "{doc}");
+    }
+    for doc in [
+        // Equal values, other lexical forms: the dynamic path accepts them,
+        // the plan compares literals.
+        "<r><f>1.5</f></r>",
+        "<r><f> 1.50 </f></r>",
+        "<r Id='a'><s Id='a'>QUJD</s></r>",
+        "<r><s Algorithm='urn:b'>QUJD</s></r>",
+        "<r><s>QUJD RA==</s></r>",
     ] {
         assert!(!verdicts(&set, &plan, doc).0, "{doc}");
     }

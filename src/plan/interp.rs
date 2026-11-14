@@ -339,14 +339,16 @@ fn start<T: ValueTier>(
         }
     };
     let child = *plan.children.get(child_id as usize).ok_or(Structure)?;
-    if child.flags & (CHILD_UNCOVERED | CHILD_FIXED) != 0 {
-        return Err(Construct);
-    }
-    if (child.flags & CHILD_DEFAULT != 0 || child.unique != NONE) && !tier.delegating() {
+    if child.flags & CHILD_UNCOVERED != 0 {
         return Err(Construct);
     }
     let ty = *plan.types.get(child.ty as usize).ok_or(Construct)?;
     if ty.content == Content::Uncovered {
+        return Err(Construct);
+    }
+    // A value constraint is checked on simple content only (the builder
+    // leaves other declarations with one uncovered).
+    if child.flags & (CHILD_DEFAULT | CHILD_FIXED) != 0 && ty.content != Content::Simple {
         return Err(Construct);
     }
 
@@ -382,9 +384,6 @@ fn start<T: ValueTier>(
         seen |= bit;
         let value = span.value(tag, version).map_err(|_| Reader)?;
         if u.fixed != NONE {
-            if !tier.delegating() {
-                return Err(Construct);
-            }
             let lit = plan.literals.get(u.fixed as usize).ok_or(Construct)?;
             // Equal lexical forms have equal values.
             if plan.span(*lit) != value.as_bytes() {
@@ -426,10 +425,9 @@ fn start<T: ValueTier>(
     Ok(())
 }
 
-/// An `xsi:schemaLocation` or `xsi:noNamespaceSchemaLocation` hint, in the
-/// delegating tier only, and on the root only: there no item of any
-/// namespace has appeared yet, so XSD 1.0's rule against late-arriving
-/// components cannot apply. The value is checked
+/// An `xsi:schemaLocation` or `xsi:noNamespaceSchemaLocation` hint, on the
+/// root only: there no item of any namespace has appeared yet, so XSD 1.0's
+/// rule against late-arriving components cannot apply. The value is checked
 /// as the runtime checks it: `xs:anyURI` tokens, an even number of them for
 /// `schemaLocation`. Every other `xsi:` attribute is not covered.
 fn schema_location_hint<T: ValueTier>(
@@ -441,7 +439,7 @@ fn schema_location_hint<T: ValueTier>(
     tier: &mut T,
 ) -> Step {
     use UnknownReason::*;
-    if !tier.delegating() || !root || plan.hint_check == NONE {
+    if !root || plan.hint_check == NONE {
         return Err(Construct);
     }
     // The runtime splits on Unicode white space; take only values where
@@ -481,13 +479,27 @@ fn end<T: ValueTier>(plan: PlanRef<'_>, s: &mut Scratch, tier: &mut T) -> Step {
             _ => Err(Structure),
         },
         Content::Simple => {
-            let child = plan.children.get(f.child as usize).ok_or(Construct)?;
-            if child.flags & CHILD_DEFAULT != 0 && s.text.is_empty() {
-                // The default would be the value.
-                Err(Value)
+            let child = *plan.children.get(f.child as usize).ok_or(Construct)?;
+            let constraint = child.flags & (CHILD_DEFAULT | CHILD_FIXED) != 0;
+            if constraint && s.text.is_empty() {
+                // An element with no character children takes its value
+                // constraint as its value (cvc-elt.5.1).
+                let lit = plan.literals.get(child.value as usize).ok_or(Construct)?;
+                let lit = std::str::from_utf8(plan.span(*lit)).map_err(|_| Construct)?;
+                run_check(plan, ty.check, lit, s, tier)
             } else {
                 let text = std::mem::take(&mut s.text);
-                let r = run_check(plan, ty.check, &text, s, tier);
+                let r = if child.flags & CHILD_FIXED != 0 {
+                    // Equal lexical forms have equal values (cvc-elt.5.2.2).
+                    let lit = plan.literals.get(child.value as usize).ok_or(Construct)?;
+                    if plan.span(*lit) == text.as_bytes() {
+                        run_check(plan, ty.check, &text, s, tier)
+                    } else {
+                        Err(Value)
+                    }
+                } else {
+                    run_check(plan, ty.check, &text, s, tier)
+                };
                 s.text = text;
                 r
             }
@@ -524,10 +536,6 @@ fn run_check<T: ValueTier>(
             CheckKind::Uncovered => return Err(Construct),
             CheckKind::Any => {}
             CheckKind::Delegate => return fallback(tier),
-            // `xs:ID` uniqueness is the delegating tier's in this stage.
-            CheckKind::Value if c.flags & CHECK_ID != 0 && !tier.delegating() => {
-                return Err(Construct)
-            }
             CheckKind::Value => match check_value(plan, &c, value, &mut s.norm) {
                 Ok(v) => {
                     if c.flags & CHECK_ID != 0 {

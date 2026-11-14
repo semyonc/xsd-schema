@@ -282,6 +282,24 @@ impl<'a> Builder<'a> {
                 NONE
             }
         };
+        if flags & (CHILD_DEFAULT | CHILD_FIXED) != 0 && ty != NONE {
+            // A value constraint is the value of an empty element: checked
+            // like content, on simple content only. An `xs:ID` value would
+            // count at document level for every such element.
+            let tp = self.plan.types[ty as usize];
+            let checkable = tp.content == Content::Simple
+                && self
+                    .plan
+                    .checks
+                    .get(tp.check as usize)
+                    .is_some_and(|c| c.flags & CHECK_ID == 0);
+            if !checkable {
+                self.uncovered(format!(
+                    "element {label}: a value constraint on content the plan does not check"
+                ));
+                flags |= CHILD_UNCOVERED;
+            }
+        }
         self.plan.children[id as usize] = ChildPlan {
             ty,
             flags,
