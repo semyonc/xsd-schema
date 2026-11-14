@@ -2609,14 +2609,17 @@ impl WfState {
                 ),
             ))
         };
-        let prefixed: Vec<&AttrSpan> = self
-            .attrs
-            .iter()
-            .filter(|a| a.kind == AttrKind::Attribute && a.colon.is_some())
-            .collect();
-        if prefixed.len() <= 8 {
-            for (i, a) in prefixed.iter().enumerate() {
-                for b in &prefixed[i + 1..] {
+        // The prefixed attributes, in document order (no list of them is
+        // built: a tag with a few is the common case).
+        let prefixed = || {
+            self.attrs
+                .iter()
+                .filter(|a| a.kind == AttrKind::Attribute && a.colon.is_some())
+        };
+        let count = prefixed().count();
+        if count <= 8 {
+            for (i, a) in prefixed().enumerate() {
+                for b in prefixed().skip(i + 1) {
                     if a.local(c) != b.local(c) {
                         continue;
                     }
@@ -2632,8 +2635,8 @@ impl WfState {
         // Keyed by the expanded name itself, so the work stays linear
         // whatever the names hash to.
         let mut seen: FastMap<(&[u8], &[u8]), &AttrSpan> = FastMap::default();
-        seen.reserve(prefixed.len());
-        for b in prefixed {
+        seen.reserve(count);
+        for b in prefixed() {
             let Some((_, uri)) = resolve(b) else {
                 continue;
             };
