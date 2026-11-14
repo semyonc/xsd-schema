@@ -112,6 +112,64 @@ corpora give the same results.
     subtrahend (`[a-z-[b]c]`) is an invalid pattern, as in the `xsd11` build
     (the `regex` crate read them as a set difference, a union and a union).
   `regex_convert::convert_xml_pattern` writes these forms out the same way.
+- Values that were accepted are now rejected: `xs:integer`,
+  `xs:nonNegativeInteger`, `xs:positiveInteger`, `xs:nonPositiveInteger`,
+  `xs:negativeInteger` and the types restricting them took `_` between or after
+  the digits (`1_000`, `1_`, `10_000_000`, `-1_0`) and read it as the number
+  without it. This affected element and attribute values, `default` and
+  `fixed` values, facet values, the XPath casts and constructor functions to
+  every integer type (`xs:long('1_000')` too), and
+  `TypeConverter::to_integer`. Datatypes 1.1 §3.4.13.1: "a finite-length
+  sequence of one or more decimal digits (#x30-#x39) with an optional leading
+  sign".
+- Values that were accepted are now rejected: an `xs:time`, `xs:dateTime` or
+  `xs:dateTimeStamp` of hour 24 with a fraction of more than 28 digits that are
+  not all zero (`24:00:00.00000000000000000000000000001`). The end of the day
+  is `24:00:00` with zeros only after the point (Datatypes 1.1 §D.2.2,
+  `endOfDayFrag`), however many there are. Valid values whose seconds have
+  more digits than the typed value holds still give the `xs-seconds-capacity`
+  warning.
+- Values that were accepted are now rejected: the XPath casts and constructor
+  functions from `xs:string` or `xs:untypedAtomic` to the numeric types,
+  `xs:boolean`, the date, time and duration types, `xs:hexBinary` and
+  `xs:base64Binary` removed any Unicode white space around the value
+  (U+00A0, U+3000, U+2028, U+0085, …), so `xs:integer` of a no-break space
+  and `1` was 1. Only
+  the XML white space #x20, #x9, #xD, #xA is removed now, as the `collapse`
+  white space normalization says (F&O 1.0 §17.1.1). A cast to `xs:anyURI`
+  keeps such characters in the value instead of dropping them. The same holds
+  for `TypeConverter::to_integer`, `to_decimal` and `to_double`.
+- Values that were accepted are now rejected: `TypeConverter::to_double` read
+  an `xs:untypedAtomic` as Rust's `f64` parser does (`inf`, `infinity`, `nan`
+  in any case); it now reads the `xs:double` lexical space (`INF`, `-INF`,
+  `NaN`, or a numeral). `XPathEvaluator::run_number` gives `NaN` for a string
+  or node result that is not an `xs:double` lexical form, as `fn:number` does
+  (it gave infinity for `inf` and `Infinity`), and 1 and 0 for `true()` and
+  `false()` (it gave `NaN`).
+- `TypeConverter::to_integer` (and `TypeConverter::cast` to `xs:integer`) of an
+  `xs:float` or `xs:double` beyond the range of `i64` gives the exact integral
+  part (`1e20` is 100000000000000000000); it gave ±9223372036854775807.
+- Schemas that were accepted are now rejected: a `length`, `minLength`,
+  `maxLength`, `totalDigits` or `fractionDigits` value with two signs (`++5`)
+  or with white space other than #x20, #x9, #xD, #xA around it.
+  The other way round, `minOccurs` and `maxOccurs` now accept XML white space
+  around the value (`minOccurs=" 1 "`, `maxOccurs=" unbounded "`) and a `+`
+  before a number beyond `u32` (`maxOccurs="+79228162514264337593543950335"`),
+  as `xs:nonNegativeInteger` does; they were schema errors.
+- `vc:minVersion` and `vc:maxVersion` are `xs:decimal` values compared with
+  the processor's version exactly (Structures §4.2.2): they were read as `f64`,
+  so `vc:minVersion="1.1000000000000000001"` kept the element under XSD 1.1.
+  Schemas that were accepted are now rejected under XSD 1.1: a value that is
+  not an `xs:decimal` lexical form (`inf`, `NaN`, `1e0`) is a schema error;
+  under XSD 1.0 such a value is ignored (`inf` and `NaN` excluded the element).
+- An element whose `vc:maxVersion` equals the processor's version is now
+  ignored; it was kept. Structures §4.2.2: "If V is less than the value of
+  vc:minVersion, or if V is greater than or equal to the value of
+  vc:maxVersion, then the element on which the attribute appears is to be
+  ignored". Under XSD 1.1 a declaration marked `vc:maxVersion="1.1"` and its
+  replacement marked `vc:minVersion="1.1"` were both kept, a duplicate
+  declaration; now only the second is. Under XSD 1.0 `vc:maxVersion="1.0"`
+  now removes the element.
 
 ### Performance
 

@@ -17,6 +17,7 @@ use num_bigint::BigInt;
 use rust_decimal::Decimal;
 
 use super::exact_decimal::{parse_decimal_exact, unsigned_zero, DecimalParseError, ExactDecimal};
+use super::facets::{normalize_whitespace, WhitespaceMode};
 #[cfg(feature = "xsd11")]
 use super::sequence::{ItemType, SequenceType};
 use super::validators::{is_valid_xsd_decimal_lexical, ValidationError, ValidatorRegistry};
@@ -192,12 +193,15 @@ impl TypeConverter {
                     })
             }
             XmlValueKind::Atomic(XmlAtomicValue::Boolean(b)) => Ok(if *b { 1.0 } else { 0.0 }),
+            // The `xs:double` lexical space after white space collapse, not
+            // `f64::from_str`'s (which also reads `inf`, `infinity`, `nan`).
             XmlValueKind::UntypedAtomic(s) => {
-                s.trim().parse().map_err(|_| ConversionError::InvalidValue {
-                    value: s.clone(),
-                    target_type: "double",
-                    message: "Not a valid number".to_string(),
-                })
+                super::validators::parse_double(&normalize_whitespace(s, WhitespaceMode::Collapse))
+                    .map_err(|_| ConversionError::InvalidValue {
+                        value: s.clone(),
+                        target_type: "double",
+                        message: "Not a valid number".to_string(),
+                    })
             }
             _ => Err(ConversionError::TypeMismatch {
                 from: value.type_code,
@@ -284,7 +288,8 @@ impl TypeConverter {
                 // notation as of 1.42). Gate explicitly so this API does not
                 // track the crate's parser behaviour for downstream consumers,
                 // which resolve their own `rust_decimal` version.
-                let trimmed = s.trim();
+                let trimmed = normalize_whitespace(s, WhitespaceMode::Collapse);
+                let trimmed = trimmed.as_ref();
                 if !is_valid_xsd_decimal_lexical(trimmed) {
                     return Err(ConversionError::InvalidValue {
                         value: s.clone(),
@@ -349,9 +354,11 @@ impl TypeConverter {
                         message: "Cannot convert NaN or Infinity to integer".to_string(),
                     });
                 }
+                // Every digit of the truncated value (F&O §17.1.3.4: "SV with
+                // the fractional part discarded"), not `as i64`, which
+                // saturates beyond ±2⁶³.
                 let truncated = f.trunc();
-                (truncated as i64)
-                    .to_string()
+                format!("{truncated:.0}")
                     .parse()
                     .map_err(|_| ConversionError::Overflow {
                         value: f.to_string(),
@@ -367,8 +374,7 @@ impl TypeConverter {
                     });
                 }
                 let truncated = d.trunc();
-                (truncated as i64)
-                    .to_string()
+                format!("{truncated:.0}")
                     .parse()
                     .map_err(|_| ConversionError::Overflow {
                         value: d.to_string(),
@@ -378,8 +384,18 @@ impl TypeConverter {
             XmlValueKind::Atomic(XmlAtomicValue::Boolean(b)) => {
                 Ok(if *b { BigInt::from(1) } else { BigInt::from(0) })
             }
+            // The `xs:integer` lexical space after white space collapse, not
+            // `num_bigint`'s (which also reads `1_000`).
             XmlValueKind::UntypedAtomic(s) => {
-                s.trim().parse().map_err(|_| ConversionError::InvalidValue {
+                let lexical = normalize_whitespace(s, WhitespaceMode::Collapse);
+                if !super::validators::is_valid_xsd_integer_lexical(&lexical) {
+                    return Err(ConversionError::InvalidValue {
+                        value: s.clone(),
+                        target_type: "integer",
+                        message: "Not a valid integer".to_string(),
+                    });
+                }
+                lexical.parse().map_err(|_| ConversionError::InvalidValue {
                     value: s.clone(),
                     target_type: "integer",
                     message: "Not a valid integer".to_string(),
@@ -1138,5 +1154,45 @@ mod tests {
         assert_eq!(42i32.into_xml_value().as_integer(), Some(&BigInt::from(42)));
         assert_eq!(2.5f64.into_xml_value().as_double(), Some(2.5));
         assert_eq!("hello".into_xml_value().as_string(), Some("hello"));
+    }
+
+    /// An `xs:untypedAtomic` is read with the XSD lexical space of the target
+    /// after white space collapse (#x20, #x9, #xD, #xA only), not with the
+    /// grammar of `num_bigint`, `rust_decimal` or `f64::from_str`.
+    #[test]
+    fn untyped_values_are_read_with_the_xsd_lexical_spaces() {
+        let tc = TypeConverter::new();
+        let u = |s: &str| XmlValue::untyped(s.to_string());
+        for bad in ["1_000", "1_", "\u{a0}1", "1\u{3000}", "+-1"] {
+            assert!(tc.to_integer(&u(bad)).is_err(), "{bad:?}");
+            assert!(tc.to_decimal(&u(bad)).is_err(), "{bad:?}");
+            assert!(tc.to_double(&u(bad)).is_err(), "{bad:?}");
+        }
+        for bad in ["inf", "-inf", "infinity", "Infinity", "nan", "NAN", "+NaN"] {
+            assert!(tc.to_double(&u(bad)).is_err(), "{bad:?}");
+        }
+        assert_eq!(tc.to_integer(&u(" -12\n")).unwrap(), BigInt::from(-12));
+        assert_eq!(tc.to_decimal(&u("\t.5 ")).unwrap(), Decimal::new(5, 1));
+        assert_eq!(tc.to_double(&u(" 1.5E1 ")).unwrap(), 15.0);
+        assert_eq!(tc.to_double(&u("-INF")).unwrap(), f64::NEG_INFINITY);
+    }
+
+    /// F&O §17.1.3.4: a float or double cast to `xs:integer` is "SV with the
+    /// fractional part discarded" — exactly, beyond the range of `i64` too.
+    #[test]
+    fn float_to_integer_keeps_every_digit() {
+        let tc = TypeConverter::new();
+        let int = |v: XmlValue| tc.to_integer(&v).unwrap().to_string();
+        assert_eq!(int(XmlValue::double(1e20)), "100000000000000000000");
+        assert_eq!(int(XmlValue::double(-1e19)), "-10000000000000000000");
+        assert_eq!(int(XmlValue::double(-2.9)), "-2");
+        assert_eq!(int(XmlValue::double(-0.5)), "0");
+        assert_eq!(int(XmlValue::float(1e20)), "100000002004087734272");
+        assert_eq!(
+            tc.cast(&XmlValue::double(1e20), XmlTypeCode::Integer)
+                .unwrap()
+                .to_string_value(),
+            "100000000000000000000"
+        );
     }
 }

@@ -346,4 +346,19 @@ mod tests {
         assert_eq!(IdentityKind::Key, IdentityKind::Key);
         assert_ne!(IdentityKind::Key, IdentityKind::Keyref);
     }
+
+    /// The integer-valued facets (`length`, `minLength`, `maxLength`,
+    /// `totalDigits`, `fractionDigits`) are `xs:nonNegativeInteger` /
+    /// `xs:positiveInteger` literals after white space collapse: one optional
+    /// sign, then digits — not what `u32::from_str` would take after it.
+    #[test]
+    fn facet_integers_have_the_xsd_lexical_form() {
+        let read = |value: &str| parse_nonneg_integer::<u32>(value, "length");
+        for (value, want) in [("5", 5), ("+5", 5), (" 5\n", 5), ("-0", 0), ("+0", 0), ("007", 7)] {
+            assert_eq!(read(value).ok(), Some(want), "{value:?}");
+        }
+        for bad in ["++5", "+-5", "-5", "5_0", "\u{a0}5", "5\u{3000}", "", "+", "5 5", "0x5"] {
+            assert!(read(bad).is_err(), "{bad:?}");
+        }
+    }
 }

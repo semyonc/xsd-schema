@@ -242,24 +242,23 @@ pub fn parse_boolean(value: &str) -> Result<bool, String> {
 /// `unbounded` — and it is only observable on a document with more than
 /// `u32::MAX` sibling occurrences. Every literal that fits in `u32` is exact.
 pub fn parse_occurs(value: &str) -> Result<Option<u32>, String> {
+    // Both attributes are read after white space collapse (`minOccurs` is an
+    // `xs:nonNegativeInteger`, `maxOccurs` a union of it and the `xs:NMTOKEN`
+    // `unbounded`): only the XML white space #x20, #x9, #xD, #xA goes.
+    let value = value.trim_matches(|c| matches!(c, ' ' | '\t' | '\r' | '\n'));
     if value == "unbounded" {
         Ok(None)
     } else {
         // An `xs:nonNegativeInteger`: zero "may be preceded by a positive
         // ("+") or a negative ("-") sign" (XSD 1.0 §3.3.20.1).
         let value = crate::types::validators::unsigned_lexical(value);
-        match value.parse::<u32>() {
-            Ok(n) => Ok(Some(n)),
-            Err(_) => {
-                // Accept valid non-negative integers that overflow u32:
-                // saturate to the representable maximum (documented above).
-                if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {
-                    Ok(Some(u32::MAX))
-                } else {
-                    Err(format!("Invalid occurrence value: '{}'", value))
-                }
-            }
+        let digits = value.strip_prefix('+').unwrap_or(value);
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(format!("Invalid occurrence value: '{}'", value));
         }
+        // Accept valid non-negative integers that overflow u32: saturate to
+        // the representable maximum (documented above).
+        Ok(Some(digits.parse::<u32>().unwrap_or(u32::MAX)))
     }
 }
 
@@ -323,6 +322,26 @@ mod tests {
         assert_eq!(parse_occurs("-0"), Ok(Some(0)));
         assert_eq!(parse_occurs("-00"), Ok(Some(0)));
         assert_eq!(parse_occurs("+0"), Ok(Some(0)));
+        // Collapsed XML white space; nothing a parser would add beyond
+        // `('+' | '-')? digit+`.
+        assert_eq!(parse_occurs(" 1 "), Ok(Some(1)));
+        assert_eq!(parse_occurs("\t unbounded\n"), Ok(None));
+        assert_eq!(
+            parse_occurs("+79228162514264337593543950335"),
+            Ok(Some(u32::MAX))
+        );
+        for bad in [
+            "++1",
+            "+-0",
+            "1_0",
+            "\u{a0}1",
+            "1\u{3000}",
+            "+",
+            "1 2",
+            "0x1",
+        ] {
+            assert!(parse_occurs(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
