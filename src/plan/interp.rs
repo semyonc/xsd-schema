@@ -11,6 +11,7 @@
 //! declaration naming another version than 1.0 or another encoding than
 //! UTF-8 answer `Unknown`.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 
 use quick_xml::events::{BytesStart, Event};
@@ -98,11 +99,54 @@ struct Frame {
     unique_inst: u32,
 }
 
+/// The character content of the innermost open element so far.
+///
+/// Most values arrive as one piece of the input (one text event that end-of-
+/// line normalization leaves alone): that piece is kept as it is, borrowed.
+/// Only a value of several pieces (text, a reference, text) is joined, in
+/// [`Scratch::text`].
+#[derive(Clone, Copy, Debug)]
+enum Text<'a> {
+    /// No character content yet.
+    None,
+    /// One piece, borrowed from the input.
+    One(&'a str),
+    /// Several pieces, joined in `Scratch::text`.
+    Joined,
+}
+
+impl<'a> Text<'a> {
+    /// Append a piece that lives as long as the input.
+    #[inline]
+    fn push(&mut self, piece: Cow<'a, str>, joined: &mut String) {
+        match (*self, piece) {
+            (Text::None, Cow::Borrowed(p)) => *self = Text::One(p),
+            (_, piece) => self.push_str(&piece, joined),
+        }
+    }
+
+    /// Append a piece of any lifetime.
+    fn push_str(&mut self, piece: &str, joined: &mut String) {
+        match *self {
+            Text::None => joined.clear(),
+            Text::One(first) => {
+                joined.clear();
+                joined.push_str(first);
+            }
+            Text::Joined => {}
+        }
+        joined.push_str(piece);
+        *self = Text::Joined;
+    }
+}
+
 /// Reusable buffers of the interpreter: one per thread or task. A warm
 /// scratch makes no allocation for a document of a shape it has seen.
 #[derive(Debug)]
 pub struct Scratch {
     stack: Vec<Frame>,
+    /// The joined character content of the innermost open element, when it
+    /// came in several pieces ([`Text::Joined`]).
     text: String,
     /// (prefix start, prefix end, namespace id) in `scope_bytes`.
     scope: Vec<(u32, u32, u32)>,
@@ -187,6 +231,8 @@ fn run<T: ValueTier>(plan: &PlanRef<'_>, input: &[u8], s: &mut Scratch, tier: &m
     let limits = ParseLimits::default();
     let mut reader = SliceWfReader::from_slice(input, &limits, false);
     let mut root_seen = false;
+    // The character content of the innermost open element.
+    let mut text = Text::None;
     loop {
         // The one place events come from.
         let event = reader.read_event().map_err(|_| UnknownReason::Reader)?;
@@ -202,18 +248,27 @@ fn run<T: ValueTier>(plan: &PlanRef<'_>, input: &[u8], s: &mut Scratch, tier: &m
                 }
             }
             Event::DocType(_) => return Err(UnknownReason::Prolog),
-            Event::Start(ref e) => start(plan, &reader, e, s, tier, &mut root_seen)?,
+            Event::Start(ref e) => {
+                start(plan, &reader, e, s, tier, &mut root_seen)?;
+                text = Text::None;
+            }
             Event::Empty(ref e) => {
                 start(plan, &reader, e, s, tier, &mut root_seen)?;
-                end(plan, s, tier)?;
+                end(plan, s, tier, Text::None)?;
+                text = Text::None;
             }
-            Event::End(_) => end(plan, s, tier)?,
+            Event::End(_) => {
+                end(plan, s, tier, text)?;
+                text = Text::None;
+            }
             Event::Text(ref t) => {
                 if s.stack.is_empty() {
                     continue; // white space outside the root
                 }
                 match top_content(plan, s) {
-                    Content::Simple => s.text.push_str(&t.xml_content(reader.quick_xml_version())),
+                    Content::Simple => {
+                        text.push(t.xml_content(reader.quick_xml_version()), &mut s.text)
+                    }
                     Content::ElementOnly
                         if t.as_bytes()
                             .iter()
@@ -229,7 +284,7 @@ fn run<T: ValueTier>(plan: &PlanRef<'_>, input: &[u8], s: &mut Scratch, tier: &m
                     return Err(UnknownReason::Construct);
                 }
                 let r = resolve_general_ref(g).map_err(|_| UnknownReason::Reader)?;
-                s.text.push_str(&r);
+                text.push_str(&r, &mut s.text);
             }
             Event::CData(_) => {
                 if !s.stack.is_empty() {
@@ -428,7 +483,6 @@ fn start<T: ValueTier>(
         scope_bytes,
         unique_inst,
     });
-    s.text.clear();
     Ok(())
 }
 
@@ -474,48 +528,65 @@ fn schema_location_hint<T: ValueTier>(
     }
 }
 
-fn end<T: ValueTier>(plan: &PlanRef<'_>, s: &mut Scratch, tier: &mut T) -> Step {
+/// Close the innermost open element, whose character content is `text`.
+fn end<T: ValueTier>(plan: &PlanRef<'_>, s: &mut Scratch, tier: &mut T, text: Text<'_>) -> Step {
     use UnknownReason::*;
     let f = s.stack.pop().ok_or(Structure)?;
     s.scope.truncate(f.scope_len as usize);
     s.scope_bytes.truncate(f.scope_bytes as usize);
     let ty = *plan.types.get(f.ty as usize).ok_or(Construct)?;
-    let out = match ty.content {
+    match ty.content {
         Content::ElementOnly => match plan.states.get(f.state as usize) {
             Some(st) if st.accept => Ok(()),
             _ => Err(Structure),
         },
         Content::Simple => {
             let child = *plan.children.get(f.child as usize).ok_or(Construct)?;
-            let constraint = child.flags & (CHILD_DEFAULT | CHILD_FIXED) != 0;
-            if constraint && s.text.is_empty() {
-                // An element with no character children takes its value
-                // constraint as its value (cvc-elt.5.1).
-                let lit = plan.literals.get(child.value as usize).ok_or(Construct)?;
-                let lit = std::str::from_utf8(plan.span(*lit)).map_err(|_| Construct)?;
-                run_check(plan, ty.check, lit, s, tier)
-            } else {
-                let text = std::mem::take(&mut s.text);
-                let r = if child.flags & CHILD_FIXED != 0 {
-                    // Equal lexical forms have equal values (cvc-elt.5.2.2).
-                    let lit = plan.literals.get(child.value as usize).ok_or(Construct)?;
-                    if plan.span(*lit) == text.as_bytes() {
-                        run_check(plan, ty.check, &text, s, tier)
-                    } else {
-                        Err(Value)
-                    }
-                } else {
-                    run_check(plan, ty.check, &text, s, tier)
-                };
-                s.text = text;
-                r
+            match text {
+                Text::None => simple_value(plan, &child, ty.check, "", s, tier),
+                Text::One(value) => simple_value(plan, &child, ty.check, value, s, tier),
+                Text::Joined => {
+                    let value = std::mem::take(&mut s.text);
+                    let r = simple_value(plan, &child, ty.check, &value, s, tier);
+                    s.text = value;
+                    r
+                }
             }
         }
         Content::Empty => Ok(()),
         Content::Uncovered => Err(Construct),
-    };
-    s.text.clear();
-    out
+    }
+}
+
+/// The value of an element with simple content: its character content
+/// `value`, or its value constraint when it has no character content.
+fn simple_value<T: ValueTier>(
+    plan: &PlanRef<'_>,
+    child: &ChildPlan,
+    check: u32,
+    value: &str,
+    s: &mut Scratch,
+    tier: &mut T,
+) -> Step {
+    use UnknownReason::*;
+    let constraint = child.flags & (CHILD_DEFAULT | CHILD_FIXED) != 0;
+    if constraint && value.is_empty() {
+        // An element with no character children takes its value constraint
+        // as its value (cvc-elt.5.1).
+        let lit = plan.literals.get(child.value as usize).ok_or(Construct)?;
+        let lit = std::str::from_utf8(plan.span(*lit)).map_err(|_| Construct)?;
+        run_check(plan, check, lit, s, tier)
+    } else if child.flags & CHILD_FIXED != 0 {
+        // Equal lexical forms have equal values (cvc-elt.5.2.2).
+        let lit = plan.literals.get(child.value as usize).ok_or(Construct)?;
+        if plan.span(*lit) == value.as_bytes() {
+            run_check(plan, check, value, s, tier)
+        } else {
+            Err(Value)
+        }
+    } else {
+        run_check(plan, check, value, s, tier)
+    }
 }
 
 /// Run the check `id` (and the checks chained to it) on `value`.
