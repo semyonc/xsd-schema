@@ -19,7 +19,8 @@
 //!   declared with type xs:decimal, and their ·actual values· are compared to
 //!   a decimal value representing the version of XSD supported by the
 //!   processor"; their "·initial value· must be locally ·valid· with respect
-//!   to xs:decimal" (Conditional Inclusion Constraints).
+//!   to xs:decimal" (Conditional Inclusion Constraints). An element is kept
+//!   "if vc:minVersion ≤ V < vc:maxVersion".
 //! - F&O 1.0 §17.1.1 (casts from `xs:string` / `xs:untypedAtomic`):
 //!   "Whitespace normalization is applied as indicated by the whiteSpace facet
 //!   for the datatype. The resulting whitespace-normalized string must be a
@@ -393,6 +394,67 @@ fn vc_version_bounds_are_exact_decimals() {
                 "{attr} (1.0): {:?}",
                 other.map(|ss| valid(&ss, "<e>x</e>"))
             )),
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// An element is kept "if vc:minVersion ≤ V < vc:maxVersion": the upper bound
+/// is exclusive, so `vc:maxVersion="1.1"` and `vc:minVersion="1.1"` split the
+/// versions without overlap.
+#[test]
+fn vc_max_version_is_an_exclusive_bound() {
+    let two = r#"<xs:element name="e" type="xs:string" vc:maxVersion="1.1"/>
+                 <xs:element name="e" type="xs:int" vc:minVersion="1.1"/>"#;
+    let mut wrong = Vec::new();
+    // (version, `<e>x</e>` valid: the `xs:string` declaration is the one kept)
+    for (version, string_kept) in [(XsdVersion::V1_0, true), (XsdVersion::V1_1, false)] {
+        match compile(version, two) {
+            Ok(ss) => {
+                if valid(&ss, "<e>x</e>") != string_kept || !valid(&ss, "<e>1</e>") {
+                    wrong.push(format!(
+                        "{version:?}: <e>x</e> {}, <e>1</e> {}",
+                        valid(&ss, "<e>x</e>"),
+                        valid(&ss, "<e>1</e>")
+                    ));
+                }
+            }
+            Err(e) => wrong.push(format!("{version:?}: {e}")),
+        }
+    }
+
+    let body = |attrs: &str| format!(r#"<xs:element name="e" type="xs:string" {attrs}/>"#);
+    for (version, v, below) in [
+        (XsdVersion::V1_0, "1.0", "0.9999999999999999999"),
+        (XsdVersion::V1_1, "1.1", "1.0999999999999999999"),
+    ] {
+        // (attributes, kept)
+        let cases = [
+            (format!(r#"vc:maxVersion="{below}""#), false),
+            (format!(r#"vc:maxVersion="{v}""#), false),
+            (format!(r#"vc:maxVersion="{v}0""#), false),
+            (format!(r#"vc:maxVersion="{v}000000000000000001""#), true),
+            (format!(r#"vc:minVersion="{below}""#), true),
+            (format!(r#"vc:minVersion="{v}""#), true),
+            (format!(r#"vc:minVersion="{v}000000000000000001""#), false),
+            (format!(r#"vc:minVersion="{v}" vc:maxVersion="{v}""#), false),
+            (
+                r#"vc:minVersion="1.0" vc:maxVersion="1.1""#.to_string(),
+                v == "1.0",
+            ),
+            (
+                r#"vc:minVersion="1.1" vc:maxVersion="1.2""#.to_string(),
+                v == "1.1",
+            ),
+        ];
+        for (attrs, kept) in cases {
+            match compile(version, &body(&attrs)) {
+                Ok(ss) if valid(&ss, "<e>x</e>") == kept => {}
+                other => wrong.push(format!(
+                    "{version:?} {attrs}: {:?}",
+                    other.map(|ss| valid(&ss, "<e>x</e>"))
+                )),
+            }
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));

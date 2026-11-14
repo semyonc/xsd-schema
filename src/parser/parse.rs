@@ -1174,9 +1174,15 @@ fn should_skip_for_vc(
                         continue;
                     }
                 };
+                // Structures §4.2.2: "If V is less than the value of
+                // vc:minVersion, or if V is greater than or equal to the value
+                // of vc:maxVersion, then the element on which the attribute
+                // appears is to be ignored" — kept "if vc:minVersion ≤ V <
+                // vc:maxVersion". `minVersionExclusive` and
+                // `maxVersionExclusive` are not in the Recommendation; the
+                // latter now reads like `maxVersion`.
                 match local {
                     "minVersion" => current >= bound,
-                    "maxVersion" => current <= bound,
                     "minVersionExclusive" => current > bound,
                     _ => current < bound,
                 }
@@ -1388,6 +1394,13 @@ mod tests {
             skip("minVersion", "1.0000000000000000001", V1_0),
             Ok(true)
         ));
+        // Kept if vc:minVersion ≤ V < vc:maxVersion: the lower bound is
+        // inclusive, the upper bound is not.
+        assert!(matches!(skip("minVersion", "1.0", V1_0), Ok(false)));
+        assert!(matches!(skip("maxVersion", "1.1", V1_1), Ok(true)));
+        assert!(matches!(skip("maxVersion", " 1.10\n", V1_1), Ok(true)));
+        assert!(matches!(skip("maxVersion", "1.0", V1_0), Ok(true)));
+        assert!(matches!(skip("maxVersion", "1.1", V1_0), Ok(false)));
         for bad in ["inf", "NaN", "1e0", "1_0", "\u{a0}1.0", "", "+"] {
             assert!(skip("minVersion", bad, V1_1).is_err(), "{bad:?}");
             // XSD 1.0: an invalid value is ignored.

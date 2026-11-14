@@ -162,6 +162,14 @@ corpora give the same results.
   Schemas that were accepted are now rejected under XSD 1.1: a value that is
   not an `xs:decimal` lexical form (`inf`, `NaN`, `1e0`) is a schema error;
   under XSD 1.0 such a value is ignored (`inf` and `NaN` excluded the element).
+- An element whose `vc:maxVersion` equals the processor's version is now
+  ignored; it was kept. Structures §4.2.2: "If V is less than the value of
+  vc:minVersion, or if V is greater than or equal to the value of
+  vc:maxVersion, then the element on which the attribute appears is to be
+  ignored". Under XSD 1.1 a declaration marked `vc:maxVersion="1.1"` and its
+  replacement marked `vc:minVersion="1.1"` were both kept, a duplicate
+  declaration; now only the second is. Under XSD 1.0 `vc:maxVersion="1.0"`
+  now removes the element.
 
 ### Performance
 
