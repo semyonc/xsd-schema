@@ -58,7 +58,8 @@ pub(crate) fn is_name_char(c: u32) -> bool {
         || matches!(c, 0x2D | 0x2E | 0x30..=0x39 | 0xB7 | 0x300..=0x36F | 0x203F..=0x2040)
 }
 
-/// Per ASCII byte: bit 0 = `NameStartChar`, bit 1 = `NameChar`.
+/// Per ASCII byte: bit 0 = `NameStartChar`, bit 1 = `NameChar`, bit 2 =
+/// `NameChar` other than the colon.
 const ASCII_NAME: [u8; 128] = {
     let mut t = [0u8; 128];
     let mut i = 0;
@@ -66,7 +67,7 @@ const ASCII_NAME: [u8; 128] = {
         let c = i as u32;
         let start = c == 0x3A || (c >= 0x41 && c <= 0x5A) || c == 0x5F || (c >= 0x61 && c <= 0x7A);
         let name = start || c == 0x2D || c == 0x2E || (c >= 0x30 && c <= 0x39);
-        t[i] = (start as u8) | ((name as u8) << 1);
+        t[i] = (start as u8) | ((name as u8) << 1) | (((name && c != 0x3A) as u8) << 2);
         i += 1;
     }
     t
@@ -125,9 +126,17 @@ pub(crate) fn scan_name(b: &[u8], i: usize) -> Option<NameScan> {
     let len = b.len();
     let first = *b.get(i)?;
     let mut k = i;
+    // The colons are counted as the name is scanned (a colon is one ASCII
+    // byte, and the scan stops at each), not in a second pass over it.
+    let mut colons = 0;
+    let mut first_colon = None;
     if first < 0x80 {
         if ASCII_NAME[first as usize] & 1 == 0 {
             return None;
+        }
+        if first == b':' {
+            colons = 1;
+            first_colon = Some(i);
         }
         k += 1;
     } else {
@@ -137,32 +146,35 @@ pub(crate) fn scan_name(b: &[u8], i: usize) -> Option<NameScan> {
         }
     }
     loop {
-        // ASCII name characters, the common case, in a tight loop.
+        // ASCII name characters other than the colon, the common case, in
+        // a tight loop.
         while k < len {
             let c = b[k];
-            if c >= 0x80 || ASCII_NAME[c as usize] & 2 == 0 {
+            if c >= 0x80 || ASCII_NAME[c as usize] & 4 == 0 {
                 break;
             }
             k += 1;
         }
-        if k < len && b[k] >= 0x80 {
-            if let Some((cp, n)) = decode_at(b, k) {
-                if is_name_char(cp) {
-                    k += n;
-                    continue;
+        if k < len {
+            if b[k] == b':' {
+                if colons == 0 {
+                    first_colon = Some(k);
+                }
+                colons += 1;
+                k += 1;
+                continue;
+            }
+            if b[k] >= 0x80 {
+                if let Some((cp, n)) = decode_at(b, k) {
+                    if is_name_char(cp) {
+                        k += n;
+                        continue;
+                    }
                 }
             }
         }
         break;
     }
-    let name = &b[i..k];
-    let (colons, first_colon) = match name.iter().position(|&c| c == b':') {
-        None => (0, None),
-        Some(p) => (
-            1 + name[p + 1..].iter().filter(|&&c| c == b':').count(),
-            Some(i + p),
-        ),
-    };
     Some(NameScan {
         end: k,
         colons,
@@ -308,6 +320,50 @@ mod tests {
                 first_colon: Some(1)
             }
         );
+    }
+
+    /// The colons a scan reports are those of the name it found: their
+    /// number and the offset of the first, wherever the name starts.
+    #[test]
+    fn scan_name_reports_the_colons_of_the_name() {
+        let pieces: [&[u8]; 12] = [
+            b":",
+            b"a",
+            b"B",
+            b"-",
+            b".",
+            b"7",
+            b"_",
+            b" ",
+            b"=",
+            "é".as_bytes(),
+            "\u{300}".as_bytes(),
+            b"\xFF",
+        ];
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        for _ in 0..20_000 {
+            let mut b = Vec::new();
+            for _ in 0..next(12) {
+                b.extend_from_slice(pieces[next(pieces.len())]);
+            }
+            for i in 0..=b.len() {
+                let Some(found) = scan_name(&b, i) else {
+                    continue;
+                };
+                let name = &b[i..found.end];
+                assert_eq!(found.colons, name.iter().filter(|&&c| c == b':').count());
+                assert_eq!(
+                    found.first_colon,
+                    name.iter().position(|&c| c == b':').map(|p| i + p)
+                );
+            }
+        }
     }
 
     #[test]
