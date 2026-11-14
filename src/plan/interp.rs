@@ -89,14 +89,27 @@ impl ValueTier for Shipped {
     }
 }
 
+/// One open element: what its children, its character content and its end
+/// tag need of its child plan and type plan, read from the tables once, when
+/// it starts.
 #[derive(Clone, Copy, Debug)]
 struct Frame {
-    child: u32,
-    ty: u32,
+    /// What the type allows as content.
+    content: Content,
+    /// The declaration's `CHILD_*` bits.
+    flags: u8,
+    /// The DFA state (element-only content).
     state: u32,
+    /// The value check (simple content).
+    check: u32,
+    /// The declaration's `default` or `fixed` literal.
+    value: u32,
+    /// The declaration's narrow `xs:unique` (`NONE` without one).
+    unique: u32,
+    /// This element's instance of it.
+    unique_inst: u32,
     scope_len: u32,
     scope_bytes: u32,
-    unique_inst: u32,
 }
 
 /// The character content of the innermost open element so far.
@@ -265,7 +278,7 @@ fn run<T: ValueTier>(plan: &PlanRef<'_>, input: &[u8], s: &mut Scratch, tier: &m
                 if s.stack.is_empty() {
                     continue; // white space outside the root
                 }
-                match top_content(plan, s) {
+                match top_content(s) {
                     Content::Simple => {
                         text.push(t.xml_content(reader.quick_xml_version()), &mut s.text)
                     }
@@ -280,7 +293,7 @@ fn run<T: ValueTier>(plan: &PlanRef<'_>, input: &[u8], s: &mut Scratch, tier: &m
                 if s.stack.is_empty() {
                     continue;
                 }
-                if top_content(plan, s) != Content::Simple {
+                if top_content(s) != Content::Simple {
                     return Err(UnknownReason::Construct);
                 }
                 let r = resolve_general_ref(g).map_err(|_| UnknownReason::Reader)?;
@@ -292,7 +305,7 @@ fn run<T: ValueTier>(plan: &PlanRef<'_>, input: &[u8], s: &mut Scratch, tier: &m
                 }
             }
             Event::Comment(_) | Event::PI(_) => {
-                if !s.stack.is_empty() && top_content(plan, s) == Content::Simple {
+                if !s.stack.is_empty() && top_content(s) == Content::Simple {
                     return Err(UnknownReason::Construct);
                 }
             }
@@ -307,11 +320,10 @@ fn run<T: ValueTier>(plan: &PlanRef<'_>, input: &[u8], s: &mut Scratch, tier: &m
     }
 }
 
-fn top_content(plan: &PlanRef<'_>, s: &Scratch) -> Content {
-    s.stack
-        .last()
-        .and_then(|f| plan.types.get(f.ty as usize))
-        .map_or(Content::Uncovered, |t| t.content)
+/// What the innermost open element allows as content.
+#[inline]
+fn top_content(s: &Scratch) -> Content {
+    s.stack.last().map_or(Content::Uncovered, |f| f.content)
 }
 
 fn split_name(name: &[u8]) -> (&[u8], &[u8]) {
@@ -370,13 +382,11 @@ fn start<T: ValueTier>(
             plan.root(name)
         }
         Some(f) => {
-            let pt = plan.types.get(f.ty as usize).ok_or(Construct)?;
-            if pt.content != Content::ElementOnly {
+            if f.content != Content::ElementOnly {
                 return Err(Structure);
             }
-            let pc = plan.children.get(f.child as usize).ok_or(Construct)?;
-            if pc.unique != NONE {
-                let u = plan.uniques.get(pc.unique as usize).ok_or(Construct)?;
+            if f.unique != NONE {
+                let u = plan.uniques.get(f.unique as usize).ok_or(Construct)?;
                 parent_unique = Some((u.attr, f.unique_inst));
             }
             let st = plan.states.get(f.state as usize).ok_or(Construct)?;
@@ -400,11 +410,11 @@ fn start<T: ValueTier>(
             }
         }
     };
-    let child = *plan.children.get(child_id as usize).ok_or(Structure)?;
+    let child = plan.children.get(child_id as usize).ok_or(Structure)?;
     if child.flags & CHILD_UNCOVERED != 0 {
         return Err(Construct);
     }
-    let ty = *plan.types.get(child.ty as usize).ok_or(Construct)?;
+    let ty = plan.types.get(child.ty as usize).ok_or(Construct)?;
     if ty.content == Content::Uncovered {
         return Err(Construct);
     }
@@ -476,12 +486,15 @@ fn start<T: ValueTier>(
         0
     };
     s.stack.push(Frame {
-        child: child_id,
-        ty: child.ty,
+        content: ty.content,
+        flags: child.flags,
         state: ty.start,
+        check: ty.check,
+        value: child.value,
+        unique: child.unique,
+        unique_inst,
         scope_len,
         scope_bytes,
-        unique_inst,
     });
     Ok(())
 }
@@ -534,59 +547,53 @@ fn end<T: ValueTier>(plan: &PlanRef<'_>, s: &mut Scratch, tier: &mut T, text: Te
     let f = s.stack.pop().ok_or(Structure)?;
     s.scope.truncate(f.scope_len as usize);
     s.scope_bytes.truncate(f.scope_bytes as usize);
-    let ty = *plan.types.get(f.ty as usize).ok_or(Construct)?;
-    match ty.content {
+    match f.content {
         Content::ElementOnly => match plan.states.get(f.state as usize) {
             Some(st) if st.accept => Ok(()),
             _ => Err(Structure),
         },
-        Content::Simple => {
-            let child = *plan.children.get(f.child as usize).ok_or(Construct)?;
-            match text {
-                Text::None => simple_value(plan, &child, ty.check, "", s, tier),
-                Text::One(value) => simple_value(plan, &child, ty.check, value, s, tier),
-                Text::Joined => {
-                    let value = std::mem::take(&mut s.text);
-                    let r = simple_value(plan, &child, ty.check, &value, s, tier);
-                    s.text = value;
-                    r
-                }
+        Content::Simple => match text {
+            Text::None => simple_value(plan, &f, "", s, tier),
+            Text::One(value) => simple_value(plan, &f, value, s, tier),
+            Text::Joined => {
+                let value = std::mem::take(&mut s.text);
+                let r = simple_value(plan, &f, &value, s, tier);
+                s.text = value;
+                r
             }
-        }
+        },
         Content::Empty => Ok(()),
         Content::Uncovered => Err(Construct),
     }
 }
 
-/// The value of an element with simple content: its character content
+/// The value of the element `f`, of simple content: its character content
 /// `value`, or its value constraint when it has no character content.
 fn simple_value<T: ValueTier>(
     plan: &PlanRef<'_>,
-    child: &ChildPlan,
-    check: u32,
+    f: &Frame,
     value: &str,
     s: &mut Scratch,
     tier: &mut T,
 ) -> Step {
     use UnknownReason::*;
-    let constraint = child.flags & (CHILD_DEFAULT | CHILD_FIXED) != 0;
-    if constraint && value.is_empty() {
+    let constraint = f.flags & (CHILD_DEFAULT | CHILD_FIXED) != 0;
+    let value = if constraint && value.is_empty() {
         // An element with no character children takes its value constraint
         // as its value (cvc-elt.5.1).
-        let lit = plan.literals.get(child.value as usize).ok_or(Construct)?;
-        let lit = std::str::from_utf8(plan.span(*lit)).map_err(|_| Construct)?;
-        run_check(plan, check, lit, s, tier)
-    } else if child.flags & CHILD_FIXED != 0 {
+        let lit = plan.literals.get(f.value as usize).ok_or(Construct)?;
+        std::str::from_utf8(plan.span(*lit)).map_err(|_| Construct)?
+    } else if f.flags & CHILD_FIXED != 0 {
         // Equal lexical forms have equal values (cvc-elt.5.2.2).
-        let lit = plan.literals.get(child.value as usize).ok_or(Construct)?;
-        if plan.span(*lit) == value.as_bytes() {
-            run_check(plan, check, value, s, tier)
-        } else {
-            Err(Value)
+        let lit = plan.literals.get(f.value as usize).ok_or(Construct)?;
+        if plan.span(*lit) != value.as_bytes() {
+            return Err(Value);
         }
+        value
     } else {
-        run_check(plan, check, value, s, tier)
-    }
+        value
+    };
+    run_check(plan, f.check, value, s, tier)
 }
 
 /// Run the check `id` (and the checks chained to it) on `value`.
