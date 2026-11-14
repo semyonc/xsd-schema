@@ -294,12 +294,13 @@ impl Bounds {
     /// range is not one).
     #[inline]
     pub fn has_facets(&self) -> bool {
-        self.min_incl.set
-            || self.min_excl.set
-            || self.max_incl.set
-            || self.max_excl.set
-            || self.total_digits != NONE
-            || self.fraction_digits != NONE
+        self.has_range() || self.total_digits != NONE || self.fraction_digits != NONE
+    }
+
+    /// Whether a range facet is present.
+    #[inline]
+    pub fn has_range(&self) -> bool {
+        self.min_incl.set || self.min_excl.set || self.max_incl.set || self.max_excl.set
     }
 }
 

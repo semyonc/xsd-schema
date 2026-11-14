@@ -160,7 +160,7 @@ impl<'a> Text<'a> {
 
     /// Append a piece that lives as long as the input; `clean`: it is known
     /// to have no byte up to #x20.
-    #[inline]
+    #[inline(always)]
     fn push(&mut self, piece: Cow<'a, str>, clean: bool, joined: &mut String) {
         match (*self, piece) {
             (Text::None, Cow::Borrowed(p)) => *self = Text::One(p, clean),

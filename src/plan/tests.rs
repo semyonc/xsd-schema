@@ -821,6 +821,51 @@ fn binary_octets_are_the_decoders() {
     assert_eq!(values::hex_octets(&"0a".repeat(1000)), Some(1000));
 }
 
+/// The plan's integer reader gives what the dynamic path's gate gives, for
+/// every literal: the short ones it reads itself and those it leaves to it.
+#[test]
+fn integer_values_are_the_gates() {
+    use crate::validation::simple::integer_lexical_value;
+    let mut r = Rng(0x2545_F491_4F6C_DD1D);
+    let pieces = ["0", "1", "7", "9", "+", "-", "_", " ", ".", "a", "\u{661}"];
+    for _ in 0..300_000 {
+        // Mostly digits, of every length around the 18 the reader takes.
+        let sign = r.pick(&["", "", "+", "-"]);
+        let n = r.next() % 42;
+        let mut s: String = sign.to_string();
+        for _ in 0..n {
+            s.push_str(if r.next().is_multiple_of(16) {
+                r.pick(&pieces)
+            } else {
+                r.pick(&["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"])
+            });
+        }
+        assert_eq!(
+            values::integer_value(&s),
+            integer_lexical_value(&s),
+            "{s:?}"
+        );
+    }
+    for s in [
+        "",
+        "+",
+        "-",
+        "-0",
+        "+0",
+        "000000000000000000",
+        "999999999999999999",
+        "-999999999999999999",
+        "1000000000000000000",
+        "0000000000000000001",
+        "170141183460469231731687303715884105727",
+        "170141183460469231731687303715884105728",
+        "-170141183460469231731687303715884105728",
+        "-170141183460469231731687303715884105729",
+    ] {
+        assert_eq!(values::integer_value(s), integer_lexical_value(s), "{s:?}");
+    }
+}
+
 /// The plan's white-space normalization is the dynamic path's, byte for byte.
 #[test]
 fn normalization_is_the_runtimes() {

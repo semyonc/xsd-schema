@@ -175,7 +175,7 @@ pub(crate) fn check_value<'a>(
             Read::Plain,
         )?,
         Lex::Integer => {
-            let i = integer_lexical_value(v).ok_or(Bad)?;
+            let i = integer_value(v).ok_or(Bad)?;
             let b = plan
                 .bounds
                 .get(c.bounds as usize)
@@ -320,18 +320,21 @@ pub(crate) fn check_value<'a>(
                 {
                     return Err(Bad);
                 }
-                let order = |bound: &Bound| decimal_cmp(mant, scale, bound.mant, bound.scale);
-                in_range(b, order)?;
+                if b.has_range() {
+                    let order = |bound: &Bound| decimal_cmp(mant, scale, bound.mant, bound.scale);
+                    in_range(b, order)?;
+                }
             }
             Read::Moment { whole, frac, tz } => {
-                let any = b.min_incl.set || b.min_excl.set || b.max_incl.set || b.max_excl.set;
-                if any && tz != b.zoned {
-                    return Err(Bad);
+                if b.has_range() {
+                    if tz != b.zoned {
+                        return Err(Bad);
+                    }
+                    let order = |bound: &Bound| {
+                        Some(moment_cmp(whole, frac, bound.mant, plan.span(bound.frac)))
+                    };
+                    in_range(b, order)?;
                 }
-                let order = |bound: &Bound| {
-                    Some(moment_cmp(whole, frac, bound.mant, plan.span(bound.frac)))
-                };
-                in_range(b, order)?;
             }
             _ => return Err(UnknownReason::Construct),
         }
@@ -364,6 +367,32 @@ fn in_range(b: &Bounds, order: impl Fn(&Bound) -> Option<Ordering>) -> Result<()
     } else {
         Err(UnknownReason::Value)
     }
+}
+
+/// The value of an integer literal, as [`integer_lexical_value`] reads it. A
+/// literal of an optional sign and one to eighteen digits is read here (it
+/// is in the lexical space, and its value fits 64 bits); every other one is
+/// left to that function.
+#[inline]
+pub(crate) fn integer_value(v: &str) -> Option<i128> {
+    let b = v.as_bytes();
+    let (negative, digits) = match b.first() {
+        Some(b'-') => (true, &b[1..]),
+        Some(b'+') => (false, &b[1..]),
+        _ => (false, b),
+    };
+    if digits.is_empty() || digits.len() > 18 {
+        return integer_lexical_value(v);
+    }
+    let mut n = 0i64;
+    for &d in digits {
+        let d = d.wrapping_sub(b'0');
+        if d > 9 {
+            return integer_lexical_value(v);
+        }
+        n = n * 10 + i64::from(d);
+    }
+    Some(i128::from(if negative { -n } else { n }))
 }
 
 /// The number of decimal digits of `n`, at least one (`totalDigits` of an
@@ -496,11 +525,17 @@ fn days_in_month(year: u32, month: u32) -> u32 {
 
 /// `YYYY-MM-DD` with a four-digit year from 0001: (year, month, day), rest.
 fn read_ymd(s: &[u8]) -> Option<(u32, u32, u32, &[u8])> {
-    let (y, s) = digits(s, 4)?;
-    let s = s.strip_prefix(b"-")?;
-    let (m, s) = digits(s, 2)?;
-    let s = s.strip_prefix(b"-")?;
-    let (d, s) = digits(s, 2)?;
+    // The ten bytes at once: four digits, `-`, two digits, `-`, two digits.
+    let (&[y0, y1, y2, y3, b'-', m0, m1, b'-', d0, d1], s) = s.split_first_chunk::<10>()? else {
+        return None;
+    };
+    let digit = |b: u8| {
+        let d = b.wrapping_sub(b'0');
+        (d <= 9).then_some(u32::from(d))
+    };
+    let y = digit(y0)? * 1000 + digit(y1)? * 100 + digit(y2)? * 10 + digit(y3)?;
+    let m = digit(m0)? * 10 + digit(m1)?;
+    let d = digit(d0)? * 10 + digit(d1)?;
     if y == 0 || !(1..=12).contains(&m) || d == 0 || d > days_in_month(y, m) {
         return None;
     }
