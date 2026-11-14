@@ -442,7 +442,8 @@ impl<'a> Builder<'a> {
         match determine_content_type(set, ct) {
             ContentType::Empty => self.plan.types[id as usize].content = Content::Empty,
             ContentType::TextOnly => {
-                // Simple content: its value check (delegated in this stage).
+                // Simple content: the check of its value (for a type with
+                // simple content, a chain of checks: `simple_content_check`).
                 let check = self.check(tk);
                 let t = &mut self.plan.types[id as usize];
                 t.content = Content::Simple;
