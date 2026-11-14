@@ -463,6 +463,24 @@ impl AttrSpan {
         &tag[self.value.0..self.value.1]
     }
 
+    /// [`value`](Self::value) of a tag that is text already (quick-xml hands
+    /// a start tag out as `str`): a value that needs no normalization is cut
+    /// out of it, with no second look at its bytes.
+    #[cfg(feature = "plan")]
+    #[inline]
+    pub(crate) fn value_in<'t>(
+        &self,
+        tag: &'t str,
+        version: quick_xml::XmlVersion,
+    ) -> Result<Cow<'t, str>, quick_xml::Error> {
+        match tag.get(self.value.0..self.value.1) {
+            Some(raw) if !self.needs_normalization => Ok(Cow::Borrowed(raw)),
+            // Normalization; or offsets that are no character boundaries
+            // (not reached: a value lies between two quotes).
+            _ => self.value(tag.as_bytes(), version),
+        }
+    }
+
     /// The normalized value (XML 1.0 / 1.1 §3.3.3), as quick-xml's
     /// `Attribute::normalized_value` gives it for `version` (the reader's
     /// [`quick_xml_version`](WfReader::quick_xml_version)). The value was
@@ -585,6 +603,12 @@ struct WfState {
     scope: Scope,
     /// The attributes of the last start tag.
     attrs: Vec<AttrSpan>,
+    /// Of the last start tag: the offset of the colon in its name, if it is
+    /// prefixed, and how many namespace declarations it has.
+    #[cfg(feature = "plan")]
+    name_colon: Option<usize>,
+    #[cfg(feature = "plan")]
+    declarations: usize,
     version: XmlVersion,
     /// The XML declaration, once read: what it says, with its `version` and
     /// its `encoding` kept one after the other in `decl_text`.
@@ -887,6 +911,10 @@ impl<B: BufRead, W> WfReader<B, W> {
                 run: None,
                 scope,
                 attrs,
+                #[cfg(feature = "plan")]
+                name_colon: None,
+                #[cfg(feature = "plan")]
+                declarations: 0,
                 version: XmlVersion::V1_0,
                 declaration: None,
                 decl_text,
@@ -942,6 +970,21 @@ impl<B: BufRead, W> WfReader<B, W> {
     /// bytes), in document order.
     pub(crate) fn attributes(&self) -> &[AttrSpan] {
         &self.st.attrs
+    }
+
+    /// The offset of the colon in the name of the start tag returned last
+    /// (into its bytes), when the name has a prefix: the name was scanned
+    /// and is a qualified name.
+    #[cfg(feature = "plan")]
+    pub(crate) fn name_colon(&self) -> Option<usize> {
+        self.st.name_colon
+    }
+
+    /// How many of [`attributes`](Self::attributes) are namespace
+    /// declarations.
+    #[cfg(feature = "plan")]
+    pub(crate) fn namespace_declarations(&self) -> usize {
+        self.st.declarations
     }
 
     /// The byte offset into the input (a leading BOM included) up to which
@@ -2307,6 +2350,11 @@ impl WfState {
 
         if self.attrs.len() >= 2 {
             self.check_unique_att_spec(c, base)?;
+        }
+        #[cfg(feature = "plan")]
+        {
+            self.name_colon = name.first_colon;
+            self.declarations = declarations;
         }
         let depth = self.depth + 1;
         if declarations > 0 {

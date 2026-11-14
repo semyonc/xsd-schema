@@ -381,13 +381,6 @@ fn top_content(s: &Scratch) -> Content {
     s.stack.last().map_or(Content::Uncovered, |f| f.content)
 }
 
-fn split_name(name: &[u8]) -> (&[u8], &[u8]) {
-    match name.iter().position(|&b| b == b':') {
-        Some(i) => (&name[..i], &name[i + 1..]),
-        None => (&[], name),
-    }
-}
-
 /// Open an element. The common tag has no attribute and no namespace
 /// declaration: what only the others need is out of line
 /// ([`declare_namespaces`], [`attributes`], and [`root_child`] for the
@@ -401,18 +394,25 @@ fn start<T: ValueTier>(
     root_seen: &mut bool,
 ) -> Step {
     use UnknownReason::*;
-    let tag = e.as_bytes();
+    let tag: &str = e;
     let spans = reader.attributes();
     let scope_len = s.scope.len() as u32;
     let scope_bytes = s.scope_bytes.len() as u32;
 
     // 1. Namespace declarations.
-    if !spans.is_empty() {
+    if reader.namespace_declarations() != 0 {
         declare_namespaces(plan, reader, tag, spans, s)?;
     }
 
-    // 2. The element's name.
-    let (prefix, local) = split_name(e.name().0.as_bytes());
+    // 2. The element's name, split where the reader found its colon.
+    let name = e.name().0.as_bytes();
+    let (prefix, local) = match reader.name_colon() {
+        Some(colon) => (
+            name.get(..colon).ok_or(Reader)?,
+            name.get(colon + 1..).ok_or(Reader)?,
+        ),
+        None => (&[][..], name),
+    };
     let ns = s.resolve(prefix).ok_or(Construct)?;
 
     // 3. Its child plan: a global element at the root, else the parent's
@@ -518,15 +518,15 @@ fn start<T: ValueTier>(
 fn declare_namespaces(
     plan: &PlanRef<'_>,
     reader: &SliceWfReader<'_>,
-    tag: &[u8],
+    tag: &str,
     spans: &[AttrSpan],
     s: &mut Scratch,
 ) -> Step {
     let version = reader.quick_xml_version();
     for span in spans.iter().filter(|a| a.kind != AttrKind::Attribute) {
-        let prefix = span.prefix(tag);
+        let prefix = span.prefix(tag.as_bytes());
         let uri = span
-            .value(tag, version)
+            .value_in(tag, version)
             .map_err(|_| UnknownReason::Reader)?;
         let ns = if uri.as_bytes() == XSI_NAMESPACE {
             XSI_NS
@@ -567,7 +567,7 @@ fn root_child(
 fn attributes<T: ValueTier>(
     plan: &PlanRef<'_>,
     reader: &SliceWfReader<'_>,
-    tag: &[u8],
+    tag: &str,
     spans: &[AttrSpan],
     uses: &[AttrUse],
     required: u64,
@@ -579,19 +579,19 @@ fn attributes<T: ValueTier>(
     let version = reader.quick_xml_version();
     let mut seen = 0u64;
     for span in spans.iter().filter(|a| a.kind == AttrKind::Attribute) {
-        let prefix = span.prefix(tag);
+        let prefix = span.prefix(tag.as_bytes());
         let ans = if prefix.is_empty() {
             0
         } else {
             s.resolve(prefix).ok_or(Construct)?
         };
         if ans == XSI_NS {
-            let value = span.value(tag, version).map_err(|_| Reader)?;
+            let value = span.value_in(tag, version).map_err(|_| Reader)?;
             let root = s.stack.is_empty();
-            schema_location_hint(plan, span.local(tag), &value, root, s, tier)?;
+            schema_location_hint(plan, span.local(tag.as_bytes()), &value, root, s, tier)?;
             continue;
         }
-        let alocal = span.local(tag);
+        let alocal = span.local(tag.as_bytes());
         let u = uses
             .iter()
             .find(|u| plan.name_is(u.name, ans, alocal))
@@ -602,7 +602,7 @@ fn attributes<T: ValueTier>(
             return Err(Structure);
         }
         seen |= bit;
-        let value = span.value(tag, version).map_err(|_| Reader)?;
+        let value = span.value_in(tag, version).map_err(|_| Reader)?;
         if u.fixed != NONE {
             let lit = plan.literals.get(u.fixed as usize).ok_or(Construct)?;
             // Equal lexical forms have equal values.
