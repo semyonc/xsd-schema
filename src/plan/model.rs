@@ -132,29 +132,97 @@ pub enum CheckKind {
     Uncovered,
     /// Every value is valid (`xs:string` with no facets).
     Any,
-    /// The string family: white space, length, enumeration, patterns.
-    Str,
+    /// The plan's own check: white space, the lexical form of [`CheckPlan::lex`]
+    /// and the facets the check carries.
+    Value,
     /// Not covered by the plan itself; only the harness's delegating tier
     /// checks it (on the dynamic validator's own function).
     Delegate,
-    /// `xs:ID`: the delegating tier checks the value, the interpreter its
-    /// uniqueness in the document.
-    Id,
 }
+
+/// The lexical space a [`CheckKind::Value`] check reads its value in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Lex {
+    /// The string family and `xs:anyURI`: every normalized value.
+    String,
+    /// `xs:Name`.
+    Name,
+    /// `xs:NCName` and `xs:ID`.
+    NCName,
+    /// `xs:NMTOKEN`.
+    NmToken,
+    /// `xs:language`.
+    Language,
+    /// The integer hierarchy (bounds in [`Bounds`]).
+    Integer,
+    /// `xs:decimal` (bounds in [`Bounds`]).
+    Decimal,
+    /// `xs:boolean`.
+    Boolean,
+    /// `xs:float`.
+    Float,
+    /// `xs:double`.
+    Double,
+    /// `xs:dateTime` (bounds in [`Bounds`]).
+    DateTime,
+    /// `xs:date` (bounds in [`Bounds`]).
+    Date,
+    /// `xs:time` (bounds in [`Bounds`]).
+    Time,
+    /// `xs:gYearMonth`.
+    GYearMonth,
+    /// `xs:gYear`.
+    GYear,
+    /// `xs:gMonthDay`.
+    GMonthDay,
+    /// `xs:gDay`.
+    GDay,
+    /// `xs:gMonth`.
+    GMonth,
+    /// `xs:duration`.
+    Duration,
+    /// `xs:yearMonthDuration`.
+    YearMonthDuration,
+    /// `xs:dayTimeDuration`.
+    DayTimeDuration,
+    /// `xs:hexBinary` (lengths in octets).
+    HexBinary,
+    /// `xs:base64Binary` (lengths in octets).
+    Base64Binary,
+}
+
+/// [`CheckPlan::flags`]: the value is an `xs:ID`, unique in the document.
+pub const CHECK_ID: u8 = 1;
+/// [`CheckPlan::flags`]: the dynamic path matches the patterns against the
+/// value as written, so a value its white space would change answers
+/// `Unknown` when the check has patterns.
+pub const CHECK_RAW_PATTERNS: u8 = 2;
+/// [`CheckPlan::flags`]: XSD 1.0 lexical rules (no `+INF`).
+pub const CHECK_XSD10: u8 = 4;
+/// [`CheckPlan::flags`]: a time zone is required (`explicitTimezone`).
+pub const CHECK_TZ_REQUIRED: u8 = 8;
+/// [`CheckPlan::flags`]: a time zone is prohibited (`explicitTimezone`).
+pub const CHECK_TZ_PROHIBITED: u8 = 16;
 
 /// One value check.
 #[derive(Clone, Copy, Debug)]
 pub struct CheckPlan {
     /// What it does.
     pub kind: CheckKind,
-    /// White space (`Str`).
+    /// The lexical space (`Value`).
+    pub lex: Lex,
+    /// White space, applied before everything else (`Value`).
     pub ws: Ws,
-    /// Minimum length in characters (`Str`).
+    /// `CHECK_*` bits.
+    pub flags: u8,
+    /// Minimum length, in characters or (binary) octets (`Value`).
     pub min_len: u32,
-    /// Maximum length in characters (`Str`; `NONE` for no bound).
+    /// Maximum length (`Value`; `NONE` for no bound).
     pub max_len: u32,
     /// The enumeration: `enum_literals[enum_start..enum_end]`, literal ids
-    /// sorted by their bytes; `enum_start == NONE` for no enumeration.
+    /// sorted by their bytes; `enum_start == NONE` for no enumeration. A
+    /// value is compared with the literals as written.
     pub enum_start: u32,
     /// See `enum_start`.
     pub enum_end: u32,
@@ -162,8 +230,63 @@ pub struct CheckPlan {
     pub pat_start: u32,
     /// See `pat_start`.
     pub pat_end: u32,
+    /// The bounds and digit facets: `bounds[bounds]` (`NONE` without).
+    pub bounds: u32,
+    /// A further check the same value must pass (`NONE` without): the
+    /// layers of simple content.
+    pub next: u32,
     /// The delegating tier's index for this check (`NONE` without one).
     pub delegate: u32,
+}
+
+/// A bound of a range facet: a decimal `mant / 10^scale` (numbers), or a
+/// position on the time line, whole seconds `mant` and the fraction digits
+/// `frac` (dates and times).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Bound {
+    /// Whether the facet is present.
+    pub set: bool,
+    /// The mantissa, or the whole seconds.
+    pub mant: i128,
+    /// The scale (numbers).
+    pub scale: u32,
+    /// The fraction digits, no trailing zero (dates and times).
+    pub frac: Span,
+}
+
+impl Bound {
+    /// No bound.
+    pub const NONE: Bound = Bound {
+        set: false,
+        mant: 0,
+        scale: 0,
+        frac: Span { start: 0, len: 0 },
+    };
+}
+
+/// The range and digit facets of a check, with the built-in range of an
+/// integer type.
+#[derive(Clone, Copy, Debug)]
+pub struct Bounds {
+    /// `minInclusive`.
+    pub min_incl: Bound,
+    /// `minExclusive`.
+    pub min_excl: Bound,
+    /// `maxInclusive`.
+    pub max_incl: Bound,
+    /// `maxExclusive`.
+    pub max_excl: Bound,
+    /// The built-in range of an integer type, inclusive.
+    pub int_lo: i128,
+    /// See `int_lo`.
+    pub int_hi: i128,
+    /// `totalDigits` (`NONE` without).
+    pub total_digits: u32,
+    /// `fractionDigits` (`NONE` without).
+    pub fraction_digits: u32,
+    /// Dates and times: whether the bounds have a time zone. A value whose
+    /// time zone presence differs from its bounds' answers `Unknown`.
+    pub zoned: bool,
 }
 
 /// One pattern step (a restriction step's patterns, joined): a value must be
@@ -223,7 +346,7 @@ pub struct NameEntry {
 }
 
 /// A byte string of the blob: `bytes[start..start + len]`.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Span {
     /// Start offset.
     pub start: u32,
@@ -265,6 +388,8 @@ pub struct PlanData {
     pub uniques: Vec<UniquePlan>,
     /// Value checks.
     pub checks: Vec<CheckPlan>,
+    /// Range and digit facets of the value checks.
+    pub bounds: Vec<Bounds>,
     /// Literal ids of enumerations.
     pub enum_literals: Vec<u32>,
     /// Literals (enumeration values, `default` and `fixed` values).
@@ -316,6 +441,8 @@ pub struct PlanRef<'a> {
     pub uniques: &'a [UniquePlan],
     /// See [`PlanData::checks`].
     pub checks: &'a [CheckPlan],
+    /// See [`PlanData::bounds`].
+    pub bounds: &'a [Bounds],
     /// See [`PlanData::enum_literals`].
     pub enum_literals: &'a [u32],
     /// See [`PlanData::literals`].
@@ -351,6 +478,7 @@ impl PlanData {
             attrs: &self.attrs,
             uniques: &self.uniques,
             checks: &self.checks,
+            bounds: &self.bounds,
             enum_literals: &self.enum_literals,
             literals: &self.literals,
             pattern_steps: &self.pattern_steps,
@@ -409,6 +537,18 @@ impl<'a> PlanRef<'a> {
             i = (i + 1) & mask;
         }
         NONE
+    }
+
+    /// Whether the name `id` is (`ns`, `local`).
+    #[inline]
+    pub fn name_is(&self, id: u32, ns: u32, local: &[u8]) -> bool {
+        self.names.get(id as usize).is_some_and(|n| {
+            n.ns == ns
+                && self.span(Span {
+                    start: n.start,
+                    len: n.len,
+                }) == local
+        })
     }
 
     /// The namespace id of a URI (`""` is 0), or `UNKNOWN_NS`.

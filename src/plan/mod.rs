@@ -15,6 +15,7 @@
 
 mod interp;
 pub mod model;
+mod values;
 
 #[cfg(feature = "codegen")]
 pub mod alphabet;

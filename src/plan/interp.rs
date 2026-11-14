@@ -20,6 +20,7 @@ use crate::xml::ParseLimits;
 use crate::xml_entity::resolve_general_ref;
 
 use super::model::*;
+use super::values::{check_value, is_xml_space, normalize};
 
 const XSI_NAMESPACE: &[u8] = b"http://www.w3.org/2001/XMLSchema-instance";
 
@@ -54,12 +55,12 @@ pub enum UnknownReason {
 
 /// The value tier behind the plan's own checks.
 ///
-/// The shipped tier ([`Shipped`]) has none: an uncovered value check answers
-/// `Unknown`. The harness's delegating tier (feature `codegen`) asks the
-/// dynamic validator's own function instead, and runs the narrow forms of
-/// `xs:ID`, `xs:unique`, element `default` and attribute `fixed`, so the
-/// differential tests names, content models, attributes and patterns on real
-/// documents. A plan without a `SchemaSet` has only the shipped tier.
+/// The shipped tier ([`Shipped`]) has none: a value check the plan does not
+/// cover, or a value its check does not accept, answers `Unknown`. The
+/// harness's delegating tier (feature `codegen`) asks the dynamic validator's
+/// own function instead, so the differential also tests names, content
+/// models and attributes where a value the plan leaves out occurs. A plan
+/// without a `SchemaSet` has only the shipped tier.
 pub trait ValueTier {
     /// Whether the delegating tier is on.
     fn delegating(&self) -> bool;
@@ -290,13 +291,9 @@ fn start<T: ValueTier>(
     // 2. The element's name.
     let (prefix, local) = split_name(e.name().0.as_bytes());
     let ns = s.resolve(prefix).ok_or(Construct)?;
-    let name = plan.lookup(ns, local);
-    if name == NONE {
-        return Err(Construct);
-    }
 
     // 3. Its child plan: a global element at the root, else the parent's
-    //    transition.
+    //    transition, found by comparing the name with the transitions'.
     let mut parent_unique = None;
     let child_id = match s.stack.last_mut() {
         None => {
@@ -304,6 +301,10 @@ fn start<T: ValueTier>(
                 return Err(Structure);
             }
             *root_seen = true;
+            let name = plan.lookup(ns, local);
+            if name == NONE {
+                return Err(Construct);
+            }
             plan.root(name)
         }
         Some(f) => {
@@ -321,7 +322,14 @@ fn start<T: ValueTier>(
                 .transitions
                 .get(st.t_start as usize..st.t_end as usize)
                 .ok_or(Construct)?;
-            match ts.iter().find(|t| t.name == name) {
+            // A few transitions: compare names; many: one hashed lookup.
+            let found = if ts.len() <= 4 {
+                ts.iter().find(|t| plan.name_is(t.name, ns, local))
+            } else {
+                let name = plan.lookup(ns, local);
+                ts.iter().find(|t| name != NONE && t.name == name)
+            };
+            match found {
                 Some(t) => {
                     f.state = t.next;
                     t.child
@@ -357,14 +365,16 @@ fn start<T: ValueTier>(
         };
         if ans == XSI_NS {
             let value = span.value(tag, version).map_err(|_| Reader)?;
-            schema_location_hint(plan, span.local(tag), &value, s.stack.is_empty(), tier)?;
+            let root = s.stack.is_empty();
+            schema_location_hint(plan, span.local(tag), &value, root, s, tier)?;
             continue;
         }
-        let aname = plan.lookup(ans, span.local(tag));
+        let alocal = span.local(tag);
         let u = uses
             .iter()
-            .find(|u| aname != NONE && u.name == aname)
+            .find(|u| plan.name_is(u.name, ans, alocal))
             .ok_or(Construct)?;
+        let aname = u.name;
         let bit = 1u64 << u.bit;
         if seen & bit != 0 {
             return Err(Structure);
@@ -387,8 +397,8 @@ fn start<T: ValueTier>(
                 // The builder admits only fields whose value is the
                 // normalized literal.
                 let ws = plan.checks.get(u.check as usize).ok_or(Construct)?.ws;
-                normalize_into(&value, ws, &mut s.norm);
-                let h = s.hasher.hash_one(s.norm.as_bytes());
+                let v = normalize(&value, ws, &mut s.norm);
+                let h = s.hasher.hash_one(v.as_bytes());
                 if !s.uniques.insert((inst, h)) {
                     return Err(Value);
                 }
@@ -419,14 +429,15 @@ fn start<T: ValueTier>(
 /// An `xsi:schemaLocation` or `xsi:noNamespaceSchemaLocation` hint, in the
 /// delegating tier only, and on the root only: there no item of any
 /// namespace has appeared yet, so XSD 1.0's rule against late-arriving
-/// components cannot apply. The value is checked as the runtime checks it:
-/// `xs:anyURI` tokens, an even number of them for `schemaLocation`. Every
-/// other `xsi:` attribute is not covered.
+/// components cannot apply. The value is checked
+/// as the runtime checks it: `xs:anyURI` tokens, an even number of them for
+/// `schemaLocation`. Every other `xsi:` attribute is not covered.
 fn schema_location_hint<T: ValueTier>(
     plan: PlanRef<'_>,
     local: &[u8],
     value: &str,
     root: bool,
+    s: &mut Scratch,
     tier: &mut T,
 ) -> Step {
     use UnknownReason::*;
@@ -441,21 +452,19 @@ fn schema_location_hint<T: ValueTier>(
     {
         return Err(Value);
     }
-    let delegate = plan
-        .checks
-        .get(plan.hint_check as usize)
-        .ok_or(Construct)?
-        .delegate;
     match local {
         b"schemaLocation" => {
-            let tokens: Vec<&str> = value.split_ascii_whitespace().collect();
-            if !tokens.len().is_multiple_of(2) || !tokens.iter().all(|t| tier.value(delegate, t)) {
+            let mut n = 0usize;
+            for t in value.split_ascii_whitespace() {
+                run_check(plan, plan.hint_check, t, s, tier)?;
+                n += 1;
+            }
+            if !n.is_multiple_of(2) {
                 return Err(Value);
             }
             Ok(())
         }
-        b"noNamespaceSchemaLocation" if tier.value(delegate, value) => Ok(()),
-        b"noNamespaceSchemaLocation" => Err(Value),
+        b"noNamespaceSchemaLocation" => run_check(plan, plan.hint_check, value, s, tier),
         _ => Err(Construct),
     }
 }
@@ -490,55 +499,7 @@ fn end<T: ValueTier>(plan: PlanRef<'_>, s: &mut Scratch, tier: &mut T) -> Step {
     out
 }
 
-/// `value` normalized as `ws` says (Datatypes §4.3.6), into `out`.
-fn normalize_into(value: &str, ws: Ws, out: &mut String) {
-    out.clear();
-    match ws {
-        Ws::Preserve => out.push_str(value),
-        Ws::Replace => out.extend(value.chars().map(|c| {
-            if matches!(c, '\t' | '\n' | '\r') {
-                ' '
-            } else {
-                c
-            }
-        })),
-        Ws::Collapse => {
-            for (i, t) in value
-                .split(|c: char| c.is_ascii() && is_xml_space(c as u8))
-                .filter(|t| !t.is_empty())
-                .enumerate()
-            {
-                if i > 0 {
-                    out.push(' ');
-                }
-                out.push_str(t);
-            }
-        }
-    }
-}
-
-fn is_xml_space(b: u8) -> bool {
-    matches!(b, b' ' | b'\t' | b'\n' | b'\r')
-}
-
-/// The value as the check's white space leaves it, when that needs no real
-/// normalization.
-fn normalized(value: &str, ws: Ws) -> Option<&str> {
-    match ws {
-        Ws::Preserve => Some(value),
-        Ws::Replace => {
-            (!value.bytes().any(|b| matches!(b, b'\t' | b'\n' | b'\r'))).then_some(value)
-        }
-        Ws::Collapse => {
-            let t = value.trim_matches(|c: char| c.is_ascii() && is_xml_space(c as u8));
-            let b = t.as_bytes();
-            let clean = !b.iter().any(|&c| matches!(c, b'\t' | b'\n' | b'\r'))
-                && !b.windows(2).any(|w| w == b"  ");
-            clean.then_some(t)
-        }
-    }
-}
-
+/// Run the check `id` (and the checks chained to it) on `value`.
 fn run_check<T: ValueTier>(
     plan: PlanRef<'_>,
     id: u32,
@@ -547,79 +508,56 @@ fn run_check<T: ValueTier>(
     tier: &mut T,
 ) -> Step {
     use UnknownReason::*;
-    let c = *plan.checks.get(id as usize).ok_or(Construct)?;
-    // What the delegating tier says where the plan cannot decide.
+    let head = *plan.checks.get(id as usize).ok_or(Construct)?;
+    // What the delegating tier says where the plan does not decide: about
+    // the whole value, for the head check's type.
     let fallback = |tier: &mut T| {
-        if tier.delegating() && c.delegate != NONE && tier.value(c.delegate, value) {
+        if tier.delegating() && head.delegate != NONE && tier.value(head.delegate, value) {
             Ok(())
         } else {
             Err(Value)
         }
     };
-    match c.kind {
-        CheckKind::Uncovered => Err(Construct),
-        CheckKind::Any => Ok(()),
-        CheckKind::Delegate => fallback(tier),
-        CheckKind::Id => {
-            if !tier.delegating() {
-                return Err(Construct);
+    let mut c = head;
+    loop {
+        match c.kind {
+            CheckKind::Uncovered => return Err(Construct),
+            CheckKind::Any => {}
+            CheckKind::Delegate => return fallback(tier),
+            // `xs:ID` uniqueness is the delegating tier's in this stage.
+            CheckKind::Value if c.flags & CHECK_ID != 0 && !tier.delegating() => {
+                return Err(Construct)
             }
-            fallback(tier)?;
-            let v = value.trim_matches(|c: char| c.is_ascii() && is_xml_space(c as u8));
-            let h = s.hasher.hash_one(v.as_bytes());
-            if s.ids.insert(h) {
-                Ok(())
-            } else {
-                Err(Value)
-            }
-        }
-        CheckKind::Str => {
-            let Some(v) = normalized(value, c.ws) else {
-                return fallback(tier);
-            };
-            if c.min_len != 0 || c.max_len != NONE {
-                let n = v.chars().count() as u64;
-                if n < u64::from(c.min_len) || (c.max_len != NONE && n > u64::from(c.max_len)) {
-                    return Err(Value);
-                }
-            }
-            if c.enum_start != NONE {
-                let lits = plan
-                    .enum_literals
-                    .get(c.enum_start as usize..c.enum_end as usize)
-                    .ok_or(Construct)?;
-                let found = lits
-                    .binary_search_by(|&l| {
-                        let span = plan.literals.get(l as usize).copied();
-                        span.map_or(&[][..], |sp| plan.span(sp)).cmp(v.as_bytes())
-                    })
-                    .is_ok();
-                if !found {
-                    return Err(Value);
-                }
-            }
-            let steps = plan
-                .pattern_steps
-                .get(c.pat_start as usize..c.pat_end as usize)
-                .ok_or(Construct)?;
-            let mut undecided = false;
-            for step in steps {
-                let table = plan.patterns.get(step.table as usize);
-                let alphabet = plan.alphabets.get(step.alphabet as usize);
-                match (table, alphabet) {
-                    (Some(t), Some(a)) if in_alphabet(plan, a, v) => {
-                        if !table_accepts(plan, t, v.as_bytes()) {
+            CheckKind::Value => match check_value(plan, &c, value, &mut s.norm) {
+                Ok(v) => {
+                    if c.flags & CHECK_ID != 0 {
+                        // The ID's value is its collapsed literal; a hash
+                        // collision reads as a duplicate.
+                        let h = s.hasher.hash_one(v.as_bytes());
+                        if !s.ids.insert(h) {
                             return Err(Value);
                         }
                     }
-                    _ => undecided = true,
                 }
-            }
-            if undecided {
-                return fallback(tier);
-            }
-            Ok(())
+                Err(e) if !tier.delegating() => return Err(e),
+                Err(_) => {
+                    fallback(tier)?;
+                    if c.flags & CHECK_ID != 0 {
+                        let v =
+                            value.trim_matches(|ch: char| ch.is_ascii() && is_xml_space(ch as u8));
+                        let h = s.hasher.hash_one(v.as_bytes());
+                        if !s.ids.insert(h) {
+                            return Err(Value);
+                        }
+                    }
+                    return Ok(());
+                }
+            },
         }
+        if c.next == NONE {
+            return Ok(());
+        }
+        c = *plan.checks.get(c.next as usize).ok_or(Construct)?;
     }
 }
 

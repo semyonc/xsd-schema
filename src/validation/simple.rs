@@ -1808,7 +1808,7 @@ fn check_xsd10_year_facets(
 
 /// Walk the resolved_base_type chain from `sk` until we find a built-in type code.
 /// Returns `None` if no built-in ancestor is found (cycle guard at depth 100).
-fn resolve_type_code(sk: SimpleTypeKey, schema_set: &SchemaSet) -> Option<XmlTypeCode> {
+pub(crate) fn resolve_type_code(sk: SimpleTypeKey, schema_set: &SchemaSet) -> Option<XmlTypeCode> {
     let mut current = sk;
     for _ in 0..100 {
         if let Some(code) = schema_set.get_type_code(current) {

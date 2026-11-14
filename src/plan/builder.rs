@@ -19,7 +19,8 @@ use crate::parser::frames::{AttributeUseKind, IdentityKind, SimpleTypeVariety};
 use crate::schema::attribute_uses::AttributeLookup;
 use crate::schema::model::{RegexCompat, XsdVersion};
 use crate::schema::SchemaSet;
-use crate::types::facets::WhitespaceMode;
+use crate::types::facets::{FacetSet, WhitespaceMode};
+use crate::types::XmlTypeCode;
 use crate::validation::content::{CompiledContentModel, ContentValidatorState};
 use crate::validation::info::{ContentType, ValidationFlags};
 use crate::validation::runtime::determine_content_type;
@@ -114,7 +115,7 @@ struct Builder<'a> {
     type_memo: HashMap<TypeKey, u32>,
     child_memo: HashMap<ElementKey, u32>,
     check_memo: HashMap<TypeKey, u32>,
-    step_memo: HashMap<Vec<String>, PatternStep>,
+    step_memo: HashMap<(Vec<String>, XsdVersion), PatternStep>,
     alphabet_memo: HashMap<AlphabetKey, u32>,
     /// Each element-only type plan's states: `states[start..end]`.
     type_states: HashMap<u32, (u32, u32)>,
@@ -512,8 +513,9 @@ impl<'a> Builder<'a> {
                 // ENTITY or QName value counts at document level. So the
                 // constraint must be a value the plan could check itself and
                 // that its type accepts.
-                let kind = self.plan.checks[check as usize].kind;
-                if matches!(kind, CheckKind::Uncovered | CheckKind::Id)
+                let c = self.plan.checks[check as usize];
+                if c.kind == CheckKind::Uncovered
+                    || c.flags & CHECK_ID != 0
                     || validate_simple_type(v, ty?, set).is_err()
                 {
                     return None;
@@ -538,7 +540,7 @@ impl<'a> Builder<'a> {
         // runtime counts them (ct-props-correct.5).
         let ids = out
             .iter()
-            .filter(|u| self.plan.checks[u.check as usize].kind == CheckKind::Id)
+            .filter(|u| self.plan.checks[u.check as usize].flags & CHECK_ID != 0)
             .count();
         if ids > 1 && self.version == XsdVersion::V1_0 {
             return None;
@@ -717,13 +719,17 @@ impl<'a> Builder<'a> {
     fn simple_check(kind: CheckKind, delegate: u32) -> CheckPlan {
         CheckPlan {
             kind,
+            lex: Lex::String,
             ws: Ws::Preserve,
+            flags: 0,
             min_len: 0,
             max_len: NONE,
             enum_start: NONE,
             enum_end: NONE,
             pat_start: 0,
             pat_end: 0,
+            bounds: NONE,
+            next: NONE,
             delegate,
         }
     }
@@ -735,75 +741,423 @@ impl<'a> Builder<'a> {
         let delegate = self.delegate(tk);
         let plan = match tk {
             TypeKey::Complex(ck) => self.simple_content_check(ck, delegate),
-            TypeKey::Simple(sk) => self.simple_type_check(sk, delegate),
+            TypeKey::Simple(sk) => self.simple_type_check(sk, None, delegate),
         };
-        if plan.kind == CheckKind::Uncovered {
+        if plan.kind != CheckKind::Value && plan.kind != CheckKind::Any {
             let label = self.type_label(tk);
-            self.uncovered(format!("value type {label}"));
+            self.uncovered(format!("value type {label}: {:?}", plan.kind));
         }
         let id = self.push_check(plan);
+        // A value of the string family or `xs:anyURI` is its normalized
+        // literal: a narrow `xs:unique` may compare such values as bytes.
+        if plan.kind == CheckKind::Value && plan.lex == Lex::String && plan.next == NONE {
+            self.literal_valued.insert(id);
+        }
         self.check_memo.insert(tk, id);
         id
     }
 
-    /// The value check of a complex type with simple content: delegated in
-    /// this stage, as a whole, to `validate_simple_type`. That function
-    /// checks the value and nothing the runtime does at document level or
-    /// with namespace bindings, so a content type whose values are IDs,
-    /// references, QNames or notations — or a list or union, which may
-    /// hold them — is not covered.
+    /// The value check of a complex type with simple content, as the
+    /// dynamic path validates such content (`validate_simple_type` on the
+    /// complex type): along the derivation chain each restriction's own
+    /// `whiteSpace` normalizes the value first, the content's simple type
+    /// validates it, and then the facets each restriction declares are
+    /// checked on that value, read by the simple type's built-in datatype.
+    /// The facets of a restriction are not those of a simple type: their
+    /// patterns are compiled when they are matched, as XSD 1.1 patterns.
+    ///
+    /// All of it becomes a chain of checks of the one value: the simple
+    /// type's check, then one per restriction with facets, each normalizing
+    /// with the strongest white space that applies to it (normalizations
+    /// compose to the strongest of them). A content type whose values are
+    /// IDs, references, QNames or notations — or a list or union, which may
+    /// hold them — is not covered, nor a chain without a simple type.
     fn simple_content_check(&mut self, ck: ComplexTypeKey, delegate: u32) -> CheckPlan {
+        use crate::parser::frames::{ComplexContentResult, DerivationMethod};
         let set = self.set;
         let mut cur = TypeKey::Complex(ck);
+        let mut outer_ws = Ws::Preserve;
+        let mut layers: Vec<ComplexTypeKey> = Vec::new();
+        let mut value_type = None;
         for _ in 0..100 {
             match cur {
                 TypeKey::Simple(sk) => {
-                    return match self.builtin_of(sk).as_deref() {
-                        None
-                        | Some(
-                            "ID" | "IDREF" | "IDREFS" | "ENTITY" | "ENTITIES" | "NOTATION"
-                            | "QName",
-                        ) => Self::simple_check(CheckKind::Uncovered, delegate),
-                        Some(_) => Self::simple_check(CheckKind::Delegate, delegate),
-                    };
+                    value_type = Some(sk);
+                    break;
                 }
                 TypeKey::Complex(k) => {
                     let Some(ct) = set.arenas.complex_types.get(k) else {
                         break;
                     };
-                    if k == set.any_type_key()
-                        || !matches!(
-                            ct.content,
-                            crate::parser::frames::ComplexContentResult::Simple(_)
-                        )
-                    {
+                    if k == set.any_type_key() {
                         break;
                     }
-                    // Every simple type on the way restricts or extends the
-                    // base's content type, so it keeps its primitive.
-                    if let Some(TypeKey::Simple(inline)) = ct.resolved_simple_content_type {
-                        if self.builtin_of(inline).is_none_or(|b| {
-                            matches!(
-                                b.as_str(),
-                                "ID" | "IDREF"
-                                    | "IDREFS"
-                                    | "ENTITY"
-                                    | "ENTITIES"
-                                    | "NOTATION"
-                                    | "QName"
-                            )
-                        }) {
-                            break;
+                    let ComplexContentResult::Simple(sc) = &ct.content else {
+                        break;
+                    };
+                    if sc.derivation == DerivationMethod::Restriction {
+                        if let Some(w) = &sc.facets.whitespace {
+                            outer_ws = strongest(outer_ws, ws_of(w.value));
+                        }
+                        if !sc.facets.is_empty() {
+                            layers.push(k);
                         }
                     }
-                    match ct.resolved_base_type {
+                    match ct.resolved_simple_content_type.or(ct.resolved_base_type) {
                         Some(next) if next != cur => cur = next,
                         _ => break,
                     }
                 }
             }
         }
-        Self::simple_check(CheckKind::Uncovered, delegate)
+        let Some(sk) = value_type else {
+            return Self::simple_check(CheckKind::Uncovered, delegate);
+        };
+        let mut head = self.simple_type_check(sk, Some(outer_ws), delegate);
+        if head.kind != CheckKind::Value && head.kind != CheckKind::Any {
+            // Uncovered stays uncovered (IDs, references, QNames, lists,
+            // unions); anything else the delegating tier decides on the
+            // whole content.
+            return head;
+        }
+        if head.flags & CHECK_ID != 0 {
+            return Self::simple_check(CheckKind::Uncovered, delegate);
+        }
+        let Some(code) = crate::validation::simple::resolve_type_code(sk, set) else {
+            return Self::simple_check(CheckKind::Uncovered, delegate);
+        };
+        // The value the restrictions' facets see: normalized by the simple
+        // type's white space after the restrictions' own.
+        let inner_ws = strongest(outer_ws, head.ws);
+        let mut next = NONE;
+        for &k in layers.iter().rev() {
+            let ComplexContentResult::Simple(sc) = &set.arenas.complex_types[k].content else {
+                return Self::simple_check(CheckKind::Uncovered, delegate);
+            };
+            let facets = sc.facets.clone();
+            let ws = match &facets.whitespace {
+                Some(w) => strongest(inner_ws, ws_of(w.value)),
+                None => strongest(inner_ws, default_ws(code)),
+            };
+            let mut layer = self.value_check(code, &facets, ws, XsdVersion::V1_1, false, delegate);
+            match layer.kind {
+                CheckKind::Value | CheckKind::Any => {}
+                _ => return Self::simple_check(CheckKind::Delegate, delegate),
+            }
+            layer.next = next;
+            next = self.push_check(layer);
+        }
+        if head.kind == CheckKind::Any && next != NONE {
+            head.kind = CheckKind::Value;
+        }
+        head.next = next;
+        head
+    }
+
+    /// The value check of a simple type: its effective facets and white
+    /// space (`ws_floor`: a white space at least as strong is applied
+    /// first, for simple content), as `validate_atomic_type` reads them.
+    fn simple_type_check(
+        &mut self,
+        sk: SimpleTypeKey,
+        ws_floor: Option<Ws>,
+        delegate: u32,
+    ) -> CheckPlan {
+        let set = self.set;
+        let Some(builtin) = self.builtin_of(sk) else {
+            return Self::simple_check(CheckKind::Uncovered, delegate);
+        };
+        if matches!(
+            builtin.as_str(),
+            "IDREF" | "IDREFS" | "ENTITY" | "ENTITIES" | "NOTATION" | "QName"
+        ) {
+            return Self::simple_check(CheckKind::Uncovered, delegate);
+        }
+        let Some(code) = crate::validation::simple::resolve_type_code(sk, set) else {
+            return Self::simple_check(CheckKind::Delegate, delegate);
+        };
+        let facets = set.effective_facets(sk);
+        if matches!(
+            code,
+            XmlTypeCode::AnySimpleType | XmlTypeCode::AnyAtomicType
+        ) {
+            // No datatype: every value, as written.
+            return if facets.is_empty() {
+                Self::simple_check(CheckKind::Any, delegate)
+            } else {
+                Self::simple_check(CheckKind::Delegate, delegate)
+            };
+        }
+        let ws = ws_of(crate::validation::simple::atomic_whitespace(sk, set));
+        let ws = match ws_floor {
+            Some(w) => strongest(w, ws),
+            None => ws,
+        };
+        let id = code == XmlTypeCode::Id;
+        self.value_check(code, &facets, ws, self.version, id, delegate)
+    }
+
+    /// A `Value` check of a value of the built-in datatype `code` against
+    /// `facets`, normalized with `ws`, patterns read as patterns of
+    /// `pattern_version`. Any facet the check cannot carry exactly leaves it
+    /// to the delegating tier.
+    fn value_check(
+        &mut self,
+        code: XmlTypeCode,
+        facets: &FacetSet,
+        ws: Ws,
+        pattern_version: XsdVersion,
+        id: bool,
+        delegate: u32,
+    ) -> CheckPlan {
+        use XmlTypeCode as C;
+        let fallback = Self::simple_check(CheckKind::Delegate, delegate);
+        let (lex, mut flags) = match code {
+            C::String | C::NormalizedString | C::Token | C::AnyUri => (Lex::String, 0),
+            C::Name => (Lex::Name, 0),
+            C::NCName => (Lex::NCName, 0),
+            C::Id => (Lex::NCName, 0),
+            C::NmToken => (Lex::NmToken, 0),
+            C::Language => (Lex::Language, 0),
+            C::Integer
+            | C::Long
+            | C::Int
+            | C::Short
+            | C::Byte
+            | C::NonNegativeInteger
+            | C::PositiveInteger
+            | C::NonPositiveInteger
+            | C::NegativeInteger
+            | C::UnsignedLong
+            | C::UnsignedInt
+            | C::UnsignedShort
+            | C::UnsignedByte => (Lex::Integer, 0),
+            C::Decimal => (Lex::Decimal, 0),
+            C::Boolean => (Lex::Boolean, CHECK_RAW_PATTERNS),
+            C::Float => (Lex::Float, CHECK_RAW_PATTERNS),
+            C::Double => (Lex::Double, CHECK_RAW_PATTERNS),
+            C::DateTime => (Lex::DateTime, CHECK_RAW_PATTERNS),
+            C::DateTimeStamp => (Lex::DateTime, CHECK_RAW_PATTERNS | CHECK_TZ_REQUIRED),
+            C::Date => (Lex::Date, CHECK_RAW_PATTERNS),
+            C::Time => (Lex::Time, CHECK_RAW_PATTERNS),
+            C::GYearMonth => (Lex::GYearMonth, CHECK_RAW_PATTERNS),
+            C::GYear => (Lex::GYear, CHECK_RAW_PATTERNS),
+            C::GMonthDay => (Lex::GMonthDay, CHECK_RAW_PATTERNS),
+            C::GDay => (Lex::GDay, CHECK_RAW_PATTERNS),
+            C::GMonth => (Lex::GMonth, CHECK_RAW_PATTERNS),
+            C::Duration => (Lex::Duration, CHECK_RAW_PATTERNS),
+            C::YearMonthDuration => (Lex::YearMonthDuration, CHECK_RAW_PATTERNS),
+            C::DayTimeDuration => (Lex::DayTimeDuration, CHECK_RAW_PATTERNS),
+            C::HexBinary => (Lex::HexBinary, 0),
+            C::Base64Binary => (Lex::Base64Binary, 0),
+            _ => return fallback,
+        };
+        if id {
+            flags |= CHECK_ID;
+        }
+        if self.version == XsdVersion::V1_0 {
+            flags |= CHECK_XSD10;
+        }
+        // XSD 1.1 assertions bind `$value`; the plan has no XPath.
+        if !facets.assertions.is_empty() {
+            return fallback;
+        }
+        let stringlike = matches!(
+            lex,
+            Lex::String | Lex::Name | Lex::NCName | Lex::NmToken | Lex::Language
+        );
+        let binary = matches!(lex, Lex::HexBinary | Lex::Base64Binary);
+        let numeric = matches!(lex, Lex::Integer | Lex::Decimal);
+        let timed = matches!(lex, Lex::DateTime | Lex::Date | Lex::Time);
+        let has_length =
+            facets.length.is_some() || facets.min_length.is_some() || facets.max_length.is_some();
+        let has_range = facets.min_inclusive.is_some()
+            || facets.max_inclusive.is_some()
+            || facets.min_exclusive.is_some()
+            || facets.max_exclusive.is_some();
+        let has_digits = facets.total_digits.is_some() || facets.fraction_digits.is_some();
+        if (has_length && !(stringlike || binary))
+            || (has_range && !(numeric || timed))
+            || (has_digits && !numeric)
+        {
+            return fallback;
+        }
+        if let Some(tz) = &facets.explicit_timezone {
+            use crate::types::facets::ExplicitTimezone as E;
+            let dated = timed
+                || matches!(
+                    lex,
+                    Lex::GYearMonth | Lex::GYear | Lex::GMonthDay | Lex::GDay | Lex::GMonth
+                );
+            if !dated {
+                return fallback;
+            }
+            match tz.value {
+                E::Required => flags |= CHECK_TZ_REQUIRED,
+                E::Prohibited => flags |= CHECK_TZ_PROHIBITED,
+                E::Optional => {}
+            }
+        }
+
+        // Lengths.
+        let mut min = 0u64;
+        let mut max = u64::MAX;
+        if let Some(l) = &facets.length {
+            min = min.max(l.value);
+            max = max.min(l.value);
+        }
+        if let Some(l) = &facets.min_length {
+            min = min.max(l.value);
+        }
+        if let Some(l) = &facets.max_length {
+            max = max.min(l.value);
+        }
+        if min > u64::from(u32::MAX - 1) || (max != u64::MAX && max >= u64::from(NONE)) {
+            return fallback;
+        }
+        let max_len = if max >= u64::from(NONE) {
+            NONE
+        } else {
+            max as u32
+        };
+
+        // Range and digit facets.
+        let mut bounds = NONE;
+        if numeric || has_range {
+            let Some(b) = self.bounds(code, lex, facets) else {
+                return fallback;
+            };
+            self.plan.bounds.push(b);
+            bounds = self.plan.bounds.len() as u32 - 1;
+        }
+
+        // Enumeration: the literals as written, sorted.
+        let (enum_start, enum_end) = match &facets.enumeration {
+            Some(e) => {
+                let mut values: Vec<&String> = e.values.iter().collect();
+                values.sort();
+                let lits: Vec<u32> = values.into_iter().map(|v| self.literal(v)).collect();
+                let start = self.plan.enum_literals.len() as u32;
+                self.plan.enum_literals.extend(lits);
+                (start, self.plan.enum_literals.len() as u32)
+            }
+            None => (NONE, NONE),
+        };
+
+        // Patterns.
+        let steps: Vec<Vec<String>> = facets
+            .patterns
+            .iter()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.iter().map(|p| p.value.clone()).collect())
+            .collect();
+        let built: Vec<PatternStep> = steps
+            .into_iter()
+            .map(|s| self.pattern_step(s, pattern_version))
+            .collect();
+        let pat_start = self.plan.pattern_steps.len() as u32;
+        self.plan.pattern_steps.extend(built);
+        let pat_end = self.plan.pattern_steps.len() as u32;
+
+        let plain = lex == Lex::String
+            && ws == Ws::Preserve
+            && min == 0
+            && max_len == NONE
+            && enum_start == NONE
+            && pat_start == pat_end
+            && !id;
+        CheckPlan {
+            kind: if plain {
+                CheckKind::Any
+            } else {
+                CheckKind::Value
+            },
+            lex,
+            ws,
+            flags,
+            min_len: min as u32,
+            max_len,
+            enum_start,
+            enum_end,
+            pat_start,
+            pat_end,
+            bounds,
+            next: NONE,
+            delegate,
+        }
+    }
+
+    /// The range and digit facets of a check, with the built-in range of an
+    /// integer type; `None` when one of them is a literal the plan does not
+    /// read exactly, or when dates disagree on having a time zone.
+    fn bounds(&mut self, code: XmlTypeCode, lex: Lex, facets: &FacetSet) -> Option<Bounds> {
+        use crate::types::facets::normalize_whitespace;
+        use XmlTypeCode as C;
+        let (int_lo, int_hi) = match code {
+            C::Long => (i128::from(i64::MIN), i128::from(i64::MAX)),
+            C::Int => (i128::from(i32::MIN), i128::from(i32::MAX)),
+            C::Short => (i128::from(i16::MIN), i128::from(i16::MAX)),
+            C::Byte => (i128::from(i8::MIN), i128::from(i8::MAX)),
+            C::NonNegativeInteger => (0, i128::MAX),
+            C::PositiveInteger => (1, i128::MAX),
+            C::NonPositiveInteger => (i128::MIN, 0),
+            C::NegativeInteger => (i128::MIN, -1),
+            C::UnsignedLong => (0, i128::from(u64::MAX)),
+            C::UnsignedInt => (0, i128::from(u32::MAX)),
+            C::UnsignedShort => (0, i128::from(u16::MAX)),
+            C::UnsignedByte => (0, i128::from(u8::MAX)),
+            _ => (i128::MIN, i128::MAX),
+        };
+        let mut zoned: Option<bool> = None;
+        let mut bound = |literal: Option<&String>, this: &mut Self| -> Option<Bound> {
+            let Some(literal) = literal else {
+                return Some(Bound::NONE);
+            };
+            let lit = normalize_whitespace(literal, crate::types::facets::WhitespaceMode::Collapse);
+            match lex {
+                Lex::Integer | Lex::Decimal => {
+                    if !crate::types::validators::is_valid_xsd_decimal_lexical(&lit) {
+                        return None;
+                    }
+                    let (mant, scale, _, _) = super::values::read_decimal(&lit)?;
+                    Some(Bound {
+                        set: true,
+                        mant,
+                        scale,
+                        frac: Span { start: 0, len: 0 },
+                    })
+                }
+                Lex::DateTime | Lex::Date | Lex::Time => {
+                    let (whole, frac, tz) = super::values::read_moment(&lit, lex)?;
+                    if *zoned.get_or_insert(tz) != tz {
+                        return None;
+                    }
+                    let frac = this.push_bytes(frac.as_bytes());
+                    Some(Bound {
+                        set: true,
+                        mant: whole,
+                        scale: 0,
+                        frac,
+                    })
+                }
+                _ => None,
+            }
+        };
+        let min_incl = bound(facets.min_inclusive.as_ref().map(|f| &f.value), self)?;
+        let min_excl = bound(facets.min_exclusive.as_ref().map(|f| &f.value), self)?;
+        let max_incl = bound(facets.max_inclusive.as_ref().map(|f| &f.value), self)?;
+        let max_excl = bound(facets.max_exclusive.as_ref().map(|f| &f.value), self)?;
+        Some(Bounds {
+            min_incl,
+            min_excl,
+            max_incl,
+            max_excl,
+            int_lo,
+            int_hi,
+            total_digits: facets.total_digits.as_ref().map_or(NONE, |f| f.value),
+            fraction_digits: facets.fraction_digits.as_ref().map_or(NONE, |f| f.value),
+            zoned: zoned.unwrap_or(false),
+        })
     }
 
     /// The built-in datatype a simple type is derived from (its nearest
@@ -827,112 +1181,15 @@ impl<'a> Builder<'a> {
         None
     }
 
-    fn simple_type_check(&mut self, sk: SimpleTypeKey, delegate: u32) -> CheckPlan {
-        let Some(builtin) = self.builtin_of(sk) else {
-            return Self::simple_check(CheckKind::Uncovered, delegate);
-        };
-        match builtin.as_str() {
-            "IDREF" | "IDREFS" | "ENTITY" | "ENTITIES" | "NOTATION" | "QName" => {
-                Self::simple_check(CheckKind::Uncovered, delegate)
-            }
-            "ID" => Self::simple_check(CheckKind::Id, delegate),
-            "string" | "normalizedString" | "token" => self.string_check(sk, delegate),
-            "anyURI" => {
-                // Delegated, with its white space recorded: an `xs:anyURI`
-                // value is its normalized literal, which a narrow
-                // `xs:unique` compares.
-                let mut c = Self::simple_check(CheckKind::Delegate, delegate);
-                c.ws = ws_of(crate::validation::simple::atomic_whitespace(sk, self.set));
-                self.literal_valued.insert(self.plan.checks.len() as u32);
-                c
-            }
-            _ => Self::simple_check(CheckKind::Delegate, delegate),
-        }
-    }
-
-    /// The string family: the effective facets, as the runtime reads them.
-    fn string_check(&mut self, sk: SimpleTypeKey, delegate: u32) -> CheckPlan {
-        let set = self.set;
-        let f = set.effective_facets(sk);
-        if f.min_inclusive.is_some()
-            || f.max_inclusive.is_some()
-            || f.min_exclusive.is_some()
-            || f.max_exclusive.is_some()
-            || f.total_digits.is_some()
-            || f.fraction_digits.is_some()
-            || !f.assertions.is_empty()
-            || f.explicit_timezone.is_some()
-        {
-            return Self::simple_check(CheckKind::Delegate, delegate);
-        }
-        let ws = ws_of(crate::validation::simple::atomic_whitespace(sk, set));
-        let mut min = 0u64;
-        let mut max = u64::MAX;
-        if let Some(l) = &f.length {
-            min = min.max(l.value);
-            max = max.min(l.value);
-        }
-        if let Some(l) = &f.min_length {
-            min = min.max(l.value);
-        }
-        if let Some(l) = &f.max_length {
-            max = max.min(l.value);
-        }
-        if min > u64::from(u32::MAX - 1) || (max != u64::MAX && max >= u64::from(NONE)) {
-            return Self::simple_check(CheckKind::Delegate, delegate);
-        }
-        self.literal_valued.insert(self.plan.checks.len() as u32);
-        let max_len = if max >= u64::from(NONE) {
-            NONE
-        } else {
-            max as u32
-        };
-        let (enum_start, enum_end) = match &f.enumeration {
-            Some(e) => {
-                let mut values: Vec<&String> = e.values.iter().collect();
-                values.sort();
-                let lits: Vec<u32> = values.into_iter().map(|v| self.literal(v)).collect();
-                let start = self.plan.enum_literals.len() as u32;
-                self.plan.enum_literals.extend(lits);
-                (start, self.plan.enum_literals.len() as u32)
-            }
-            None => (NONE, NONE),
-        };
-        let steps: Vec<Vec<String>> = f
-            .patterns
-            .iter()
-            .filter(|s| !s.is_empty())
-            .map(|s| s.iter().map(|p| p.value.clone()).collect())
-            .collect();
-        let pat_start = self.plan.pattern_steps.len() as u32;
-        let built: Vec<PatternStep> = steps.into_iter().map(|s| self.pattern_step(s)).collect();
-        self.plan.pattern_steps.extend(built);
-        let pat_end = self.plan.pattern_steps.len() as u32;
-        let no_facets = min == 0 && max_len == NONE && enum_start == NONE && pat_start == pat_end;
-        CheckPlan {
-            kind: if no_facets && ws == Ws::Preserve {
-                CheckKind::Any
-            } else {
-                CheckKind::Str
-            },
-            ws,
-            min_len: min as u32,
-            max_len,
-            enum_start,
-            enum_end,
-            pat_start,
-            pat_end,
-            delegate,
-        }
-    }
-
-    fn pattern_step(&mut self, patterns: Vec<String>) -> PatternStep {
-        if let Some(&s) = self.step_memo.get(&patterns) {
+    fn pattern_step(&mut self, patterns: Vec<String>, version: XsdVersion) -> PatternStep {
+        let key = (patterns, version);
+        if let Some(&s) = self.step_memo.get(&key) {
             return s;
         }
+        let patterns = key.0;
         let refs: Vec<&str> = patterns.iter().map(String::as_str).collect();
         let mut refused = None;
-        let alphabet = match step_alphabet(&refs, self.version) {
+        let alphabet = match step_alphabet(&refs, version) {
             Ok(a) => self.intern_alphabet(&a),
             Err(e) => {
                 refused = Some(format!("{e:?}"));
@@ -950,7 +1207,7 @@ impl<'a> Builder<'a> {
             refused = Some("lenient regex mode".into());
             NONE
         } else {
-            match build_table(&refs, self.version) {
+            match build_table(&refs, version) {
                 Ok(t) => {
                     let classes = self.push_bytes(&t.classes).start;
                     let accept: Vec<u8> = t.accept.iter().map(|&a| u8::from(a)).collect();
@@ -980,7 +1237,7 @@ impl<'a> Builder<'a> {
                 .push(format!("{patterns:?}: {why}"));
         }
         let step = PatternStep { table, alphabet };
-        self.step_memo.insert(patterns, step);
+        self.step_memo.insert((patterns, version), step);
         step
     }
 
@@ -1001,6 +1258,25 @@ impl<'a> Builder<'a> {
         let id = self.plan.alphabets.len() as u32 - 1;
         self.alphabet_memo.insert(key, id);
         id
+    }
+}
+
+/// The stronger of two white-space normalizations: normalizing with one and
+/// then the other is normalizing with the stronger.
+fn strongest(a: Ws, b: Ws) -> Ws {
+    match (a, b) {
+        (Ws::Collapse, _) | (_, Ws::Collapse) => Ws::Collapse,
+        (Ws::Replace, _) | (_, Ws::Replace) => Ws::Replace,
+        _ => Ws::Preserve,
+    }
+}
+
+/// The white space a built-in datatype's validator applies when no
+/// `whiteSpace` facet says otherwise.
+fn default_ws(code: XmlTypeCode) -> Ws {
+    match crate::types::validators::VALIDATOR_REGISTRY.get_by_code(code) {
+        Some(v) => ws_of(v.whitespace()),
+        None => Ws::Preserve,
     }
 }
 

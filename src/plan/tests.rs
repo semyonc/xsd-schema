@@ -85,12 +85,11 @@ fn structure_names_and_string_values() {
         "{:?}",
         report.patterns_refused
     );
-    // xs:positiveInteger is a G2 check: Unknown as shipped, Valid delegating.
     let doc = order(
         &format!("<id>XY001</id><person>Ann</person>{LINE}"),
         "retail",
     );
-    assert_eq!(verdicts(&set, &plan, &doc), (false, true));
+    assert_eq!(verdicts(&set, &plan, &doc), (true, true));
     for doc in [
         order(
             &format!("<id>XY001</id><company> ACME </company>{LINE}{LINE}<note>n</note>"),
@@ -101,7 +100,7 @@ fn structure_names_and_string_values() {
             LINE.replace("<", "<o:").replace("<o:/", "</o:")
         ),
     ] {
-        assert_eq!(verdicts(&set, &plan, &doc), (false, true), "{doc}");
+        assert_eq!(verdicts(&set, &plan, &doc), (true, true), "{doc}");
     }
     // Not valid: every one must stay Unknown.
     for doc in [
@@ -190,11 +189,12 @@ fn string_family_as_shipped() {
     ] {
         assert_eq!(verdicts(&set, &plan, doc), (false, false), "{doc}");
     }
-    // A schema-location hint on the root: G2 as shipped, the delegating tier
-    // checks it as the runtime does.
+    // A schema-location hint on the root: in the delegating tier in this
+    // stage, checked as the runtime checks it.
     for doc in [
         "<r xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance' xsi:noNamespaceSchemaLocation='x.xsd'><s>x</s></r>",
         "<r xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance' xsi:schemaLocation='urn:a a.xsd urn:b b.xsd'><s>x</s></r>",
+        "<r xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance' xsi:schemaLocation=' urn:a\n\ta.xsd '><s>x</s></r>",
     ] {
         assert_eq!(verdicts(&set, &plan, doc), (false, true), "{doc}");
     }
@@ -542,4 +542,393 @@ fn prohibited_fixed_in_a_restriction_or_without_a_base() {
         "D",
         PF_DOCS,
     );
+}
+
+// ---------------------------------------------------------------------------
+// Value checks
+// ---------------------------------------------------------------------------
+
+/// A small xorshift generator for the lexical differentials.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+    fn pick<'a>(&mut self, v: &[&'a str]) -> &'a str {
+        v[(self.next() % v.len() as u64) as usize]
+    }
+}
+
+/// Whether the dynamic path's validator for `code` accepts `v` (with the XSD
+/// 1.0 rules of `validate_atomic_type`: no year 0000, no `+INF`).
+fn runtime_accepts(code: crate::types::XmlTypeCode, v: &str, xsd10: bool) -> bool {
+    use crate::types::validators::VALIDATOR_REGISTRY;
+    use crate::types::value::{XmlAtomicValue as A, XmlValueKind as K};
+    let Ok(val) = VALIDATOR_REGISTRY.validate(code, v) else {
+        return false;
+    };
+    if xsd10 {
+        let year_zero = match &val.value {
+            K::Atomic(A::DateTime(d)) => d.year == 0,
+            K::Atomic(A::Date(d)) => d.year == 0,
+            K::Atomic(A::GYear(d)) => d.year == 0,
+            K::Atomic(A::GYearMonth(d)) => d.year == 0,
+            _ => false,
+        };
+        let collapsed = crate::types::facets::normalize_whitespace(
+            v,
+            crate::types::facets::WhitespaceMode::Collapse,
+        );
+        if year_zero
+            || (matches!(
+                code,
+                crate::types::XmlTypeCode::Float | crate::types::XmlTypeCode::Double
+            ) && collapsed == "+INF")
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// A `Value` check of one lexical family with no facets.
+fn bare_check(lex: model::Lex, xsd10: bool) -> (PlanData, model::CheckPlan) {
+    let mut plan = PlanData::default();
+    plan.bounds.push(model::Bounds {
+        min_incl: model::Bound::NONE,
+        min_excl: model::Bound::NONE,
+        max_incl: model::Bound::NONE,
+        max_excl: model::Bound::NONE,
+        int_lo: i128::MIN,
+        int_hi: i128::MAX,
+        total_digits: model::NONE,
+        fraction_digits: model::NONE,
+        zoned: false,
+    });
+    let c = model::CheckPlan {
+        kind: model::CheckKind::Value,
+        lex,
+        ws: model::Ws::Collapse,
+        flags: if xsd10 { model::CHECK_XSD10 } else { 0 },
+        min_len: 0,
+        max_len: model::NONE,
+        enum_start: model::NONE,
+        enum_end: model::NONE,
+        pat_start: 0,
+        pat_end: 0,
+        bounds: if lex == model::Lex::Integer {
+            0
+        } else {
+            model::NONE
+        },
+        next: model::NONE,
+        delegate: model::NONE,
+    };
+    (plan, c)
+}
+
+/// Every string the plan reads in a family's lexical space, the runtime's
+/// validator reads too (in both XSD versions).
+#[test]
+fn plan_lexical_forms_lie_inside_the_runtimes() {
+    use crate::types::XmlTypeCode as C;
+    use model::Lex as L;
+    let mut r = Rng(0x2545_F491_4F6C_DD1D);
+    let years = [
+        "0000", "0001", "1900", "1970", "2000", "2004", "2100", "9999", "10000", "-0001", "200",
+        "02000", "+2000",
+    ];
+    let months = ["00", "01", "02", "04", "12", "13", "1", "001"];
+    let days = ["00", "01", "28", "29", "30", "31", "32", "1"];
+    let hours = ["00", "09", "23", "24", "25", "1", "000"];
+    let minutes = ["00", "01", "59", "60", "5"];
+    let seconds = [
+        "00",
+        "01",
+        "59",
+        "60",
+        "00.5",
+        "00.000",
+        "59.999999999999999999999999999999",
+        "00.",
+        "1",
+        "00.1.2",
+        "0.5",
+        ".5",
+    ];
+    let zones = [
+        "", "Z", "+00:00", "-00:00", "+14:00", "-14:00", "+14:01", "+13:59", "+15:00", "+05", "z",
+        "+05:60", "-1:00", "Z Z",
+    ];
+    let mut cases: Vec<(L, C, String)> = Vec::new();
+    for _ in 0..40_000 {
+        let (y, m, d) = (r.pick(&years), r.pick(&months), r.pick(&days));
+        let (h, mi, s, z) = (
+            r.pick(&hours),
+            r.pick(&minutes),
+            r.pick(&seconds),
+            r.pick(&zones),
+        );
+        cases.push((
+            L::DateTime,
+            C::DateTime,
+            format!("{y}-{m}-{d}T{h}:{mi}:{s}{z}"),
+        ));
+        cases.push((L::Date, C::Date, format!("{y}-{m}-{d}{z}")));
+        cases.push((L::Time, C::Time, format!("{h}:{mi}:{s}{z}")));
+        cases.push((L::GYearMonth, C::GYearMonth, format!("{y}-{m}{z}")));
+        cases.push((L::GYear, C::GYear, format!("{y}{z}")));
+        cases.push((L::GMonthDay, C::GMonthDay, format!("--{m}-{d}{z}")));
+        cases.push((L::GDay, C::GDay, format!("---{d}{z}")));
+        cases.push((L::GMonth, C::GMonth, format!("--{m}{z}")));
+    }
+    let num = [
+        "",
+        "0",
+        "1",
+        "00",
+        "999999999",
+        "4294967296",
+        "0000000001",
+        "1.5",
+        ".5",
+        "5.",
+        "99999999999999999999",
+        "999999999999999999",
+    ];
+    let des = ["Y", "M", "D", "H", "S", "W", ""];
+    for _ in 0..40_000 {
+        let mut s = String::from(r.pick(&["P", "-P", "+P", "", "PT", "-PT", "pT"]));
+        for _ in 0..(r.next() % 5) {
+            if r.next().is_multiple_of(5) {
+                s.push('T');
+            }
+            s.push_str(r.pick(&num));
+            s.push_str(r.pick(&des));
+        }
+        cases.push((L::Duration, C::Duration, s.clone()));
+        cases.push((L::YearMonthDuration, C::YearMonthDuration, s.clone()));
+        cases.push((L::DayTimeDuration, C::DayTimeDuration, s));
+    }
+    let digits = [
+        "", "0", "1", "9", "00", "12", "007", "1e3", "1E-2", "e", ".", "INF", "NaN", "_", " ", "x",
+    ];
+    for _ in 0..40_000 {
+        let s = format!(
+            "{}{}{}{}",
+            r.pick(&["", "+", "-", "--"]),
+            r.pick(&digits),
+            r.pick(&["", ".", ".0", ".5", "..", "e5", "E+1", "e-1"]),
+            r.pick(&digits)
+        );
+        for (lex, code) in [
+            (L::Decimal, C::Decimal),
+            (L::Integer, C::Integer),
+            (L::Float, C::Float),
+            (L::Double, C::Double),
+            (L::Boolean, C::Boolean),
+        ] {
+            cases.push((lex, code, s.clone()));
+        }
+    }
+    for s in [
+        "true", "false", "1", "0", " true ", "TRUE", "", "+INF", "INF", "-INF", "NaN", "1e999",
+        "-0",
+    ] {
+        for (lex, code) in [
+            (L::Boolean, C::Boolean),
+            (L::Float, C::Float),
+            (L::Double, C::Double),
+        ] {
+            cases.push((lex, code, s.to_string()));
+        }
+    }
+    let b64 = [
+        "A", "Q", "g", "w", "+", "/", "=", " ", "a", "Z", "9", "-", "_",
+    ];
+    let hex = ["0", "a", "F", "g", " ", "x", "00"];
+    for _ in 0..40_000 {
+        let n = r.next() % 14;
+        let s: String = (0..n).map(|_| r.pick(&b64)).collect();
+        cases.push((L::Base64Binary, C::Base64Binary, s));
+        let n = r.next() % 7;
+        let s: String = (0..n).map(|_| r.pick(&hex)).collect();
+        cases.push((L::HexBinary, C::HexBinary, s));
+    }
+    let names = [
+        "a", "1", "-", ".", ":", "_", "ä", "\u{b7}", "\u{300}", " ", "x",
+    ];
+    for _ in 0..20_000 {
+        let n = r.next() % 4;
+        let s: String = (0..n).map(|_| r.pick(&names)).collect();
+        for (lex, code) in [
+            (L::Name, C::Name),
+            (L::NCName, C::NCName),
+            (L::NmToken, C::NmToken),
+            (L::Language, C::Language),
+        ] {
+            cases.push((lex, code, s.clone()));
+        }
+    }
+    let mut accepted = 0;
+    for xsd10 in [false, true] {
+        for (lex, code, v) in &cases {
+            let (plan, c) = bare_check(*lex, xsd10);
+            let mut buf = String::new();
+            let plan_ok = values::check_value(plan.as_ref(), &c, v, &mut buf).is_ok();
+            if plan_ok {
+                accepted += 1;
+                assert!(
+                    runtime_accepts(*code, v, xsd10),
+                    "the plan reads {v:?} as {lex:?} (XSD 1.0: {xsd10}), the runtime does not"
+                );
+            }
+        }
+    }
+    assert!(accepted > 50_000, "too few accepted forms: {accepted}");
+}
+
+/// The plan's binary readers count the octets the validators decode.
+#[test]
+fn binary_octets_are_the_decoders() {
+    use base64::Engine;
+    let mut r = Rng(0x9E37_79B9_7F4A_7C15);
+    let b64 = ["A", "Q", "g", "w", "B", "+", "/", "=", " ", "z", "9"];
+    for _ in 0..200_000 {
+        let n = r.next() % 13;
+        let s: String = (0..n).map(|_| r.pick(&b64)).collect();
+        let plan = values::base64_octets(&s);
+        let runtime = base64::engine::general_purpose::STANDARD.decode(s.as_bytes());
+        assert_eq!(plan, runtime.ok().map(|o| o.len()), "{s:?}");
+    }
+    // Longer than one chunk, padding only at the end.
+    let long = "QUJD".repeat(700) + "QQ==";
+    assert_eq!(values::base64_octets(&long), Some(2101));
+    let padded_inside = "QQ==".repeat(400);
+    assert_eq!(values::base64_octets(&padded_inside), None);
+    let hex = ["0", "a", "F", "g", " ", "9"];
+    for _ in 0..100_000 {
+        let n = r.next() % 7;
+        let s: String = (0..n).map(|_| r.pick(&hex)).collect();
+        assert_eq!(
+            values::hex_octets(&s),
+            hex::decode(&s).ok().map(|o| o.len()),
+            "{s:?}"
+        );
+    }
+    assert_eq!(values::hex_octets(&"0a".repeat(1000)), Some(1000));
+}
+
+/// The plan's white-space normalization is the dynamic path's, byte for byte.
+#[test]
+fn normalization_is_the_runtimes() {
+    use crate::types::facets::{normalize_whitespace, WhitespaceMode};
+    let mut r = Rng(0x1234_5678_9ABC_DEF1);
+    let parts = [" ", "\t", "\n", "\r", "a", "b", "\u{a0}", "é", "  "];
+    for _ in 0..100_000 {
+        let n = r.next() % 7;
+        let s: String = (0..n).map(|_| r.pick(&parts)).collect();
+        for (ws, mode) in [
+            (model::Ws::Preserve, WhitespaceMode::Preserve),
+            (model::Ws::Replace, WhitespaceMode::Replace),
+            (model::Ws::Collapse, WhitespaceMode::Collapse),
+        ] {
+            let mut buf = String::new();
+            assert_eq!(
+                values::normalize(&s, ws, &mut buf),
+                normalize_whitespace(&s, mode).as_ref(),
+                "{s:?} {ws:?}"
+            );
+        }
+    }
+}
+
+const NUMBERS: &str = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:element name="r">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element name="q" type="Q" minOccurs="0"/>
+        <xs:element name="b" type="xs:unsignedByte" minOccurs="0"/>
+        <xs:element name="p" type="P" minOccurs="0"/>
+        <xs:element name="d" type="xs:date" minOccurs="0"/>
+        <xs:element name="t" type="T" minOccurs="0"/>
+      </xs:sequence>
+      <xs:attribute name="rate" type="P"/>
+    </xs:complexType>
+  </xs:element>
+  <xs:simpleType name="Q">
+    <xs:restriction base="xs:integer">
+      <xs:minInclusive value="1"/>
+      <xs:maxExclusive value="1000"/>
+      <xs:totalDigits value="3"/>
+    </xs:restriction>
+  </xs:simpleType>
+  <xs:simpleType name="P">
+    <xs:restriction base="xs:decimal">
+      <xs:maxInclusive value="100.00"/>
+      <xs:fractionDigits value="2"/>
+      <xs:pattern value="-?\d{1,3}\.\d{2}"/>
+    </xs:restriction>
+  </xs:simpleType>
+  <xs:simpleType name="T">
+    <xs:restriction base="xs:time">
+      <xs:maxInclusive value="24:00:00"/>
+    </xs:restriction>
+  </xs:simpleType>
+</xs:schema>"#;
+
+#[test]
+fn numbers_dates_and_times_as_shipped() {
+    let set = load(NUMBERS);
+    let (plan, report) = build(&set);
+    assert!(report.uncovered.is_empty(), "{:?}", report.uncovered);
+    for doc in [
+        "<r><q>1</q><b>255</b><p>100.00</p><d>2000-02-29</d><t>00:00:00</t></r>",
+        "<r rate=' 0.50 '><q> 999 </q><b>-0</b><p>-5.00</p><d>1970-01-01Z</d></r>",
+        "<r><q>+007</q><b>+0</b></r>",
+    ] {
+        assert_eq!(verdicts(&set, &plan, doc), (true, true), "{doc}");
+    }
+    for doc in [
+        "<r><q>0</q></r>",
+        "<r><q>1000</q></r>",
+        "<r><q>1.0</q></r>",
+        "<r><b>256</b></r>",
+        "<r><b>-1</b></r>",
+        "<r><p>100.01</p></r>",
+        "<r><p>1.5</p></r>",
+        "<r><p>1.500</p></r>",
+        "<r><d>1900-02-29</d></r>",
+        "<r><d>0000-01-01</d></r>",
+        // `24:00:00` of a time is `00:00:00`: anything later is out of range.
+        "<r><t>12:00:00</t></r>",
+        "<r><t>24:00:00</t><t/></r>",
+    ] {
+        assert!(!verdicts(&set, &plan, doc).0, "{doc}");
+    }
+}
+
+/// The facets a simple-content restriction declares are not compiled with
+/// the schema: the dynamic path compiles their patterns when it matches them,
+/// as XSD 1.1 patterns, also in an XSD 1.0 schema. Read as a 1.0 pattern,
+/// `[^\w]` (`\w` pinned to Unicode 3.0) would admit U+0221, a letter since
+/// Unicode 4.0, which the dynamic path refuses.
+#[cfg(feature = "xsd11")]
+#[test]
+fn simple_content_restriction_patterns_are_read_as_the_dynamic_path_reads_them() {
+    let xsd = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+      <xs:complexType name="C"><xs:simpleContent><xs:extension base="xs:string">
+        <xs:attribute name="a" type="xs:string"/></xs:extension></xs:simpleContent></xs:complexType>
+      <xs:complexType name="R"><xs:simpleContent><xs:restriction base="C">
+        <xs:pattern value="[^\w]"/></xs:restriction></xs:simpleContent></xs:complexType>
+      <xs:element name="r" type="R"/>
+    </xs:schema>"#;
+    let set = load(xsd);
+    let (plan, _) = build(&set);
+    assert!(!verdicts(&set, &plan, "<r>\u{221}</r>").0);
+    assert_eq!(verdicts(&set, &plan, "<r>-</r>"), (true, true));
 }
