@@ -455,3 +455,44 @@ fn the_buffers_of_one_reader_serve_the_next() {
         }
     }
 }
+
+/// An error that names the innermost open element names it alike from both
+/// sources: the buffered one copies the names of the open elements, the slice
+/// one finds the name in the input when the error is built.
+#[test]
+fn the_innermost_open_element_is_named_alike_by_both_sources() {
+    let cases: [(&[u8], &str); 11] = [
+        (b"<r><p:a xmlns:p=\"u\"><b>text", "'b' (3 elements"),
+        (b"<r><p:a xmlns:p=\"u\">", "'p:a' (2 elements"),
+        (
+            b"\xEF\xBB\xBF<r><a-long-element-name a=\"1\">",
+            "'a-long-element-name' (2",
+        ),
+        (
+            b"\xEF\xBB\xBF<?xml version=\"1.0\"?>\n<r>",
+            "'r' (1 element ",
+        ),
+        // After a closed child the parent is the innermost again.
+        (b"<r>\n  <a>\n    <b/><c></c>\n  ", "'a' (2 elements"),
+        (b"<r><a></b></r>", "'<a>'"),
+        (b"<r><a></\xFF></r>", "'<a>'"),
+        (b"<r><a><!-- not closed", "'a' (2 elements"),
+        (b"<r><a><?pi not closed", "'a' (2 elements"),
+        (b"<r><a><b attr=\"not closed", "'a' (2 elements"),
+        (
+            "<\u{e9}:\u{fc} xmlns:\u{e9}=\"u\"><\u{f6}>".as_bytes(),
+            "'\u{f6}' (2 elements",
+        ),
+    ];
+    for (xml, named) in cases {
+        for trim in [false, true] {
+            let (_, end) = both(xml, &ParseLimits::default(), trim);
+            let message = format!("{:?}", end.expect_err("refused"));
+            assert!(
+                message.contains(named),
+                "{:?} (trim {trim}): {message}",
+                String::from_utf8_lossy(xml)
+            );
+        }
+    }
+}

@@ -619,8 +619,14 @@ struct WfState {
     /// The qualified names of the open elements, as written, one after the
     /// other (`open_at` has where each starts): for naming the innermost one
     /// when the input ends inside it.
+    ///
+    /// A source that has the whole input (`names_in_input`) does not copy
+    /// them: `open_at` then has where each name starts in the input, and
+    /// `open` holds the innermost name only, brought in before an error
+    /// that names it is built ([`SliceWfReader::name_innermost`]).
     open: Vec<u8>,
     open_at: Vec<usize>,
+    names_in_input: bool,
 }
 
 /// The growable buffers of a reader. A caller that reads one document after
@@ -696,6 +702,7 @@ impl<B: BufRead> WfReader<B> {
             (),
             limits,
             WfBuffers::default(),
+            false,
         )
     }
 
@@ -769,7 +776,22 @@ impl<'a> SliceWfReader<'a> {
             input,
             limits,
             buffers,
+            true,
         )
+    }
+
+    /// Brings the name of the innermost open element, which this source
+    /// leaves in the input, into the state: called before an error that may
+    /// name it is built.
+    #[cold]
+    #[inline(never)]
+    fn name_innermost(&mut self) {
+        self.st.open.clear();
+        if let Some(&at) = self.st.open_at.last() {
+            let rest = self.whole.get(at..).unwrap_or_default();
+            let end = scan_name(rest, 0).map_or(0, |name| name.end);
+            self.st.open.extend_from_slice(&rest[..end]);
+        }
     }
 
     /// The next event, checked; it borrows the input.
@@ -795,10 +817,18 @@ impl<'a> SliceWfReader<'a> {
                 // counts them, as the buffered reader's does), so they are
                 // the input between the two offsets.
                 let raw = self.markup(before, self.inner.buffer_position());
+                self.name_innermost();
                 return Err(self.refused(raw, before, quick_xml::Error::Encoding(e)));
             }
-            Err(e) => return Err(self.quick_xml_error(e)),
+            Err(e) => {
+                self.name_innermost();
+                return Err(self.quick_xml_error(e));
+            }
         };
+        if matches!(event, Event::Eof) {
+            // Input that ends inside an element is refused with its name.
+            self.name_innermost();
+        }
         self.accept(&event, before)?;
         Ok(event)
     }
@@ -882,8 +912,15 @@ impl<'i> NextEvent<'i> for SliceWfReader<'i> {
 
 impl<B: BufRead, W> WfReader<B, W> {
     /// A reader over the configured quick-xml reader `inner`, with the
-    /// (empty) buffers `buffers`.
-    fn with_parts(inner: Reader<B>, whole: W, limits: &ParseLimits, buffers: WfBuffers) -> Self {
+    /// (empty) buffers `buffers`. `names_in_input`: the source keeps the
+    /// whole input, so the names of the open elements are left in it.
+    fn with_parts(
+        inner: Reader<B>,
+        whole: W,
+        limits: &ParseLimits,
+        buffers: WfBuffers,
+        names_in_input: bool,
+    ) -> Self {
         let trim = inner.config().trim_text_start;
         let WfBuffers {
             scope,
@@ -921,6 +958,7 @@ impl<B: BufRead, W> WfReader<B, W> {
                 last_start: 0,
                 open,
                 open_at,
+                names_in_input,
             },
         }
     }
@@ -1210,7 +1248,7 @@ impl WfState {
                 match self.open_at.last() {
                     Some(&at) => refused(
                         IllFormedError::MismatchedEndTag {
-                            expected: String::from_utf8_lossy(&self.open[at..]).into_owned(),
+                            expected: String::from_utf8_lossy(self.innermost_name(at)).into_owned(),
                             found: String::new(),
                         }
                         .into(),
@@ -1256,6 +1294,16 @@ impl WfState {
         self.bad_utf8(start + find_bad_utf8(raw).unwrap_or(0) as u64)
     }
 
+    /// The name of the innermost open element, `at` being the last entry of
+    /// `open_at`.
+    fn innermost_name(&self, at: usize) -> &[u8] {
+        if self.names_in_input {
+            &self.open
+        } else {
+            &self.open[at..]
+        }
+    }
+
     /// The innermost open element and how many are open: "the element 'p:b'
     /// (2 elements not closed)"; empty when none is open.
     fn open_elements_shown(&self) -> String {
@@ -1263,7 +1311,7 @@ impl WfState {
             None => String::new(),
             Some(&at) => format!(
                 "the element '{}' ({} element{} not closed)",
-                shown(&self.open[at..]),
+                shown(self.innermost_name(at)),
                 self.open_at.len(),
                 if self.open_at.len() == 1 { "" } else { "s" }
             ),
@@ -1367,7 +1415,9 @@ impl WfState {
                 self.run = None;
                 self.last_start = before;
                 if let Some(at) = self.open_at.pop() {
-                    self.open.truncate(at);
+                    if !self.names_in_input {
+                        self.open.truncate(at);
+                    }
                 }
                 self.scope.pop(self.depth);
                 self.depth = self.depth.saturating_sub(1);
@@ -2374,8 +2424,13 @@ impl WfState {
         } else {
             self.depth = depth;
             self.phase = Phase::Root;
-            self.open_at.push(self.open.len());
-            self.open.extend_from_slice(&c[..name.end]);
+            if self.names_in_input {
+                // The name starts after the `<`, in input offsets.
+                self.open_at.push((start + 1 + self.bom) as usize);
+            } else {
+                self.open_at.push(self.open.len());
+                self.open.extend_from_slice(&c[..name.end]);
+            }
         }
         Ok(())
     }
