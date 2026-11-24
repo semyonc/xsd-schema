@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-11-24
+
+This release removes no public item and changes no signature. It has two
+changes, both for schemas with substitution groups and both reported against
+0.3.1 with XBRL schemas: the XBRL 2.1 instance and linkbase schemas now load,
+and a schema with a large substitution group compiles in a fraction of the
+time.
+
+Conformance is unchanged against 0.3.1: the W3C XSD 1.0 suite passes 39,461
+of 39,510 tests, the XSD 1.1 suite 2,313 of 2,319 and the XPath 2.0 tests of
+XQTS 8,047 of 8,047, with the same failures by name; the GAEB DA XML 3.3 and
+WSDL corpora give the same results.
+
 ### Fixed
 
 - A complex-content restriction that names a member of a substitution group
@@ -3192,7 +3205,8 @@ Performance-focused release. No breaking changes to the public API.
 Initial release: XML Schema (XSD 1.0/1.1) validator with PSVI and a built-in
 XPath 2.0 engine.
 
-[Unreleased]: https://github.com/semyonc/xsd-schema/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/semyonc/xsd-schema/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/semyonc/xsd-schema/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/semyonc/xsd-schema/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/semyonc/xsd-schema/compare/v0.2.3...v0.3.0
 [0.2.3]: https://github.com/semyonc/xsd-schema/compare/v0.2.2...v0.2.3
