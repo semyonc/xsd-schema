@@ -189,44 +189,12 @@ impl<'a> ParticleNormalizer<'a> {
             let elem_key = self
                 .schema_set
                 .lookup_element(ref_name.namespace, ref_name.local_name);
-            let (type_key, block, nillable, fixed_value, fixed_source) = elem_key
-                .and_then(|key| self.schema_set.arenas.elements.get(key))
-                .map(|decl| {
-                    let (eff_block, _) =
-                        crate::compiler::substitution::effective_element_constraints(
-                            self.schema_set,
-                            decl,
-                        );
-                    let tk = decl
-                        .resolved_type
-                        .unwrap_or_else(|| TypeKey::Complex(self.schema_set.any_type_key()));
-                    (
-                        tk,
-                        eff_block,
-                        decl.nillable,
-                        decl.fixed_value.clone(),
-                        decl.source.clone(),
-                    )
-                })
-                .unwrap_or_else(|| {
-                    (
-                        TypeKey::Complex(self.schema_set.any_type_key()),
-                        DerivationSet::empty(),
-                        false,
-                        None,
-                        None,
-                    )
-                });
-            return Ok(NormalizedElement {
-                name: ref_name.local_name,
-                namespace: ref_name.namespace,
-                type_key,
-                element_key: elem_key,
-                block,
-                nillable,
-                fixed_value,
-                fixed_source,
-            });
+            return Ok(global_element(
+                self.schema_set,
+                ref_name.local_name,
+                ref_name.namespace,
+                elem_key,
+            ));
         }
 
         let name = elem
@@ -340,6 +308,53 @@ impl<'a> ParticleNormalizer<'a> {
             compositor,
             particles: self.without_absent_particles(particles),
         })
+    }
+}
+
+/// The term of a particle for the top-level element declaration `elem_key`,
+/// named `{namespace}name` — what an `<element ref="…"/>` normalizes to. An
+/// unresolved reference (`None`) is an `xs:anyType` element without
+/// constraints.
+pub(super) fn global_element(
+    schema_set: &SchemaSet,
+    name: NameId,
+    namespace: Option<NameId>,
+    elem_key: Option<ElementKey>,
+) -> NormalizedElement {
+    let (type_key, block, nillable, fixed_value, fixed_source) = elem_key
+        .and_then(|key| schema_set.arenas.elements.get(key))
+        .map(|decl| {
+            let (eff_block, _) =
+                crate::compiler::substitution::effective_element_constraints(schema_set, decl);
+            let tk = decl
+                .resolved_type
+                .unwrap_or_else(|| TypeKey::Complex(schema_set.any_type_key()));
+            (
+                tk,
+                eff_block,
+                decl.nillable,
+                decl.fixed_value.clone(),
+                decl.source.clone(),
+            )
+        })
+        .unwrap_or_else(|| {
+            (
+                TypeKey::Complex(schema_set.any_type_key()),
+                DerivationSet::empty(),
+                false,
+                None,
+                None,
+            )
+        });
+    NormalizedElement {
+        name,
+        namespace,
+        type_key,
+        element_key: elem_key,
+        block,
+        nillable,
+        fixed_value,
+        fixed_source,
     }
 }
 

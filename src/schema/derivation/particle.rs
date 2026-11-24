@@ -6,10 +6,10 @@ use super::format_type_name;
 use super::normalize::{
     collapse_single_child_groups, complex_content_particle, effective_base_content_particle,
     flatten_nested_sequences, flatten_same_compositor_groups, fold_single_child_group,
-    folded_occurrences, folded_occurrences_under, is_effectively_empty, normalize_type_particle,
-    normalized_effective_base_particle, occurs_is_unit, remove_pointless_particles,
-    NormalizedElement, NormalizedGroup, NormalizedParticle, NormalizedParticleTerm,
-    NormalizedWildcard,
+    folded_occurrences, folded_occurrences_under, global_element, is_effectively_empty,
+    normalize_type_particle, normalized_effective_base_particle, occurs_is_unit,
+    remove_pointless_particles, NormalizedElement, NormalizedGroup, NormalizedParticle,
+    NormalizedParticleTerm, NormalizedWildcard,
 };
 use super::wildcard::{
     process_contents_strictness, wildcard_allows_element, wildcard_restricts,
@@ -804,6 +804,33 @@ fn particle_restricts_unfolded(
                 }
             }
         }
+        // XSD 1.0, a choice against an element particle: when the element
+        // heads a substitution group the particle is a choice with its range
+        // and one particle, 1..1, for each member (§3.9.6 clause 2.1), and
+        // the rule is Choice:Choice -- RecurseLax: the choice's range within
+        // the particle's, each branch as written against the element once.
+        // Every iteration of the choice is then one occurrence of the
+        // element. The branches with the choice's range folded in, below, no
+        // longer show that a member was written once
+        // ([`substituting_element_restricts`]).
+        if schema_set.is_xsd10() && choice_iterations_mix(derived) {
+            if let (
+                NormalizedParticleTerm::Group(derived_group),
+                NormalizedParticleTerm::Element(_),
+            ) = (&derived.term, &base.term)
+            {
+                let mut once = base.clone();
+                once.set_occurrences(Counts::range(1, Some(1)));
+                if occurrences_within(schema_set, derived, base)
+                    && derived_group
+                        .particles
+                        .iter()
+                        .all(|branch| particle_restricts(schema_set, branch, &once))
+                {
+                    return true;
+                }
+            }
+        }
         return derived_branches
             .iter()
             .all(|branch| particle_restricts(schema_set, branch, base));
@@ -825,38 +852,22 @@ fn particle_restricts_unfolded(
                     }
                     _ => false,
                 };
-            // NameAndTypeOK (§3.9.6):
-            // 1. Names match or substitution group
-            (names_match || subst_match)
-            // 2. Occurrence range subset (exact counts)
-            && occurrences_within(schema_set, derived, base)
-            // 3. nillable: derived nillable only if base nillable
-            && (base_element.nillable || !derived_element.nillable)
-            // 4. fixed value: if base is fixed, derived must be fixed with same value (value-space)
-            && match (&base_element.fixed_value, &derived_element.fixed_value) {
-                (None, _) => true,
-                (Some(_), None) => false,
-                (Some(base_fixed), Some(derived_fixed)) => {
-                    crate::validation::simple::fixed_values_equal_in(
-                        derived_fixed,
-                        schema_set.value_constraint_namespaces(derived_element.fixed_source.as_ref()),
-                        base_fixed,
-                        schema_set.value_constraint_namespaces(base_element.fixed_source.as_ref()),
-                        Some(derived_element.type_key),
-                        schema_set,
-                    )
+            // NameAndTypeOK (§3.9.6) clause 2, the occurrence range (exact
+            // counts), then the declarations: clauses 3, 4, 6 and 7 between
+            // the two when the names match (clause 1), or the rule for a
+            // member of the base declaration's substitution group.
+            occurrences_within(schema_set, derived, base)
+                && if names_match {
+                    name_and_type_ok_no_occurs(schema_set, derived_element, base_element)
+                } else {
+                    subst_match
+                        && substituting_element_restricts(
+                            schema_set,
+                            derived,
+                            derived_element,
+                            base_element,
+                        )
                 }
-            }
-            // TODO: 5. identity-constraint definitions subset (not yet implemented)
-            // 6. block superset (masked to element-relevant bits)
-            && derived_element.block.element_block_mask()
-                .contains(base_element.block.element_block_mask())
-            // 7. type derivation
-            && schema_set.is_type_derived_from(
-                derived_element.type_key,
-                base_element.type_key,
-                DerivationSet::extension(),
-            )
         }
         (
             NormalizedParticleTerm::Element(element),
@@ -1758,7 +1769,7 @@ fn find_subsumption_bucket(
                         continue; // already tried
                     }
                     if derived_element_substitutes_base(schema_set, d_elem, b_elem)
-                        && name_and_type_ok_no_occurs(schema_set, d_elem, b_elem)
+                        && substituting_element_restricts(schema_set, derived, d_elem, b_elem)
                     {
                         return Some(BucketAssignment::Single(i));
                     }
@@ -1834,8 +1845,9 @@ fn count_max_fits(derived_max: Option<Count>, base_max: Option<Count>) -> bool {
 }
 
 /// NameAndTypeOK clauses 3, 4, 6, 7 (everything except clause 2 — the
-/// occurrence range subset check). Used by count-based subsumption where
-/// the occurrence check is performed at the bucket aggregate level.
+/// occurrence range subset check, which the callers make: particle against
+/// particle, or at the bucket aggregate level in count-based subsumption).
+/// Clause 5, the identity-constraint definitions subset, is not implemented.
 fn name_and_type_ok_no_occurs(
     schema_set: &SchemaSet,
     derived: &NormalizedElement,
@@ -1872,6 +1884,85 @@ fn name_and_type_ok_no_occurs(
     }
     // Clause 7: type derivation.
     schema_set.is_type_derived_from(derived.type_key, base.type_key, DerivationSet::extension())
+}
+
+/// The declarations of an element particle `derived` and of the base element
+/// particle `head` whose substitution group its declaration is in (the
+/// occurrence ranges are the caller's).
+///
+/// The base particle stands for every member of the group, so the declaration
+/// `derived` answers to is the member it names, never the head:
+///
+/// * XSD 1.0 §3.9.6 Particle Valid (Restriction) clause 2.1 treats the head's
+///   particle "as if it were a choice group whose {min occurs} and {max
+///   occurs} are those of the particle, and whose {particles} consists of one
+///   particle with {min occurs} and {max occurs} of 1 for each of the
+///   declarations in its substitution group". NameAndTypeOK then compares the
+///   restriction's particle with the member's own particle in that choice.
+/// * XSD 1.1 §3.4.6.4 clause 2 requires the base's default binding for an
+///   element to subsume the restriction's. The base's is the element's
+///   governing declaration, and for an element matched through a
+///   substitution group §3.9.4.3 Element Sequence Accepted (Particle) clause
+///   2.3.2 makes that the substituting declaration — the member.
+///
+/// What a member's type owes the head's is Element Declaration Properties
+/// Correct (§3.3.6): derivation by extension is allowed there, and
+/// [`is_element_substitutable_for`](crate::compiler::substitution::is_element_substitutable_for)
+/// has checked it, with the head's `block`, before this is asked.
+///
+/// A member whose declaration also satisfies NameAndTypeOK against the head
+/// is accepted in both versions whatever its own range, as earlier releases
+/// did. Otherwise XSD 1.0 holds it to the range of the member's particle in
+/// the implied choice, 1..1 ([`occurs_once_as_written`]): `bar{1,2}` does not
+/// restrict `head{1,3}` (W3C particlesV020), while a repeated choice of
+/// `bar` does.
+fn substituting_element_restricts(
+    schema_set: &SchemaSet,
+    derived: &NormalizedParticle,
+    derived_element: &NormalizedElement,
+    head: &NormalizedElement,
+) -> bool {
+    name_and_type_ok_no_occurs(schema_set, derived_element, head)
+        || (schema_set.is_xsd11() || occurs_once_as_written(derived))
+            && restricts_substituting_declaration(schema_set, derived_element)
+}
+
+/// NameAndTypeOK clauses 3, 4, 6, 7 between `derived` and the top-level
+/// declaration with its name — the member of a substitution group it stands
+/// for. A reference to that declaration is the declaration itself; a local
+/// element with its name (W3C bug 5296) is compared with it.
+fn restricts_substituting_declaration(schema_set: &SchemaSet, derived: &NormalizedElement) -> bool {
+    let Some(member_key) = schema_set.lookup_element(derived.namespace, derived.name) else {
+        return false;
+    };
+    if derived.element_key == Some(member_key) {
+        return true;
+    }
+    let member = global_element(
+        schema_set,
+        derived.name,
+        derived.namespace,
+        Some(member_key),
+    );
+    name_and_type_ok_no_occurs(schema_set, derived, &member)
+}
+
+/// Does the element or wildcard of `particle` occur exactly once where it is
+/// written — its own range, before normalization folded the ranges of the
+/// single-child groups around it into the particle? `false` when the particle
+/// was folded and its written form is not kept.
+fn occurs_once_as_written(particle: &NormalizedParticle) -> bool {
+    let mut current = particle;
+    while let Some(written) = current.as_written.as_deref() {
+        let NormalizedParticleTerm::Group(group) = &written.term else {
+            return false;
+        };
+        let [child] = group.particles.as_slice() else {
+            return false;
+        };
+        current = child;
+    }
+    !current.folded_group_occurs && occurs_is_unit(current.min_occurs, current.max_occurs)
 }
 
 /// Check whether the derived element is a substitution group member of the
