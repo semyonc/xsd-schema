@@ -27,6 +27,42 @@ pub type SubstitutableNameSet = HashSet<(NameId, Option<NameId>), RandomState>;
 /// `SubstitutableNameSet`.
 pub type SubstitutionGroupMap = HashMap<ElementKey, SubstitutableNameSet, RandomState>;
 
+/// The direct members of every substitution group, by head: the element
+/// declarations whose `{substitution group affiliations}` name it, in arena
+/// order. Built in one pass over the element declarations, so that a walk
+/// down the groups costs the members it visits and not one scan of every
+/// declaration per member.
+///
+/// *Declared membership only*, as in [`is_substitution_group_member`]: no
+/// `block`, `final` or type-derivation check.
+pub(crate) struct SubstitutionMembers {
+    by_head: HashMap<ElementKey, Vec<ElementKey>, RandomState>,
+}
+
+impl SubstitutionMembers {
+    pub(crate) fn new(schema_set: &SchemaSet) -> Self {
+        let mut by_head: HashMap<ElementKey, Vec<ElementKey>, RandomState> = HashMap::default();
+        for (member_key, member) in schema_set.arenas.elements.iter() {
+            for &head_key in &member.resolved_substitution_groups {
+                if head_key == member_key {
+                    continue;
+                }
+                let members = by_head.entry(head_key).or_default();
+                // A head named twice by one declaration is one membership.
+                if members.last() != Some(&member_key) {
+                    members.push(member_key);
+                }
+            }
+        }
+        Self { by_head }
+    }
+
+    /// The declarations affiliated to `head_key` itself (not to its members).
+    pub(crate) fn direct(&self, head_key: ElementKey) -> &[ElementKey] {
+        self.by_head.get(&head_key).map_or(&[], Vec::as_slice)
+    }
+}
+
 /// Build a substitution group membership map for the schema set.
 pub fn build_substitution_group_map(schema_set: &SchemaSet) -> SubstitutionGroupMap {
     build_substitution_group_map_inner(schema_set, false)

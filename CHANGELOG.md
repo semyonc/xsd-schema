@@ -30,6 +30,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sequences, so it accepts both. Restrictions that were accepted before are
   accepted as before.
 
+### Performance
+
+- Compiling a schema with a large substitution group no longer takes time
+  quadratic in the size of the group
+  ([#37](https://github.com/semyonc/xsd-schema/issues/37)). Every sequence,
+  choice and `xs:all` with a reference to the head collected the names of all
+  the members of the group, for a wildcard with `notQName="##definedSibling"`
+  to exclude, whether or not it had such a wildcard, and found the members by
+  scanning every element declaration once per member. The names are now
+  collected only for a group that has a wildcard to read them, through an
+  index of the declarations by head. With 4,000 members and 400 types that
+  refer to the head, schema compilation goes from 18.0 s to 0.52 s and the
+  construction of a `SchemaValidator` from 17.3 s to 1 ms; with a
+  `##definedSibling` wildcard in each type, from 16.4 s and 16.3 s to 0.50 s
+  and 0.10 s. On the ESMA ESEF 2025 taxonomy (5,546 element declarations,
+  most of them in the substitution group of `xbrli:item`) it is 37 ms instead
+  of 110 ms, and under 1 ms instead of 72 ms. Validation results are
+  unchanged. `benches/schema_compile.rs` measures the case.
+
 ## [0.3.1] - 2026-11-08
 
 This release removes no public item and changes no signature. It is faster

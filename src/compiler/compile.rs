@@ -30,6 +30,7 @@ use super::error::{NfaCompileError, NfaCompileResult};
 use super::fragment::{fragment_to_table, FragmentBuilder, NfaFragment};
 use super::nfa::{NfaTable, NfaTerm};
 use super::particle::{apply_occurs, MaxOccurs};
+use super::substitution::SubstitutionMembers;
 use super::ContentModelMatcher;
 
 /// Maximum recursion depth for compiling nested groups
@@ -59,6 +60,9 @@ pub struct CompileContext<'a> {
     /// Current sibling element QNames for ##definedSibling expansion in wildcard compilation.
     /// Set before compiling particles in a model group (sequence/choice/all).
     current_sibling_elements: Vec<(Option<NameId>, NameId)>,
+    /// The members of every substitution group by head, built the first time
+    /// a `##definedSibling` wildcard asks for the siblings.
+    substitution_members: std::sync::OnceLock<SubstitutionMembers>,
     /// When compiling a redefining group, stores (group_name, group_ns, original_key)
     /// so self-referencing QName refs are redirected to the original group.
     redefine_redirect: Option<(NameId, Option<NameId>, ModelGroupKey)>,
@@ -80,6 +84,7 @@ impl<'a> CompileContext<'a> {
             content_flat_idx: None,
             resolved_particle_elements: Vec::new(),
             current_sibling_elements: Vec::new(),
+            substitution_members: std::sync::OnceLock::new(),
             redefine_redirect: None,
             upa_mode: false,
         }
@@ -378,7 +383,7 @@ impl<'a> CompileContext<'a> {
         }
 
         // Set sibling elements for ##definedSibling expansion in wildcards
-        let new_siblings = self.collect_sibling_element_qnames(particles);
+        let new_siblings = self.sibling_element_qnames(particles);
         let saved_siblings = std::mem::replace(&mut self.current_sibling_elements, new_siblings);
 
         let mut result = self.compile_particle_with_index(&particles[0], 0)?;
@@ -399,7 +404,7 @@ impl<'a> CompileContext<'a> {
         }
 
         // Set sibling elements for ##definedSibling expansion in wildcards
-        let new_siblings = self.collect_sibling_element_qnames(particles);
+        let new_siblings = self.sibling_element_qnames(particles);
         let saved_siblings = std::mem::replace(&mut self.current_sibling_elements, new_siblings);
 
         // A particle with minOccurs=maxOccurs=0 "maps to no component at all"
@@ -480,7 +485,7 @@ impl<'a> CompileContext<'a> {
         source: Option<&SourceRef>,
     ) -> NfaCompileResult<AllGroupModel> {
         // Set sibling elements for ##definedSibling expansion in wildcards
-        let new_siblings = self.collect_sibling_element_qnames(particles);
+        let new_siblings = self.sibling_element_qnames(particles);
         let saved_siblings = std::mem::replace(&mut self.current_sibling_elements, new_siblings);
 
         let mut all_particles = Vec::with_capacity(particles.len());
@@ -878,6 +883,49 @@ impl<'a> CompileContext<'a> {
         )
     }
 
+    /// The sibling element QNames of the group with `particles`, for the
+    /// wildcards it compiles: collected only when one of them has
+    /// `notQName="##definedSibling"`. Nothing else reads the list, and
+    /// collecting it walks the substitution group of every element reference.
+    fn sibling_element_qnames(
+        &self,
+        particles: &[ParticleResult],
+    ) -> Vec<(Option<NameId>, NameId)> {
+        if self.wildcard_reads_siblings(particles, 0) {
+            self.collect_sibling_element_qnames(particles)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Does a wildcard that reads the siblings of the group with `particles`
+    /// have `##definedSibling`? Those are the group's own wildcard particles
+    /// and, through group references, the wildcards of the referenced groups:
+    /// a group referenced from an `xs:all` is flattened into it
+    /// (`flatten_all_group_ref_into`), and its wildcards are compiled with
+    /// the siblings of that `xs:all`. An inline group, and a group referenced
+    /// from a sequence or a choice, sets its own siblings before it compiles
+    /// its wildcards; following the references there too only collects a list
+    /// that is not read.
+    fn wildcard_reads_siblings(&self, particles: &[ParticleResult], depth: usize) -> bool {
+        if depth >= self.schema_set.recursion_bound(MAX_RECURSION_DEPTH) {
+            return false;
+        }
+        particles.iter().any(|p| match &p.term {
+            ParticleTerm::Any(wildcard) => wildcard
+                .not_qname
+                .iter()
+                .any(|item| matches!(item, NotQNameItem::DefinedSibling)),
+            ParticleTerm::Group(group) => group
+                .ref_name
+                .as_ref()
+                .and_then(|ref_name| self.resolve_model_group_key(ref_name))
+                .and_then(|key| self.schema_set.arenas.get_model_group(key))
+                .is_some_and(|data| self.wildcard_reads_siblings(&data.particles, depth + 1)),
+            ParticleTerm::Element(_) => false,
+        })
+    }
+
     /// Collect sibling element QNames from a particle list, using proper
     /// namespace resolution (element refs, form attribute, elementFormDefault).
     /// Used for ##definedSibling expansion. Recurses into group refs to
@@ -898,7 +946,7 @@ impl<'a> CompileContext<'a> {
         if depth >= self.schema_set.recursion_bound(MAX_RECURSION_DEPTH) {
             return Vec::new();
         }
-        let mut result = Vec::new();
+        let mut result = SiblingNames::default();
         // A particle with minOccurs=maxOccurs=0 maps to no component, so it
         // declares no sibling element.
         for p in particles.iter().filter(|p| p.max_occurs != Some(0)) {
@@ -916,7 +964,15 @@ impl<'a> CompileContext<'a> {
                             .schema_set
                             .lookup_element(ref_name.namespace, ref_name.local_name)
                         {
-                            collect_substitution_members(self.schema_set, head_key, &mut result);
+                            let members = self
+                                .substitution_members
+                                .get_or_init(|| SubstitutionMembers::new(self.schema_set));
+                            collect_substitution_members(
+                                self.schema_set,
+                                members,
+                                head_key,
+                                &mut result,
+                            );
                         }
                     } else if let Some(name) = elem.name {
                         // Local element — resolve namespace through form/elementFormDefault
@@ -929,10 +985,12 @@ impl<'a> CompileContext<'a> {
                     if let Some(ref_name) = &group.ref_name {
                         if let Some(key) = self.resolve_model_group_key(ref_name) {
                             if let Some(data) = self.schema_set.arenas.get_model_group(key) {
-                                result.extend(self.collect_sibling_element_qnames_inner(
+                                for name in self.collect_sibling_element_qnames_inner(
                                     &data.particles,
                                     depth + 1,
-                                ));
+                                ) {
+                                    result.push(name);
+                                }
                             }
                         }
                     }
@@ -940,17 +998,48 @@ impl<'a> CompileContext<'a> {
                 ParticleTerm::Any(_) => {}
             }
         }
-        result
+        result.names
     }
 }
 
-/// Push QNames of every element that may substitute for `head_key` into `out`,
-/// honoring the head's `block`/`final` restrictions and walking transitively
-/// through nested substitution chains. Used for `##definedSibling` expansion.
+/// Element QNames gathered for `##definedSibling`, in the order found, with
+/// the set of them: asking whether a name is there does not scan the list.
+#[derive(Default)]
+struct SiblingNames {
+    names: Vec<(Option<NameId>, NameId)>,
+    seen: std::collections::HashSet<(Option<NameId>, NameId), ahash::RandomState>,
+}
+
+impl SiblingNames {
+    /// Appends `name`, also when it is already there.
+    fn push(&mut self, name: (Option<NameId>, NameId)) {
+        self.seen.insert(name);
+        self.names.push(name);
+    }
+
+    /// Appends `name` unless it is already there.
+    fn push_new(&mut self, name: (Option<NameId>, NameId)) {
+        if self.seen.insert(name) {
+            self.names.push(name);
+        }
+    }
+}
+
+/// Push the QNames of the declared members of the substitution group of
+/// `head_key` that `out` does not have yet, walking transitively through
+/// nested substitution chains (declared membership: no `block`, `final` or
+/// type-derivation check). Used for `##definedSibling` expansion.
+///
+/// `members` gives the direct members of each head, so the walk costs the
+/// members it visits. Scanning every element declaration for each of them,
+/// and the output list for each name, took time quadratic in the size of the
+/// group — with a group of thousands of members, most of a schema's
+/// compilation.
 fn collect_substitution_members(
     schema_set: &SchemaSet,
+    members: &SubstitutionMembers,
     head_key: ElementKey,
-    out: &mut Vec<(Option<NameId>, NameId)>,
+    out: &mut SiblingNames,
 ) {
     // Resolve through ref to get the canonical head decl.
     let head_key = schema_set
@@ -965,19 +1054,14 @@ fn collect_substitution_members(
         if !visited.insert(current) {
             continue;
         }
-        for (member_key, member) in schema_set.arenas.elements.iter() {
-            if member_key == current {
+        for &member_key in members.direct(current) {
+            let Some(member) = schema_set.arenas.elements.get(member_key) else {
                 continue;
+            };
+            if let Some(name) = member.name {
+                out.push_new((member.target_namespace, name));
             }
-            if member.resolved_substitution_groups.contains(&current) {
-                if let Some(name) = member.name {
-                    let entry = (member.target_namespace, name);
-                    if !out.contains(&entry) {
-                        out.push(entry);
-                    }
-                }
-                stack.push(member_key);
-            }
+            stack.push(member_key);
         }
     }
 }
@@ -2213,25 +2297,8 @@ fn collect_nfa_element_qnames(
     schema_set: &SchemaSet,
     nfa: &NfaTable,
 ) -> Vec<(Option<NameId>, NameId)> {
-    let mut result = Vec::new();
-    for state in &nfa.states {
-        if let Some(NfaTerm::Element {
-            namespace,
-            name,
-            element_key,
-            ..
-        }) = &state.term
-        {
-            let qname = (*namespace, *name);
-            if !result.contains(&qname) {
-                result.push(qname);
-            }
-            if let Some(head_key) = element_key {
-                collect_substitution_members(schema_set, *head_key, &mut result);
-            }
-        }
-    }
-    result
+    let terms = nfa.states.iter().filter_map(|state| state.term.as_ref());
+    collect_term_element_qnames(schema_set, terms)
 }
 
 /// Collect all element QNames from an all-group model (for ##definedSibling
@@ -2240,25 +2307,33 @@ fn collect_all_group_element_qnames(
     schema_set: &SchemaSet,
     model: &AllGroupModel,
 ) -> Vec<(Option<NameId>, NameId)> {
-    let mut result = Vec::new();
-    for particle in &model.particles {
+    collect_term_element_qnames(schema_set, model.particles.iter().map(|p| &p.term))
+}
+
+/// The QNames of the element terms among `terms` and of the members of
+/// their substitution groups, each once.
+fn collect_term_element_qnames<'t>(
+    schema_set: &SchemaSet,
+    terms: impl Iterator<Item = &'t NfaTerm>,
+) -> Vec<(Option<NameId>, NameId)> {
+    let mut result = SiblingNames::default();
+    let mut members: Option<SubstitutionMembers> = None;
+    for term in terms {
         if let NfaTerm::Element {
             namespace,
             name,
             element_key,
             ..
-        } = &particle.term
+        } = term
         {
-            let qname = (*namespace, *name);
-            if !result.contains(&qname) {
-                result.push(qname);
-            }
+            result.push_new((*namespace, *name));
             if let Some(head_key) = element_key {
-                collect_substitution_members(schema_set, *head_key, &mut result);
+                let members = members.get_or_insert_with(|| SubstitutionMembers::new(schema_set));
+                collect_substitution_members(schema_set, members, *head_key, &mut result);
             }
         }
     }
-    result
+    result.names
 }
 
 fn wildcard_ref_from_result(
