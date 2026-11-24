@@ -1972,3 +1972,168 @@ fn test_all_group_default_not_outer_optional() {
         other => panic!("expected AllGroup, got {:?}", other),
     }
 }
+
+/// `collect_substitution_members` as it was before the members were indexed
+/// by head: one scan of every element declaration for each declaration the
+/// walk visits, and one scan of the output for each name.
+fn substitution_members_by_scanning(
+    schema_set: &SchemaSet,
+    head_key: ElementKey,
+    out: &mut Vec<(Option<NameId>, NameId)>,
+) {
+    let head_key = schema_set
+        .arenas
+        .elements
+        .get(head_key)
+        .and_then(|e| e.resolved_ref)
+        .unwrap_or(head_key);
+    let mut visited = std::collections::HashSet::new();
+    let mut stack = vec![head_key];
+    while let Some(current) = stack.pop() {
+        if !visited.insert(current) {
+            continue;
+        }
+        for (member_key, member) in schema_set.arenas.elements.iter() {
+            if member_key == current {
+                continue;
+            }
+            if member.resolved_substitution_groups.contains(&current) {
+                if let Some(name) = member.name {
+                    let entry = (member.target_namespace, name);
+                    if !out.contains(&entry) {
+                        out.push(entry);
+                    }
+                }
+                stack.push(member_key);
+            }
+        }
+    }
+}
+
+/// The indexed walk gives the names the scan gave, in the same order, for
+/// every declaration taken as the head: chains of affiliations, a member
+/// with two heads, a head named twice, groups that share members, and a
+/// list that already has some of the names.
+#[test]
+fn substitution_members_are_those_a_scan_of_every_declaration_finds() {
+    let xsd = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:t="urn:t"
+    targetNamespace="urn:t" elementFormDefault="qualified">
+  <xs:element name="h1" type="xs:string"/>
+  <xs:element name="h2" type="xs:string"/>
+  <xs:element name="a" type="xs:string" substitutionGroup="t:h1"/>
+  <xs:element name="b" type="xs:string" substitutionGroup="t:a"/>
+  <xs:element name="c" type="xs:string" substitutionGroup="t:b"/>
+  <xs:element name="d" type="xs:string" substitutionGroup="t:h1 t:h2"/>
+  <xs:element name="e" type="xs:string" substitutionGroup="t:d t:c"/>
+  <xs:element name="f" type="xs:string" substitutionGroup="t:h2 t:h2"/>
+  <xs:element name="g" type="xs:string" substitutionGroup="t:e"/>
+  <xs:element name="alone" type="xs:string"/>
+  <xs:element name="doc">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element ref="t:h1"/>
+        <xs:element name="local" type="xs:string"/>
+      </xs:sequence>
+    </xs:complexType>
+  </xs:element>
+</xs:schema>"#;
+    let schema_set = crate::SchemaSetBuilder::xsd11()
+        .add_source(xsd, "file:///members.xsd")
+        .and_then(|builder| builder.compile())
+        .expect("schema compiles")
+        .into_schema_set();
+    let members = SubstitutionMembers::new(&schema_set);
+    let name = |local: &str| {
+        (
+            Some(schema_set.name_table.add("urn:t")),
+            schema_set.name_table.add(local),
+        )
+    };
+
+    let mut heads_with_members = 0;
+    for (head_key, _) in schema_set.arenas.elements.iter() {
+        for seed in [vec![], vec![name("c"), name("alone")]] {
+            let mut expected = seed.clone();
+            substitution_members_by_scanning(&schema_set, head_key, &mut expected);
+            let mut found = SiblingNames::default();
+            for entry in &seed {
+                found.push(*entry);
+            }
+            collect_substitution_members(&schema_set, &members, head_key, &mut found);
+            assert_eq!(found.names, expected);
+            heads_with_members += usize::from(expected.len() > seed.len());
+        }
+    }
+    // h1, h2, a, b, c, d and e have members, with and without the seed.
+    assert_eq!(heads_with_members, 14);
+
+    let h1 = schema_set
+        .lookup_element(name("h1").0, name("h1").1)
+        .unwrap();
+    let mut of_h1 = SiblingNames::default();
+    collect_substitution_members(&schema_set, &members, h1, &mut of_h1);
+    let all = [
+        name("a"),
+        name("b"),
+        name("c"),
+        name("d"),
+        name("e"),
+        name("g"),
+    ];
+    assert_eq!(of_h1.names.len(), all.len());
+    assert!(all.iter().all(|entry| of_h1.names.contains(entry)));
+}
+
+/// The siblings are collected for a group only when a wildcard that reads
+/// them has `##definedSibling`: a particle of the group, or of a group it
+/// refers to.
+#[test]
+fn sibling_qnames_are_collected_only_for_a_defined_sibling_wildcard() {
+    let wildcard = |not_qname: Vec<NotQNameItem>| ParticleResult {
+        term: ParticleTerm::Any(WildcardResult {
+            namespace: WildcardNamespace::Any,
+            process_contents: ProcessContents::Lax,
+            not_namespace: Vec::new(),
+            not_qname,
+            id: None,
+            annotation: None,
+            source: None,
+        }),
+        min_occurs: 0,
+        max_occurs: Some(1),
+        source: None,
+    };
+    let schema_set = SchemaSet::with_version(XsdVersion::V1_1);
+    let a = schema_set.name_table.add("a");
+    let b = schema_set.name_table.add("b");
+    let ctx = CompileContext::new(&schema_set, None);
+    let element = |name| make_element_particle(name, 1, Some(1));
+
+    // No wildcard, and a wildcard that names what it excludes.
+    assert!(ctx
+        .sibling_element_qnames(&[element(a), element(b)])
+        .is_empty());
+    let named = wildcard(vec![NotQNameItem::QName {
+        namespace: None,
+        local_name: a,
+    }]);
+    assert!(ctx.sibling_element_qnames(&[element(a), named]).is_empty());
+    // A `##definedSibling` wildcard nested in an inline group reads the
+    // siblings of that group, not of this one.
+    let nested = make_sequence_particle(vec![
+        element(b),
+        wildcard(vec![NotQNameItem::DefinedSibling]),
+    ]);
+    assert!(ctx.sibling_element_qnames(&[element(a), nested]).is_empty());
+
+    let siblings = ctx.sibling_element_qnames(&[
+        element(a),
+        element(b),
+        wildcard(vec![NotQNameItem::DefinedSibling]),
+    ]);
+    assert_eq!(siblings, vec![(None, a), (None, b)]);
+    assert_eq!(
+        siblings,
+        ctx.collect_sibling_element_qnames(&[element(a), element(b)])
+    );
+}
