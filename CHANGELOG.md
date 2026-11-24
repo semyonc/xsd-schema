@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A complex-content restriction that names a member of a substitution group
+  where the base names the head is no longer rejected with
+  `derivation-ok-restriction` because of the member's own declaration — a type
+  that extends the head's, `nillable`, a different `fixed` value or `block`
+  ([#36](https://github.com/semyonc/xsd-schema/issues/36)). The check compared
+  the member with the head; the declaration it answers to is the member
+  itself (XSD 1.0 §3.9.6 Particle Valid (Restriction)
+  clause 2.1, where the head's particle stands for a choice of the members of
+  its group; XSD 1.1 §3.4.6.4 clause 2, where the governing declaration of
+  such an element is the member's). What a member's type owes the head's is
+  Element Declaration Properties Correct, which was and is checked. The XBRL
+  2.1 linkbase schema (`link:presentationArc` for `xl:arc`, `link:loc` for
+  `xl:locator`, …) loads with this.
+
+  Under XSD 1.0 a member accepted by this rule has to occur once where it is
+  written, as its particle in that choice does: `bar` with `maxOccurs="2"`
+  against the head with `maxOccurs="3"` stays invalid (W3C `particlesV020`),
+  while a repeated choice of `bar` is accepted. XSD 1.1 compares the element
+  sequences, so it accepts both. Restrictions that were accepted before are
+  accepted as before.
+
 ## [0.3.1] - 2026-11-08
 
 This release removes no public item and changes no signature. It is faster
