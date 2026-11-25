@@ -19,13 +19,19 @@ cargo test --all-targets --features xsd11     # Run ALL tests
 ```
 
 ### Miri (unsafe code verification):
+The `unsafe` blocks are verified by targeted runs under an isolated Miri (no
+`-Zmiri-disable-isolation`); `doc/UNSAFE.md` maps each run to its block:
 ```bash
-cargo +nightly miri test --lib namespace::table   # NameTable unsafe verification
-cargo +nightly miri test --lib                     # Full lib under Miri
-MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test --lib --features xsd11   # + XSD 1.1
+cargo +nightly miri test --lib namespace::table::tests
+cargo +nightly miri test --lib --features xsd11 validation::runtime::tests::assertion_runtime_tests
+cargo +nightly miri test --lib types::tests::test_xml_type_code_roundtrip
+cargo +nightly miri test --lib xml::tests::bytes_that_are_not_utf8_are_refused_as_the_checks_refuse_them
+cargo +nightly miri test --lib xml::tests::                            # also with MIRIFLAGS=-Zmiri-tree-borrows
+cargo +nightly miri test --lib --features xsd11 xpath::context::tests::current_date_time_from_a_fixed_clock
 ```
-With `xsd11` the XPath engine reads the clock, which isolated Miri refuses; the
-targeted runs per `unsafe` block are in `doc/UNSAFE.md`.
+The whole library suite (`cargo +nightly miri test --lib`) has tests that create files and resolve schema
+locations against the working directory, so it does not run under an isolated Miri; it is not the
+verification of record for the `unsafe` blocks.
 
 ### Doctests (the guides in `doc/` are doctested):
 ```bash

@@ -10,8 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 This will be 0.4.0. It raises the minimum supported Rust version, moves to
 quick-xml 0.42, lalrpop 0.23 and regexml-fork 0.4, and takes quick-xml's types
 out of the public API, so that a later quick-xml release no longer changes this
-crate's API. Code that uses none of the items under *Breaking changes* and
-builds with Rust 1.88 needs no change; [Upgrading to 0.4](doc/UPGRADING_0_4.md)
+crate's API. The XPath engine (`xsd11`) takes UTC as the implicit timezone when
+none is set, instead of the host's local offset, and the crate no longer
+depends on `chrono`. Code that uses none of the items under *Breaking changes*
+and builds with Rust 1.88 needs no change; [Upgrading to 0.4](doc/UPGRADING_0_4.md)
 has the 0.3.x and the 0.4 code for each item. 0.3.1 stays the release for Rust
 1.85 to 1.87.
 
@@ -45,6 +47,35 @@ corpora give the same results.
   The validation drivers (`drive_quick_xml` and its variants),
   `BufferDocument` and the schema loaders take a `BufRead` or a byte slice, as
   before.
+- XPath (`xsd11`): the implicit timezone of an evaluation that sets none is UTC
+  (`Z`), no longer the host's local offset (the process's `TZ`). It is the
+  timezone a date/time value without one is read in when it meets one with a
+  timezone — comparisons, subtraction, the one-argument
+  `fn:adjust-*-to-timezone` — and the value of `fn:implicit-timezone` and the
+  zone of `fn:current-dateTime`; the functions that take no dynamic context
+  (`operators::value_eq`, `eval_binary`, `general_eq`, …) use it too. Schema
+  validation sets no implicit timezone, so an XSD 1.1 assertion or type
+  alternative that compares a date without a timezone with one that has a
+  timezone now gives the same verdict on every machine; in 0.3 it depended on
+  the machine's `TZ`. F&O 1.0 §16.6 and XSD 1.1 Structures §3.13.4.2 clause 7
+  leave the implicit timezone implementation-defined. A host that wants its
+  local time sets the offset itself, computed with the time-zone library it
+  uses — `jiff::Zoned::now().offset().seconds() / 60` (an `i32`) with `jiff`,
+  `time::UtcOffset::current_local_offset()?.whole_minutes()` (an `i16`) with
+  `time` and its `local-offset` feature, …:
+
+  ```rust
+  let minutes: i16 = host_offset_minutes(); // the host's offset now, east of UTC
+  let ctx = XPathContext::new(&names).with_implicit_timezone(TimezoneOffset(minutes));
+  ```
+
+  (`DynamicContext::with_implicit_timezone` does the same for a dynamic context
+  the host builds itself.) The W3C suites and XQTS give the same results.
+- XPath (`xsd11`) on `wasm32-unknown-unknown`, whose standard library has no
+  clock: `fn:current-dateTime`, `fn:current-date` and `fn:current-time` raise
+  the dynamic error `XPDY0002` unless the host sets
+  `DynamicContext::current_datetime` (0.3 read the browser's clock through
+  `chrono`). Every other target reads `std::time::SystemTime` as before.
 
 ### Added
 
@@ -87,6 +118,21 @@ corpora give the same results.
 - Schema documents are read in place: loading a schema from bytes no longer
   copies each event of the document into a buffer. What is loaded and every
   error are as before.
+- `chrono` is no longer a dependency (`cargo audit` reported it unmaintained,
+  RUSTSEC-2026-0543): the XPath engine reads the current instant from
+  `std::time::SystemTime` and converts it to a date and time itself, and it
+  no longer reads the host's time zone. `chrono` was a required dependency:
+  every build, the default one included, no longer compiles it nor
+  `iana-time-zone` and the platform crates behind them — `core-foundation-sys`
+  on Apple targets, `windows-core` and four more `windows-*` crates on Windows,
+  `android_system_properties` on Android, `js-sys` and `wasm-bindgen` on
+  `wasm32-unknown-unknown`, `iana-time-zone-haiku` (and `cc`) on Haiku.
+
+### Deprecated
+
+- `xpath::DynamicContext::implicit_timezone_or_host` is renamed
+  `effective_implicit_timezone`, since the timezone it falls back to is no
+  longer the host's but UTC. The old name stays, deprecated, for 0.4.
 
 ### Fixed
 

@@ -37,7 +37,7 @@ fn empty_ns_context() -> NamespaceContextSnapshot {
 
 fn load_schema(xsd: &str) -> SchemaSet {
     let mut schema_set = SchemaSet::new();
-    load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None)
+    load_and_process_schema(xsd.as_bytes(), "memory:///test.xsd", &mut schema_set, None)
         .expect("failed to load schema");
     schema_set
 }
@@ -45,7 +45,7 @@ fn load_schema(xsd: &str) -> SchemaSet {
 #[cfg(feature = "xsd11")]
 fn load_schema_xsd11(xsd: &str) -> SchemaSet {
     let mut schema_set = SchemaSet::xsd11();
-    load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None)
+    load_and_process_schema(xsd.as_bytes(), "memory:///test.xsd", &mut schema_set, None)
         .expect("failed to load schema");
     schema_set
 }

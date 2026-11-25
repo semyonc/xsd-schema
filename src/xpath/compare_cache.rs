@@ -343,7 +343,7 @@ fn compare_values<N: DomNavigator>(
     let context = ctx.static_context;
     let left_iter = VecNodeIterator::new(left.into_vec());
     let right_iter = VecNodeIterator::new(right.into_vec());
-    let tz = ctx.implicit_timezone_or_host();
+    let tz = ctx.effective_implicit_timezone();
     let deferred = ctx.deferred_default_collation();
     if is_eq {
         operators::general_eq_iter_collated(context, &left_iter, &right_iter, deferred.as_ref(), tz)
@@ -853,7 +853,7 @@ fn probe<N: DomNavigator>(
     // The implicit timezone, which cannot change during a run either (it is
     // read once per dynamic context), so an index keyed on date/time values
     // stays keyed the way this probe reads them.
-    let tz = ctx.implicit_timezone_or_host();
+    let tz = ctx.effective_implicit_timezone();
     // The static context's default collation, which cannot change during a run,
     // so an index built under it stays keyed the way this probe reads it. It is
     // resolved — through the per-run memo — only when a string key is needed.

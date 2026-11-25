@@ -104,7 +104,7 @@ pub fn index_of<N: DomNavigator>(
 
     let has_collation_arg = args.len() == 3;
     let collation = call_collation(context, &mut args, has_collation_arg, has_collation_arg)?;
-    let tz = context.implicit_timezone_or_host();
+    let tz = context.effective_implicit_timezone();
 
     // Get the sequence (arg 0) and search value (arg 1)
     let seq = args.remove(0);
@@ -413,7 +413,7 @@ pub fn distinct_values<N: DomNavigator>(
 
     let has_collation_arg = args.len() == 2;
     let collation = call_collation(context, &mut args, has_collation_arg, has_collation_arg)?;
-    let tz = context.implicit_timezone_or_host();
+    let tz = context.effective_implicit_timezone();
     let seq = args.remove(0);
 
     // Atomize the sequence
@@ -700,7 +700,7 @@ pub fn deep_equal<N: DomNavigator>(
     // the walk starts rather than silently become the codepoint one.
     let has_collation_arg = args.len() == 3;
     let collation = call_collation(context, &mut args, has_collation_arg, true)?;
-    let tz = context.implicit_timezone_or_host();
+    let tz = context.effective_implicit_timezone();
 
     let param1 = args.remove(0);
     let param2 = args.remove(0);

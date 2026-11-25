@@ -799,8 +799,8 @@ atomization), the first item of a sequence where a function expects one.
 A date/time value without a time zone is compared, subtracted and adjusted with
 the *implicit timezone* of the dynamic context (F&O §10.4), which also gives
 `fn:implicit-timezone()` and the zone of `fn:current-dateTime()`. Set it on the
-static context; without one the host's local offset applies, read once per
-evaluation:
+static context; without one it is UTC, whatever the `TZ` of the process (a host
+that wants its local time sets the local offset it computes):
 
 ```rust
 # #[cfg(feature = "xsd11")] {

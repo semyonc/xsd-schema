@@ -34,9 +34,6 @@ thiserror = "1.0"            # Error derive macros
 # Pattern matching and validation
 regex = "1.10"               # Pattern facet validation
 
-# Date/time types (for Phase 2 - type system)
-chrono = "0.4"               # Date/time types
-
 # Precision decimals (for Phase 2 - type system)
 rust_decimal = "1.33"        # xs:decimal precision
 

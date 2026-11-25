@@ -147,7 +147,7 @@ pub fn min<N: DomNavigator>(
     let collation = call_collation(context, &mut args, has_collation_arg)?;
     // F&O §15.4.3: the values are compared with `lt` / `gt`, a date/time
     // value without a timezone in the implicit timezone.
-    let tz = context.implicit_timezone_or_host();
+    let tz = context.effective_implicit_timezone();
     let seq = args.remove(0);
 
     let values = atomize_sequence(seq)?;
@@ -206,7 +206,7 @@ pub fn max<N: DomNavigator>(
     let collation = call_collation(context, &mut args, has_collation_arg)?;
     // F&O §15.4.3: the values are compared with `lt` / `gt`, a date/time
     // value without a timezone in the implicit timezone.
-    let tz = context.implicit_timezone_or_host();
+    let tz = context.effective_implicit_timezone();
     let seq = args.remove(0);
 
     let values = atomize_sequence(seq)?;

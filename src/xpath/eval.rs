@@ -365,7 +365,7 @@ pub fn eval_node<N: DomNavigator>(
                                 &left,
                                 &right,
                                 crate::xpath::collation::CollationRef::Codepoint,
-                                ctx.implicit_timezone_or_host(),
+                                ctx.effective_implicit_timezone(),
                                 &mut truncated,
                             )?;
                             if truncated {
@@ -397,7 +397,7 @@ pub fn eval_node<N: DomNavigator>(
                             // operand without a timezone is read in the
                             // implicit timezone of this dynamic context (F&O
                             // §10.4), in comparisons and in subtraction.
-                            let tz = ctx.implicit_timezone_or_host();
+                            let tz = ctx.effective_implicit_timezone();
                             let deferred = ctx.deferred_default_collation();
                             let mut truncated = false;
                             let result = crate::xpath::operators::eval_binary_noted(
@@ -521,7 +521,7 @@ pub fn eval_node<N: DomNavigator>(
                         // atomization, with the static context for its casts.
                         let static_context = ctx.static_context;
                         let compat = (!ebv_is_xpath10(static_context)).then_some(static_context);
-                        let tz = ctx.implicit_timezone_or_host();
+                        let tz = ctx.effective_implicit_timezone();
                         let deferred = ctx.deferred_default_collation();
                         crate::xpath::operators::general_compare_iter_10(
                             bin_op.kind,
@@ -537,7 +537,7 @@ pub fn eval_node<N: DomNavigator>(
                         // F&O §10.4: the implicit timezone of the dynamic
                         // context, for date/time values without one.
                         let static_context = ctx.static_context;
-                        let tz = ctx.implicit_timezone_or_host();
+                        let tz = ctx.effective_implicit_timezone();
                         let deferred = ctx.deferred_default_collation();
                         let collation = deferred.as_ref();
                         let (l, r) = (&left_iter, &right_iter);

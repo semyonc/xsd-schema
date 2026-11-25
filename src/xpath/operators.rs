@@ -91,8 +91,8 @@ pub fn eval_unary(op: UnaryOpKind, value: &XmlValue) -> Result<XmlValue, XPathEr
 /// what the `eq`, `ne`, `lt`, `le`, `gt` and `ge` operators of an expression do
 /// — the engine uses the crate-private `eval_binary_collated`.
 ///
-/// A date/time operand without a timezone is read in the host's local offset
-/// at the time of the call (F&O 1.0 §10.4 takes the implicit timezone from the
+/// A date/time operand without a timezone is read in UTC, the default
+/// implicit timezone (F&O 1.0 §10.4 takes the implicit timezone from the
 /// dynamic context, and this function has none); use
 /// [`eval_binary_with_timezone`] to give the implicit timezone.
 pub fn eval_binary(
@@ -100,7 +100,7 @@ pub fn eval_binary(
     left: &XmlValue,
     right: &XmlValue,
 ) -> Result<XmlValue, XPathError> {
-    eval_binary_with_timezone(op, left, right, host_timezone_for(left, right))
+    eval_binary_with_timezone(op, left, right, DEFAULT_IMPLICIT_TIMEZONE)
 }
 
 /// [`eval_binary`] with `implicit_timezone` as the implicit timezone of the
@@ -113,7 +113,7 @@ pub fn eval_binary(
 ///
 /// A host that evaluates expressions passes the timezone of the dynamic
 /// context it evaluates them in —
-/// [`DynamicContext::implicit_timezone_or_host`](crate::xpath::DynamicContext::implicit_timezone_or_host)
+/// [`DynamicContext::effective_implicit_timezone`](crate::xpath::DynamicContext::effective_implicit_timezone)
 /// — so that its own comparisons (sort keys, grouping keys) agree with the
 /// expressions'.
 ///
@@ -1891,39 +1891,31 @@ fn numeric_factor(value: &XmlValue) -> Result<f64, XPathError> {
         .ok_or_else(|| XPathError::internal("Expected numeric value"))
 }
 
-/// The `fn:implicit-timezone` of a context that has none: the host's local
-/// offset now (`chrono::Local`).
+/// The implicit timezone when nobody sets one: UTC.
+///
+/// F&O 1.0 §16.6 and XSD 1.1 Structures §3.13.4.2 clause 7 leave the implicit
+/// timezone ·implementation-defined·; this engine takes `Z`, not the host's
+/// local offset, so that a comparison of a date/time value without a timezone
+/// gives the same answer on every machine. A host that wants another one sets
+/// it ([`XPathContext::with_implicit_timezone`],
+/// [`DynamicContext::with_implicit_timezone`]).
 ///
 /// Used by the public functions that take no dynamic context
-/// ([`value_eq`], [`eval_binary`], …); a dynamic context reads its own once
-/// per evaluation ([`DynamicContext::implicit_timezone_or_host`]).
+/// ([`value_eq`], [`eval_binary`], …) and by a dynamic context without an
+/// implicit timezone of its own
+/// ([`DynamicContext::effective_implicit_timezone`]).
 ///
-/// [`DynamicContext::implicit_timezone_or_host`]: crate::xpath::DynamicContext::implicit_timezone_or_host
-pub(crate) fn host_implicit_timezone() -> TimezoneOffset {
-    crate::xpath::context::host_offset_at(chrono::Utc::now())
-}
+/// [`XPathContext::with_implicit_timezone`]: crate::xpath::XPathContext::with_implicit_timezone
+/// [`DynamicContext::with_implicit_timezone`]: crate::xpath::DynamicContext::with_implicit_timezone
+/// [`DynamicContext::effective_implicit_timezone`]: crate::xpath::DynamicContext::effective_implicit_timezone
+pub(crate) const DEFAULT_IMPLICIT_TIMEZONE: TimezoneOffset = TimezoneOffset::UTC;
 
-/// The host's implicit timezone when `left` or `right` is a value the
-/// implicit timezone can apply to (a date/time or gregorian value), else `Z`,
-/// which nothing reads — so the context-free functions consult the host's
-/// clock only for the comparisons that need it.
-fn host_timezone_for(left: &XmlValue, right: &XmlValue) -> TimezoneOffset {
-    let zoned = |value: &XmlValue| {
-        let code = unwrap_union_value(value).type_code;
-        (is_temporal_type(code) && !is_duration_code(code)) || is_gregorian_code(code)
-    };
-    if zoned(left) || zoned(right) {
-        host_implicit_timezone()
-    } else {
-        TimezoneOffset::UTC
-    }
-}
-
-/// The implicit timezone of a static context: its own, or the host's.
+/// The implicit timezone of a static context: its own, or
+/// [`DEFAULT_IMPLICIT_TIMEZONE`].
 pub(super) fn static_timezone(context: &XPathContext) -> TimezoneOffset {
     context
         .implicit_timezone
-        .unwrap_or_else(host_implicit_timezone)
+        .unwrap_or(DEFAULT_IMPLICIT_TIMEZONE)
 }
 
 // ----------------------------------------------------------------------------
@@ -2071,6 +2063,33 @@ fn civil_fields(
         (second_of_day % 3_600 / 60) as u8,
         seconds_with_fraction((second_of_day % 60) as u32, fraction, truncated),
     ))
+}
+
+/// The `xs:dateTime` of an instant of the system clock — `seconds` since
+/// 1970-01-01T00:00:00Z (negative before it) and `nanos` into that second,
+/// below 10⁹ — expressed in the timezone `tz`: the local time of the instant
+/// there, labelled `tz` (F&O 1.0 §16.3, `fn:current-dateTime`). FODT0001 when
+/// the year is beyond the `i32` the value struct holds.
+pub(crate) fn datetime_from_unix(
+    seconds: i64,
+    nanos: u32,
+    tz: TimezoneOffset,
+) -> Result<DateTimeValue, XPathError> {
+    debug_assert!(nanos < 1_000_000_000, "nanoseconds into a second");
+    let local = i128::from(seconds) + i128::from(tz.0) * 60;
+    // Nine fractional digits always fit next to seconds below 60.
+    let mut truncated = false;
+    let (year, month, day, hour, minute, second) =
+        civil_fields((local, Decimal::new(i64::from(nanos), 9)), &mut truncated)?;
+    Ok(DateTimeValue {
+        year,
+        month,
+        day,
+        hour,
+        minute,
+        second,
+        timezone: Some(tz),
+    })
 }
 
 /// F&O §10.8.4, §10.8.5 (and the subtractions): the months are added to the
@@ -2823,15 +2842,15 @@ impl<I: XmlNodeIterator> AtomCursor<I> {
 ///
 /// Strings are compared under the Unicode codepoint collation; the collated
 /// twins below take the collation the expression is actually evaluated with.
-/// A date/time value without a timezone is read in the host's local offset at
-/// the time of the call; [`eval_binary_with_timezone`] takes the implicit
-/// timezone of a dynamic context instead.
+/// A date/time value without a timezone is read in UTC, the default implicit
+/// timezone; [`eval_binary_with_timezone`] takes the implicit timezone of a
+/// dynamic context instead.
 pub fn value_eq(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
     compare_eq(
         left,
         right,
         CollationRef::Codepoint,
-        host_timezone_for(left, right),
+        DEFAULT_IMPLICIT_TIMEZONE,
     )
 }
 
@@ -2841,7 +2860,7 @@ pub fn value_gt(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
         left,
         right,
         CollationRef::Codepoint,
-        host_timezone_for(left, right),
+        DEFAULT_IMPLICIT_TIMEZONE,
     )
 }
 
@@ -2852,7 +2871,7 @@ pub fn value_ge(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
         left,
         right,
         CollationRef::Codepoint,
-        host_timezone_for(left, right),
+        DEFAULT_IMPLICIT_TIMEZONE,
     )
 }
 
@@ -2862,7 +2881,7 @@ pub fn value_lt(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
         left,
         right,
         CollationRef::Codepoint,
-        host_timezone_for(left, right),
+        DEFAULT_IMPLICIT_TIMEZONE,
     )
 }
 
@@ -2873,7 +2892,7 @@ pub fn value_le(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
         left,
         right,
         CollationRef::Codepoint,
-        host_timezone_for(left, right),
+        DEFAULT_IMPLICIT_TIMEZONE,
     )
 }
 
@@ -2917,13 +2936,13 @@ pub(crate) fn value_lt_collated(
 /// For sequence comparisons, use `general_eq_seq`.
 pub fn general_eq(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
     let (l, r) = magnitude_relationship(left, right)?;
-    compare_eq(&l, &r, CollationRef::Codepoint, host_timezone_for(&l, &r))
+    compare_eq(&l, &r, CollationRef::Codepoint, DEFAULT_IMPLICIT_TIMEZONE)
 }
 
 /// General greater-than comparison with magnitude relationship promotion (single values).
 pub fn general_gt(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
     let (l, r) = magnitude_relationship(left, right)?;
-    compare_gt(&l, &r, CollationRef::Codepoint, host_timezone_for(&l, &r))
+    compare_gt(&l, &r, CollationRef::Codepoint, DEFAULT_IMPLICIT_TIMEZONE)
 }
 
 /// General not-equal comparison with magnitude relationship promotion (single values).
@@ -2934,19 +2953,19 @@ pub fn general_ne(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError>
 /// General greater-than-or-equal comparison with magnitude relationship promotion (single values).
 pub fn general_ge(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
     let (l, r) = magnitude_relationship(left, right)?;
-    compare_ge(&l, &r, CollationRef::Codepoint, host_timezone_for(&l, &r))
+    compare_ge(&l, &r, CollationRef::Codepoint, DEFAULT_IMPLICIT_TIMEZONE)
 }
 
 /// General less-than comparison with magnitude relationship promotion (single values).
 pub fn general_lt(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
     let (l, r) = magnitude_relationship(left, right)?;
-    compare_lt(&l, &r, CollationRef::Codepoint, host_timezone_for(&l, &r))
+    compare_lt(&l, &r, CollationRef::Codepoint, DEFAULT_IMPLICIT_TIMEZONE)
 }
 
 /// General less-than-or-equal comparison with magnitude relationship promotion (single values).
 pub fn general_le(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
     let (l, r) = magnitude_relationship(left, right)?;
-    compare_le(&l, &r, CollationRef::Codepoint, host_timezone_for(&l, &r))
+    compare_le(&l, &r, CollationRef::Codepoint, DEFAULT_IMPLICIT_TIMEZONE)
 }
 
 // ============================================================================
@@ -3604,7 +3623,7 @@ where
         left,
         right,
         CollationRef::Codepoint,
-        host_implicit_timezone(),
+        DEFAULT_IMPLICIT_TIMEZONE,
         None,
     )
 }
@@ -3620,7 +3639,7 @@ where
         left,
         right,
         CollationRef::Codepoint,
-        host_implicit_timezone(),
+        DEFAULT_IMPLICIT_TIMEZONE,
         None,
     )
 }
@@ -3636,7 +3655,7 @@ where
         left,
         right,
         CollationRef::Codepoint,
-        host_implicit_timezone(),
+        DEFAULT_IMPLICIT_TIMEZONE,
         None,
     )
 }
@@ -3652,7 +3671,7 @@ where
         left,
         right,
         CollationRef::Codepoint,
-        host_implicit_timezone(),
+        DEFAULT_IMPLICIT_TIMEZONE,
         None,
     )
 }
@@ -3668,7 +3687,7 @@ where
         left,
         right,
         CollationRef::Codepoint,
-        host_implicit_timezone(),
+        DEFAULT_IMPLICIT_TIMEZONE,
         None,
     )
 }
@@ -3684,7 +3703,7 @@ where
         left,
         right,
         CollationRef::Codepoint,
-        host_implicit_timezone(),
+        DEFAULT_IMPLICIT_TIMEZONE,
         None,
     )
 }
@@ -4263,11 +4282,79 @@ mod tests {
 
     #[test]
     fn test_time_compare_uses_implicit_timezone() {
-        let implicit = host_implicit_timezone();
+        // Without a dynamic context the implicit timezone is UTC, whatever the
+        // process's `TZ`.
+        assert_eq!(DEFAULT_IMPLICIT_TIMEZONE, TimezoneOffset::UTC);
         let left = time_value(10, 0, Decimal::ZERO);
-        let right = time_value_with_tz(10, 0, Decimal::ZERO, implicit);
-        let result = eval_binary(BinaryOpKind::GeneralEq, &left, &right).unwrap();
+        let utc = time_value_with_tz(10, 0, Decimal::ZERO, TimezoneOffset::UTC);
+        let result = eval_binary(BinaryOpKind::GeneralEq, &left, &utc).unwrap();
         assert_eq!(result.as_boolean(), Some(true));
+        let east = time_value_with_tz(10, 0, Decimal::ZERO, TimezoneOffset::from_hm(1, 0));
+        let result = eval_binary(BinaryOpKind::GeneralEq, &left, &east).unwrap();
+        assert_eq!(result.as_boolean(), Some(false));
+    }
+
+    /// `datetime_from_unix` at fixed instants, in the lexical form.
+    fn unix(seconds: i64, nanos: u32, tz_minutes: i16) -> String {
+        datetime_from_unix(seconds, nanos, TimezoneOffset(tz_minutes))
+            .expect("in range")
+            .to_string()
+    }
+
+    #[test]
+    fn test_datetime_from_unix_at_the_epoch_and_before() {
+        assert_eq!(unix(0, 0, 0), "1970-01-01T00:00:00Z");
+        assert_eq!(unix(0, 1, 0), "1970-01-01T00:00:00.000000001Z");
+        // A negative instant: the seconds are floored, the nanoseconds count
+        // forward from them.
+        assert_eq!(unix(-1, 0, 0), "1969-12-31T23:59:59Z");
+        assert_eq!(unix(-2, 500_000_000, 0), "1969-12-31T23:59:58.5Z");
+        assert_eq!(unix(-2_203_891_200, 0, 0), "1900-03-01T00:00:00Z");
+        assert_eq!(unix(-62_135_596_800, 0, 0), "0001-01-01T00:00:00Z");
+        // The XPath years have no year 0: the second before 0001 is in -0001.
+        assert_eq!(unix(-62_135_596_801, 0, 0), "-0001-12-31T23:59:59Z");
+    }
+
+    #[test]
+    fn test_datetime_from_unix_on_29_february_and_at_the_end_of_a_year() {
+        assert_eq!(unix(1_709_208_000, 0, 0), "2024-02-29T12:00:00Z");
+        assert_eq!(unix(951_868_799, 0, 0), "2000-02-29T23:59:59Z");
+        assert_eq!(unix(951_868_800, 0, 0), "2000-03-01T00:00:00Z");
+        // 2100 is not a leap year.
+        assert_eq!(unix(4_107_538_800 + 3_600, 0, 0), "2100-03-01T00:00:00Z");
+        // The last second of 1999, its last nanosecond, and the next instant.
+        assert_eq!(unix(946_684_799, 0, 0), "1999-12-31T23:59:59Z");
+        assert_eq!(
+            unix(946_684_799, 999_999_999, 0),
+            "1999-12-31T23:59:59.999999999Z"
+        );
+        assert_eq!(unix(946_684_800, 0, 0), "2000-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn test_datetime_from_unix_shifts_across_midnight() {
+        // Forward: 2000-01-01T23:30:00Z is the next day east of UTC …
+        assert_eq!(unix(946_769_400, 0, 60), "2000-01-02T00:30:00+01:00");
+        // … and the next year east of UTC on 31 December.
+        assert_eq!(unix(946_684_799, 0, 5 * 60), "2000-01-01T04:59:59+05:00");
+        assert_eq!(unix(946_684_799, 0, 14 * 60), "2000-01-01T13:59:59+14:00");
+        // Backward: 2000-01-01T00:30:00Z is the previous day (and year) west
+        // of UTC, and 2000-03-01T01:00:00Z falls back to 29 February.
+        assert_eq!(unix(946_686_600, 0, -5 * 60), "1999-12-31T19:30:00-05:00");
+        assert_eq!(unix(951_872_400, 0, -14 * 60), "2000-02-29T11:00:00-14:00");
+        assert_eq!(unix(0, 0, -(3 * 60 + 30)), "1969-12-31T20:30:00-03:30");
+    }
+
+    #[test]
+    fn test_datetime_from_unix_beyond_the_year_range() {
+        assert!(matches!(
+            datetime_from_unix(i64::MAX, 0, TimezoneOffset::UTC),
+            Err(XPathError::FODT0001)
+        ));
+        assert!(matches!(
+            datetime_from_unix(i64::MIN, 0, TimezoneOffset(-14 * 60)),
+            Err(XPathError::FODT0001)
+        ));
     }
 
     #[test]

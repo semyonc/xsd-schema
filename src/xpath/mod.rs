@@ -8,11 +8,11 @@
 //! dynamic context ([`DynamicContext`]) of each run. The dynamic context holds
 //! the focus, the variables, the current dateTime and the **implicit
 //! timezone** — [`XPathContext::with_implicit_timezone`] or
-//! [`DynamicContext::with_implicit_timezone`]; without one, the host's local
-//! offset, read once per evaluation
-//! ([`DynamicContext::implicit_timezone_or_host`]). Date/time and duration
-//! comparison and arithmetic are exact and raise the F&O errors at the limits
-//! of the value types.
+//! [`DynamicContext::with_implicit_timezone`]; without one, UTC, whatever the
+//! `TZ` of the process ([`DynamicContext::effective_implicit_timezone`]). The
+//! current dateTime is read from the system clock once per evaluation unless
+//! the host sets one. Date/time and duration comparison and arithmetic are
+//! exact and raise the F&O errors at the limits of the value types.
 //!
 //! A host can lend a run a [`RegexCache`] it keeps across runs
 //! ([`XPathEvaluator::with_regex_cache`]) and collect the run's

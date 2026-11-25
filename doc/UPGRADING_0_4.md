@@ -1,15 +1,16 @@
 # Upgrading from 0.3.x to 0.4
 
 0.4.0 raises the minimum supported Rust version, moves to quick-xml 0.42,
-lalrpop 0.23 and regexml-fork 0.4, and takes quick-xml's types out of the
-public API. Code that names none of the items in section 2 and builds with
-Rust 1.88 needs no change. This guide has, in that order:
+lalrpop 0.23 and regexml-fork 0.4, takes quick-xml's types out of the
+public API, and drops `chrono`: the XPath engine's implicit timezone is UTC
+when none is set. Code that names none of the items in section 2 and builds
+with Rust 1.88 needs no change. This guide has, in that order:
 
 1. [The minimum Rust version](#1-minimum-rust-version);
 2. [Code changes](#2-code-changes): the public items that carried quick-xml
-   types, each with the 0.3.x code and the 0.4 code;
+   types, each with the 0.3.x code and the 0.4 code, and one renamed method;
 3. [Behaviour changes](#3-behaviour-changes): what the new dependencies change
-   in matching and what they do not.
+   in matching and what they do not, and the implicit timezone.
 
 The [CHANGELOG](../CHANGELOG.md) lists every change. In the examples below, a
 block marked as 0.3.x code is not compiled (it no longer builds); every other
@@ -110,11 +111,76 @@ called it reads the attributes with quick-xml (0.42: `Attribute::normalized_valu
 normalizes the value) and builds `ParsedAttribute` itself — its fields are
 public — then uses `categorize_attributes` and `AttributeMap` as before.
 
+### 2.4 `DynamicContext::implicit_timezone_or_host`
+
+Renamed `effective_implicit_timezone` (the default it falls back to is no
+longer the host's offset but UTC, section 3). The old name still compiles, with
+a deprecation warning, in 0.4.
+
+```rust
+# #[cfg(feature = "xsd11")] {
+use xsd_schema::namespace::table::NameTable;
+use xsd_schema::types::value::TimezoneOffset;
+use xsd_schema::xpath::{DynamicContext, RoXmlNavigator, XPathContext};
+
+let names = NameTable::new();
+let ctx = XPathContext::new(&names);
+let dynamic = DynamicContext::<RoXmlNavigator<'static>>::new(&ctx, 0);
+// 0.3: dynamic.implicit_timezone_or_host()
+assert_eq!(dynamic.effective_implicit_timezone(), TimezoneOffset::UTC);
+# }
+```
+
 ## 3. Behaviour changes
 
-Validation verdicts do not change: the W3C XSD 1.0 and 1.1 suites, the XPath 2.0
-tests of XQTS and the GAEB and WSDL corpora give the same results as with 0.3.1,
-failures included by name.
+Validation verdicts do not change on the test suites: the W3C XSD 1.0 and 1.1
+suites, the XPath 2.0 tests of XQTS and the GAEB and WSDL corpora give the same
+results as with 0.3.1, failures included by name.
+
+- **The implicit timezone (`xsd11`)** of an XPath evaluation that sets none is
+  UTC, no longer the host's local offset (the process's `TZ`). A date/time
+  value without a timezone is read in it when it is compared with or
+  subtracted from one that has a timezone; it is `fn:implicit-timezone()` and
+  the zone of `fn:current-dateTime()`; the functions without a dynamic context
+  (`operators::value_eq`, `eval_binary`, …) use it as well. Schema validation
+  sets none, so an XSD 1.1 assertion or type alternative such as
+  `@date lt xs:date('2026-01-01Z')` on a date without a timezone gives the same
+  verdict on every machine — in 0.3 it followed the machine's `TZ`. A host that
+  wants its local time computes the offset with the time-zone library it uses
+  and sets it:
+
+  ```rust
+  # #[cfg(feature = "xsd11")] {
+  use xsd_schema::namespace::table::NameTable;
+  use xsd_schema::types::value::TimezoneOffset;
+  use xsd_schema::xpath::{RoXmlNavigator, XPathContext, XPathExpr};
+
+  // The host's offset now, in minutes east of UTC, from its own time-zone
+  // library: `jiff::Zoned::now().offset().seconds() / 60` (an `i32`),
+  // `time::UtcOffset::current_local_offset()?.whole_minutes()` (an `i16`,
+  // `time`'s `local-offset` feature), … Here a fixed +01:00.
+  let minutes: i16 = 60;
+  let names = NameTable::new();
+  let local = XPathContext::new(&names).with_implicit_timezone(TimezoneOffset(minutes));
+  let utc = XPathContext::new(&names);
+  let xpath = "string(implicit-timezone())";
+  let run = |ctx: &XPathContext| -> Result<String, Box<dyn std::error::Error>> {
+      let expr = XPathExpr::compile(xpath, ctx)?;
+      Ok(expr.evaluator(ctx).run_string::<RoXmlNavigator<'static>>()?)
+  };
+  assert_eq!(run(&local)?, "PT1H");
+  assert_eq!(run(&utc)?, "PT0S"); // in 0.3: the offset of the machine's `TZ`
+  # }
+  # Ok::<(), Box<dyn std::error::Error>>(())
+  ```
+
+  `DynamicContext::with_implicit_timezone` does the same for a dynamic context
+  the host builds itself.
+- **The current dateTime** comes from `std::time::SystemTime`, read once per
+  dynamic context as before. On `wasm32-unknown-unknown`, whose standard
+  library has no clock, `fn:current-dateTime` without
+  `DynamicContext::current_datetime` raises `XPDY0002` (0.3 read the
+  browser's clock through `chrono`).
 
 - **Input that is not UTF-8** is refused by quick-xml 0.42 while it reads; the
   readers report it as in 0.3, with the same well-formedness rule, message and

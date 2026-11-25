@@ -137,7 +137,7 @@ pub(crate) struct NodeComparer<'s> {
     /// has always done.
     collation: CollationRef<'s>,
     /// The implicit timezone of the dynamic context, for date/time values
-    /// without one (F&O §10.4); the host's offset for [`TreeComparer`].
+    /// without one (F&O §10.4); UTC for [`TreeComparer`].
     implicit_timezone: TimezoneOffset,
 }
 
@@ -149,7 +149,7 @@ impl NodeComparer<'static> {
             function_rules: false,
             schema_set: None,
             collation: CollationRef::Codepoint,
-            implicit_timezone: super::operators::host_implicit_timezone(),
+            implicit_timezone: super::operators::DEFAULT_IMPLICIT_TIMEZONE,
         }
     }
 }

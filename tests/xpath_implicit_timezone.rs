@@ -11,13 +11,14 @@
 //! (§16.6); `fn:current-dateTime` (§16.3) "Returns the current dateTime (with
 //! timezone) from the dynamic context", and is ·stable·.
 //!
-//! A dynamic context without an implicit timezone falls back to the host's
-//! local offset, read once per evaluation.
+//! A dynamic context without an implicit timezone uses UTC, whatever the
+//! `TZ` of the process.
 //!
-//! Every test below picks a context timezone that differs from the host's
-//! offset, so that a comparison reading the host instead of the context fails
-//! under any process `TZ`; `the_host_fallback_follows_the_process_time_zone`
-//! runs the fallback under `TZ=UTC` and two other zones.
+//! The tests below set a context timezone of +09:45, which neither UTC nor any
+//! zone in use today has, so that a comparison reading the default (or the
+//! host's offset) instead of the context fails on any machine;
+//! `the_fallback_is_utc_under_any_process_time_zone` runs the fallback under
+//! `TZ=UTC` and two other zones.
 
 use xsd_schema::namespace::context::NamespaceContextSnapshot;
 use xsd_schema::namespace::table::NameTable;
@@ -27,18 +28,10 @@ use xsd_schema::XmlItem;
 
 const XS: &str = "http://www.w3.org/2001/XMLSchema";
 
-/// The host's current offset, in minutes.
-fn host_minutes() -> i16 {
-    (chrono::Local::now().offset().local_minus_utc() / 60) as i16
-}
-
-/// A context timezone (minutes) that is not the host's offset, nor UTC.
+/// A context timezone (minutes) that is not UTC, nor the offset of any zone
+/// in use today: +09:45.
 fn context_minutes() -> i16 {
-    let host = host_minutes();
-    [5 * 60, -(3 * 60 + 30), 9 * 60 + 45]
-        .into_iter()
-        .find(|&m| m != host)
-        .expect("three distinct candidates")
+    9 * 60 + 45
 }
 
 /// `±hh:mm` (or `Z`) for an offset in minutes.
@@ -79,7 +72,7 @@ fn join(value: xsd_schema::xpath::XPathValue<RoXmlNavigator<'static>>) -> String
 }
 
 /// Evaluate `expr` with the static context's implicit timezone `tz` (`None`:
-/// the host fallback); the result's items joined by spaces, or the error code.
+/// the default, UTC); the result's items joined by spaces, or the error code.
 fn eval(tz: Option<i16>, expr: &str) -> Result<String, String> {
     let names = NameTable::new();
     let mut ctx = XPathContext::new(&names).with_namespaces(names_with_xs(&names));
@@ -135,15 +128,14 @@ fn check_rows(tz: i16, rows: &[(&str, &str)], dynamic: bool) {
     }
     assert!(
         failures.is_empty(),
-        "context timezone {} (host {}):\n{}",
+        "context timezone {}:\n{}",
         lexical(tz),
-        lexical(host_minutes()),
         failures.join("\n")
     );
 }
 
 /// Comparisons, subtraction and the timezone functions of a context timezone
-/// `{tz}` that is neither the host's nor UTC.
+/// `{tz}` that is not UTC.
 const CONTEXT_ROWS: &[(&str, &str)] = &[
     // §10.4.6 – §10.4.14: a value without a timezone is read in `{tz}`.
     ("xs:dateTime('2000-01-01T00:00:00') eq xs:dateTime('2000-01-01T00:00:00{tz}')", "true"),
@@ -231,9 +223,7 @@ fn comparisons_read_the_dynamic_context_implicit_timezone() {
 #[test]
 fn comparisons_read_extreme_context_timezones() {
     for tz in [14 * 60, -14 * 60] {
-        if tz != host_minutes() {
-            check_rows(tz, &CONTEXT_ROWS[..12], false);
-        }
+        check_rows(tz, &CONTEXT_ROWS[..12], false);
     }
 }
 
@@ -254,63 +244,80 @@ fn now_epoch_seconds() -> f64 {
 }
 
 /// §16.3: the current instant, expressed in the context's timezone — not the
-/// host's wall-clock time labelled with the context's offset.
+/// wall-clock time of another zone labelled with the context's offset.
 #[test]
 fn current_date_time_is_the_current_instant_in_the_context_timezone() {
     let tz = context_minutes();
     for (label, seconds) in [
         ("static", epoch_seconds(|e| eval(Some(tz), e))),
         ("dynamic", epoch_seconds(|e| eval_dynamic(tz, e))),
-        ("host", epoch_seconds(|e| eval(None, e))),
+        ("default", epoch_seconds(|e| eval(None, e))),
     ] {
         let skew = (seconds - now_epoch_seconds()).abs();
         assert!(
             skew < 60.0,
-            "{label}: current-dateTime() is {skew} s away from now (context {}, host {})",
-            lexical(tz),
-            lexical(host_minutes())
+            "{label}: current-dateTime() is {skew} s away from now (context {})",
+            lexical(tz)
         );
     }
 }
 
-/// Without a context timezone the host's offset is the implicit timezone, the
-/// same one `current-dateTime()` carries, and the one comparisons use.
-#[test]
-fn the_host_fallback_is_the_host_offset() {
-    let host = host_minutes();
-    assert_eq!(ok(None, "implicit-timezone()"), duration(host));
+/// Without a context timezone the implicit timezone is UTC: the timezone
+/// `current-dateTime()` carries, and the one comparisons, subtraction and the
+/// one-argument `fn:adjust-*-to-timezone` use.
+fn assert_the_fallback_is_utc() {
+    assert_eq!(ok(None, "implicit-timezone()"), "PT0S");
     assert_eq!(
-        ok(
-            None,
-            "implicit-timezone() eq timezone-from-dateTime(current-dateTime())"
-        ),
-        "true"
+        ok(None, "timezone-from-dateTime(current-dateTime())"),
+        "PT0S"
     );
+    for expr in [
+        "xs:dateTime('2000-01-01T00:00:00') eq xs:dateTime('2000-01-01T00:00:00Z')",
+        // A date in summer: no daylight-saving offset of any process zone.
+        "xs:dateTime('2000-06-01T00:00:00') eq xs:dateTime('2000-06-01T00:00:00Z')",
+        "xs:time('12:00:00') eq xs:time('12:00:00Z')",
+        "xs:date('2000-01-01') eq xs:date('2000-01-01Z')",
+        "xs:gDay('---05') eq xs:gDay('---05Z')",
+        "xs:dateTime('2000-01-01T00:00:00') - xs:dateTime('2000-01-01T00:00:00Z') eq xs:dayTimeDuration('PT0S')",
+        "string(adjust-dateTime-to-timezone(xs:dateTime('2000-01-01T00:00:00+05:00'))) eq '1999-12-31T19:00:00Z'",
+        "timezone-from-dateTime(current-dateTime()) eq implicit-timezone()",
+        "not(xs:dateTime('2000-01-01T00:00:00') eq xs:dateTime('2000-01-01T00:00:00+05:00'))",
+        "not(xs:dateTime('2000-01-01T00:00:00') eq xs:dateTime('2000-01-01T00:00:00-03:00'))",
+    ] {
+        assert_eq!(ok(None, expr), "true", "{expr}");
+    }
+    // A context timezone still wins over the default.
+    let other = 300;
     let expr = format!(
-        "xs:dateTime('2000-06-01T00:00:00') eq xs:dateTime('2000-06-01T00:00:00{}')",
-        lexical(host_minutes())
+        "xs:dateTime('2000-01-01T00:00:00') eq xs:dateTime('2000-01-01T00:00:00{}')",
+        lexical(other)
     );
-    // The offset in June may differ from today's (daylight saving time): the
-    // fallback is the offset now, for every value.
-    assert_eq!(ok(None, &expr), "true");
+    assert_eq!(ok(Some(other), &expr), "true");
+    assert_eq!(ok(Some(other), "implicit-timezone()"), duration(other));
+}
+
+#[test]
+fn the_fallback_is_utc() {
+    assert_the_fallback_is_utc();
 }
 
 /// The fallback under several process time zones: this test runs
-/// `host_fallback_child` in a child process with `TZ` set.
+/// `utc_fallback_child` in a child process with `TZ` set; the fallback is UTC
+/// in each of them.
 #[test]
 #[cfg(unix)]
-fn the_host_fallback_follows_the_process_time_zone() {
+fn the_fallback_is_utc_under_any_process_time_zone() {
     let exe = std::env::current_exe().expect("test executable");
-    for (tz, minutes) in [("UTC", 0), ("Etc/GMT-5", 300), ("Etc/GMT+3", -180)] {
+    for tz in ["UTC", "Etc/GMT-5", "Etc/GMT+3"] {
         let output = std::process::Command::new(&exe)
             .args([
                 "--exact",
-                "host_fallback_child",
+                "utc_fallback_child",
                 "--ignored",
                 "--test-threads=1",
             ])
             .env("TZ", tz)
-            .env("XPATH_TZ_EXPECTED_MINUTES", minutes.to_string())
+            .env("XPATH_TZ_CHILD", "1")
             .output()
             .expect("child test runs");
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -323,33 +330,12 @@ fn the_host_fallback_follows_the_process_time_zone() {
 }
 
 #[test]
-#[ignore = "run by the_host_fallback_follows_the_process_time_zone with TZ set"]
-fn host_fallback_child() {
-    let Ok(expected) = std::env::var("XPATH_TZ_EXPECTED_MINUTES") else {
+#[ignore = "run by the_fallback_is_utc_under_any_process_time_zone with TZ set"]
+fn utc_fallback_child() {
+    if std::env::var_os("XPATH_TZ_CHILD").is_none() {
         return;
-    };
-    let expected: i16 = expected.parse().expect("minutes");
-    assert_eq!(host_minutes(), expected, "chrono reads TZ");
-    assert_eq!(ok(None, "implicit-timezone()"), duration(expected));
-    let own = lexical(expected);
-    for expr in [
-        format!("xs:dateTime('2000-01-01T00:00:00') eq xs:dateTime('2000-01-01T00:00:00{own}')"),
-        format!("xs:time('12:00:00') eq xs:time('12:00:00{own}')"),
-        format!("xs:date('2000-01-01') eq xs:date('2000-01-01{own}')"),
-        format!("xs:gDay('---05') eq xs:gDay('---05{own}')"),
-        format!("xs:dateTime('2000-01-01T00:00:00') - xs:dateTime('2000-01-01T00:00:00{own}') eq xs:dayTimeDuration('PT0S')"),
-        "timezone-from-dateTime(current-dateTime()) eq implicit-timezone()".to_string(),
-    ] {
-        assert_eq!(ok(None, &expr), "true", "{expr}");
     }
-    // A context timezone still wins over the process's.
-    let other = if expected == 0 { 300 } else { 0 };
-    let expr = format!(
-        "xs:dateTime('2000-01-01T00:00:00') eq xs:dateTime('2000-01-01T00:00:00{}')",
-        lexical(other)
-    );
-    assert_eq!(ok(Some(other), &expr), "true");
-    assert_eq!(ok(Some(other), "implicit-timezone()"), duration(other));
+    assert_the_fallback_is_utc();
 }
 
 // ---------------------------------------------------------------------------

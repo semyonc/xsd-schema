@@ -45,7 +45,8 @@ pub struct XPathContext<'a> {
     pub default_element_ns: Option<NameId>,
     /// Default namespace for unprefixed function names (fn: namespace)
     pub default_function_ns: Option<&'static str>,
-    /// Implicit timezone
+    /// Implicit timezone; `None` is UTC (see
+    /// [`DynamicContext::effective_implicit_timezone`]).
     pub implicit_timezone: Option<TimezoneOffset>,
     /// Base URI for relative URI resolution
     pub base_uri: Option<String>,
@@ -795,35 +796,59 @@ impl<V> Default for VarStore<V> {
 // The host's clock
 // ============================================================================
 
-/// The current instant and the host's local offset at that instant, read
-/// together once per dynamic context.
+/// An instant of the system clock, read once per dynamic context: whole
+/// seconds since 1970-01-01T00:00:00Z — negative before it — and the
+/// nanoseconds into that second.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct HostClock {
-    /// The current instant.
-    pub(crate) now: chrono::DateTime<chrono::Utc>,
-    /// The host's local offset at `now`.
-    pub(crate) offset: TimezoneOffset,
+    /// Whole seconds since the Unix epoch, rounded towards negative infinity.
+    pub(crate) seconds: i64,
+    /// Nanoseconds into `seconds`, below 1,000,000,000.
+    pub(crate) nanos: u32,
 }
 
 impl HostClock {
-    fn now() -> Self {
-        let now = chrono::Utc::now();
-        Self {
-            now,
-            offset: host_offset_at(now),
+    /// `time` in seconds and nanoseconds since the Unix epoch. A time before
+    /// 1970 gives a negative count of seconds, not a panic.
+    #[cfg_attr(all(target_family = "wasm", target_os = "unknown"), allow(dead_code))]
+    pub(crate) fn from_system_time(time: std::time::SystemTime) -> Self {
+        match time.duration_since(std::time::UNIX_EPOCH) {
+            Ok(after) => Self {
+                seconds: i64::try_from(after.as_secs()).unwrap_or(i64::MAX),
+                nanos: after.subsec_nanos(),
+            },
+            Err(before) => {
+                let before = before.duration();
+                let seconds = i64::try_from(before.as_secs()).unwrap_or(i64::MAX);
+                match before.subsec_nanos() {
+                    0 => Self {
+                        seconds: -seconds,
+                        nanos: 0,
+                    },
+                    nanos => Self {
+                        seconds: -seconds - 1,
+                        nanos: 1_000_000_000 - nanos,
+                    },
+                }
+            }
         }
     }
-}
 
-/// The host's local offset (`chrono::Local`, the process's `TZ`) at `instant`,
-/// in whole minutes.
-pub(crate) fn host_offset_at(instant: chrono::DateTime<chrono::Utc>) -> TimezoneOffset {
-    use chrono::{Offset, TimeZone};
-    let seconds = chrono::Local
-        .offset_from_utc_datetime(&instant.naive_utc())
-        .fix()
-        .local_minus_utc();
-    TimezoneOffset((seconds / 60) as i16)
+    /// The system clock now; `None` on `wasm32-unknown-unknown` (any
+    /// `wasm*-unknown-unknown`), whose standard library has no clock —
+    /// `SystemTime::now()` panics there. A host on that target that calls
+    /// `fn:current-dateTime` sets
+    /// [`DynamicContext::current_datetime`] itself.
+    fn now() -> Option<Self> {
+        #[cfg(all(target_family = "wasm", target_os = "unknown"))]
+        {
+            None
+        }
+        #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+        {
+            Some(Self::from_system_time(std::time::SystemTime::now()))
+        }
+    }
 }
 
 // ============================================================================
@@ -849,20 +874,37 @@ pub(crate) fn host_offset_at(instant: chrono::DateTime<chrono::Utc>) -> Timezone
 /// reads [`implicit_timezone`](Self::implicit_timezone) in every comparison,
 /// in the subtraction of two date/time values, in the one-argument
 /// `fn:adjust-*-to-timezone` functions and in `fn:implicit-timezone`. When it
-/// is `None`, the context falls back to the host's local offset (the `TZ` of
-/// the process, through `chrono::Local`), read the first time it is needed
-/// and kept for the rest of this context's evaluation, together with the
-/// instant `fn:current-dateTime` reports — so both are ·stable· (F&O §16.3)
-/// even across a daylight-saving change.
-/// [`implicit_timezone_or_host`](Self::implicit_timezone_or_host) is the
-/// timezone in force.
+/// is `None`, the implicit timezone is UTC (`Z`) — not the host's local
+/// offset, so that a result does not depend on the `TZ` of the machine.
+/// [`effective_implicit_timezone`](Self::effective_implicit_timezone) is the
+/// timezone in force. A host that wants its local time sets the offset it
+/// computes, with whatever time-zone library it uses:
+///
+/// ```
+/// use xsd_schema::namespace::table::NameTable;
+/// use xsd_schema::types::value::TimezoneOffset;
+/// use xsd_schema::xpath::{RoXmlNavigator, XPathContext, XPathExpr};
+///
+/// // The host's local offset now, in minutes east of UTC: from the host's
+/// // own time-zone library (here a fixed +01:00).
+/// let local_minutes = 60;
+/// let names = NameTable::new();
+/// let ctx = XPathContext::new(&names)
+///     .with_implicit_timezone(TimezoneOffset(local_minutes));
+/// let expr = XPathExpr::compile("string(implicit-timezone())", &ctx).unwrap();
+/// let result = expr.evaluator(&ctx).run::<RoXmlNavigator<'static>>().unwrap();
+/// assert_eq!(result.to_owned_string().as_deref(), Some("PT1H"));
+/// ```
 ///
 /// [`current_datetime`](Self::current_datetime), when set, is what
-/// `fn:current-dateTime` returns; otherwise the function returns the current
-/// instant expressed in the implicit timezone, and keeps it. A host that
-/// evaluates several expressions as one unit of work sets both
-/// fields on every dynamic context it builds, so that they stay the same
-/// throughout.
+/// `fn:current-dateTime` returns; otherwise the function reads the system
+/// clock the first time it is called in this context and returns that
+/// instant expressed in the implicit timezone, and keeps it, so that it is
+/// ·stable· (F&O §16.3). A host that evaluates several expressions as one
+/// unit of work sets both fields on every dynamic context it builds, so that
+/// they stay the same throughout. On `wasm32-unknown-unknown`, whose
+/// standard library has no clock, `fn:current-dateTime` without a
+/// `current_datetime` raises the dynamic error XPDY0002.
 pub struct DynamicContext<'a, N: DomNavigator> {
     /// Reference to the static context
     pub static_context: &'a XPathContext<'a>,
@@ -874,16 +916,15 @@ pub struct DynamicContext<'a, N: DomNavigator> {
     pub context_size: usize,
     /// Current date/time (stable for entire query evaluation)
     pub current_datetime: Option<DateTimeValue>,
-    /// Implicit timezone; `None` falls back to the host's local offset (see
-    /// [`implicit_timezone_or_host`](Self::implicit_timezone_or_host)).
+    /// Implicit timezone; `None` is UTC (see
+    /// [`effective_implicit_timezone`](Self::effective_implicit_timezone)).
     pub implicit_timezone: Option<TimezoneOffset>,
     /// Base URI for resolving relative URIs
     pub base_uri: Option<String>,
     /// The host's clock, read once: the instant `fn:current-dateTime` reports
-    /// when [`current_datetime`](Self::current_datetime) is not set, and the
-    /// host's offset at that instant, the implicit timezone when
-    /// [`implicit_timezone`](Self::implicit_timezone) is not set.
-    host_clock: std::cell::OnceCell<HostClock>,
+    /// when [`current_datetime`](Self::current_datetime) is not set (`None`
+    /// on a target without a clock).
+    host_clock: std::cell::OnceCell<Option<HostClock>>,
     /// Variable bindings (indexed by VarSlotId from NameBinder)
     pub variables: VarStore<super::functions::XPathValue<N>>,
     /// Function evaluator for eval-time dispatch (None = use builtins).
@@ -994,9 +1035,8 @@ impl<'a, N: DomNavigator> DynamicContext<'a, N> {
     }
 
     /// The implicit timezone in force:
-    /// [`implicit_timezone`](Self::implicit_timezone) when it is set, else the
-    /// host's local offset, read once for this context (see the
-    /// [type documentation](Self)).
+    /// [`implicit_timezone`](Self::implicit_timezone) when it is set, else
+    /// UTC (see the [type documentation](Self)).
     ///
     /// ```
     /// use xsd_schema::namespace::table::NameTable;
@@ -1007,17 +1047,26 @@ impl<'a, N: DomNavigator> DynamicContext<'a, N> {
     /// let ctx = XPathContext::new(&names);
     /// let dynamic = DynamicContext::<RoXmlNavigator<'static>>::new(&ctx, 0)
     ///     .with_implicit_timezone(TimezoneOffset::from_hm(5, 30));
-    /// assert_eq!(dynamic.implicit_timezone_or_host(), TimezoneOffset::from_hm(5, 30));
+    /// assert_eq!(dynamic.effective_implicit_timezone(), TimezoneOffset::from_hm(5, 30));
     ///
-    /// // Without one, the host's offset — the same value every time it is asked.
-    /// let host = DynamicContext::<RoXmlNavigator<'static>>::new(&ctx, 0);
-    /// assert_eq!(host.implicit_timezone_or_host(), host.implicit_timezone_or_host());
+    /// // Without one, UTC, whatever the `TZ` of the process.
+    /// let default = DynamicContext::<RoXmlNavigator<'static>>::new(&ctx, 0);
+    /// assert_eq!(default.effective_implicit_timezone(), TimezoneOffset::UTC);
     /// ```
+    pub fn effective_implicit_timezone(&self) -> TimezoneOffset {
+        self.implicit_timezone
+            .unwrap_or(super::operators::DEFAULT_IMPLICIT_TIMEZONE)
+    }
+
+    /// The implicit timezone in force; renamed
+    /// [`effective_implicit_timezone`](Self::effective_implicit_timezone),
+    /// since the default is no longer the host's offset but UTC.
+    #[deprecated(
+        since = "0.4.0",
+        note = "renamed `effective_implicit_timezone`; the default is UTC, not the host's offset"
+    )]
     pub fn implicit_timezone_or_host(&self) -> TimezoneOffset {
-        match self.implicit_timezone {
-            Some(tz) => tz,
-            None => self.host_clock().offset,
-        }
+        self.effective_implicit_timezone()
     }
 
     /// The warnings this evaluation has raised since they were last taken
@@ -1047,9 +1096,10 @@ impl<'a, N: DomNavigator> DynamicContext<'a, N> {
         }
     }
 
-    /// The host's clock, read the first time it is needed.
-    pub(crate) fn host_clock(&self) -> &HostClock {
-        self.host_clock.get_or_init(HostClock::now)
+    /// The host's clock, read the first time it is needed, or `None` on a
+    /// target without a clock.
+    pub(crate) fn host_clock(&self) -> Option<HostClock> {
+        *self.host_clock.get_or_init(HostClock::now)
     }
 
     /// Get the context item, returning an error if undefined.
@@ -1586,6 +1636,117 @@ mod tests {
             result,
             Err(super::super::error::XPathError::XPST0008 { .. })
         ));
+    }
+
+    /// Offsets in whole 100 ns and instants after 1601 only: what `SystemTime`
+    /// holds on every platform (Windows keeps 100 ns intervals since
+    /// 1601-01-01). The single nanosecond and the year 1 are
+    /// `datetime_from_unix`'s cases, whose inputs are integers.
+    #[test]
+    fn host_clock_counts_from_the_epoch_in_both_directions() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let at = |time| {
+            let clock = HostClock::from_system_time(time);
+            (clock.seconds, clock.nanos)
+        };
+        assert_eq!(at(UNIX_EPOCH), (0, 0));
+        assert_eq!(at(UNIX_EPOCH + Duration::new(1, 500)), (1, 500));
+        assert_eq!(
+            at(UNIX_EPOCH + Duration::new(1_764_000_000, 123_456_700)),
+            (1_764_000_000, 123_456_700)
+        );
+        // Before 1970: whole seconds floored, nanoseconds forward — no panic.
+        assert_eq!(at(UNIX_EPOCH - Duration::from_secs(1)), (-1, 0));
+        assert_eq!(
+            at(UNIX_EPOCH - Duration::from_millis(1_500)),
+            (-2, 500_000_000)
+        );
+        assert_eq!(
+            at(UNIX_EPOCH - Duration::from_nanos(100)),
+            (-1, 999_999_900)
+        );
+        // 1969-01-01T00:00:00Z.
+        assert_eq!(
+            at(UNIX_EPOCH - Duration::from_secs(31_536_000)),
+            (-31_536_000, 0)
+        );
+    }
+
+    /// A target without a clock (`wasm32-unknown-unknown`): the context's
+    /// clock reads `None`, and `fn:current-dateTime` raises XPDY0002 unless
+    /// the host sets the current dateTime.
+    #[test]
+    fn current_date_time_without_a_clock_needs_the_host() {
+        use crate::xpath::functions::datetime::current_datetime;
+        use crate::xpath::RoXmlNavigator;
+        let names = NameTable::new();
+        let ctx = XPathContext::new(&names);
+        let mut dynamic = DynamicContext::<RoXmlNavigator<'static>>::new(&ctx, 0);
+        dynamic.host_clock.set(None).expect("not read yet");
+        match current_datetime(&mut dynamic, Vec::new()) {
+            Err(err) => assert_eq!(err.error_code(), Some("XPDY0002")),
+            Ok(_) => panic!("current-dateTime() without a clock"),
+        }
+        let given = crate::xpath::operators::datetime_from_unix(0, 0, TimezoneOffset::UTC)
+            .expect("the epoch");
+        let mut dynamic =
+            DynamicContext::<RoXmlNavigator<'static>>::new(&ctx, 0).with_current_datetime(given);
+        dynamic.host_clock.set(None).expect("not read yet");
+        let Ok(value) = current_datetime(&mut dynamic, Vec::new()) else {
+            panic!("current-dateTime() with the host's value");
+        };
+        let Some(XmlItem::Atomic(value)) = value.first() else {
+            panic!("one atomic value");
+        };
+        assert_eq!(value.to_string_value(), "1970-01-01T00:00:00Z");
+    }
+
+    /// `fn:current-dateTime`, `fn:current-date` and `fn:current-time` from a
+    /// fixed reading of the clock — half a second before the epoch — in the implicit
+    /// timezone +01:00: the instant shifted into the timezone, across midnight
+    /// and the year, with its fraction. The context's clock cell is seeded, so
+    /// the test reads no system clock (and runs under an isolated Miri).
+    #[test]
+    fn current_date_time_from_a_fixed_clock() {
+        use crate::xpath::error::XPathError;
+        use crate::xpath::functions::datetime::{current_date, current_datetime, current_time};
+        use crate::xpath::functions::XPathValue;
+        use crate::xpath::RoXmlNavigator;
+        type Nav = RoXmlNavigator<'static>;
+        fn lexical(result: Result<XPathValue<Nav>, XPathError>) -> String {
+            let Ok(value) = result else {
+                panic!("a value from the fixed clock");
+            };
+            let Some(XmlItem::Atomic(value)) = value.first() else {
+                panic!("one atomic value");
+            };
+            value.to_string_value()
+        }
+        let names = NameTable::new();
+        let ctx = XPathContext::new(&names);
+        // A fresh context for each function, so that each reads the clock.
+        let fixed = || {
+            let dynamic = DynamicContext::<Nav>::new(&ctx, 0)
+                .with_implicit_timezone(TimezoneOffset::from_hm(1, 0));
+            let clock = HostClock {
+                seconds: -1,
+                nanos: 500_000_000,
+            };
+            dynamic.host_clock.set(Some(clock)).expect("not read yet");
+            dynamic
+        };
+        assert_eq!(
+            lexical(current_datetime(&mut fixed(), Vec::new())),
+            "1970-01-01T00:59:59.5+01:00"
+        );
+        assert_eq!(
+            lexical(current_date(&mut fixed(), Vec::new())),
+            "1970-01-01+01:00"
+        );
+        assert_eq!(
+            lexical(current_time(&mut fixed(), Vec::new())),
+            "00:59:59.5+01:00"
+        );
     }
 }
 

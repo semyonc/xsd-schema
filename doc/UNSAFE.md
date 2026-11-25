@@ -91,12 +91,14 @@ built-in types. Sound because `XmlTypeCode` is `#[repr(u8)]` and every value
 
 ## Miri Verification
 
+The `unsafe` blocks are verified by these targeted runs, under an isolated
+Miri — without `-Zmiri-disable-isolation`:
+
 ```bash
 cargo +nightly miri test --lib namespace::table::tests
-MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test --lib --features xsd11 \
+cargo +nightly miri test --lib --features xsd11 \
     validation::runtime::tests::assertion_runtime_tests
-MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test --lib --features xsd11 \
-    types::tests::test_xml_type_code_roundtrip
+cargo +nightly miri test --lib types::tests::test_xml_type_code_roundtrip
 cargo +nightly miri test --lib \
     xml::tests::bytes_that_are_not_utf8_are_refused_as_the_checks_refuse_them
 ```
@@ -106,10 +108,15 @@ The first covers block 1, the second block 2, the third the test-only
 read whole and in one-byte chunks, after events that were returned; each
 case also through the slice reader, which has no `unsafe`). The other
 `xml::tests` run every reader case through both sources as well
-(`cargo +nightly miri test --lib xml::`, also with
-`MIRIFLAGS=-Zmiri-tree-borrows`).
-`-Zmiri-disable-isolation` lets the XPath engine read the clock
-(`fn:current-dateTime`), which an isolated Miri refuses. The whole library
-can run under Miri as well (`cargo +nightly miri test --lib`, with
-`--features xsd11` and the flag above), but slowly: the 23 assertion tests
-alone take minutes.
+(`cargo +nightly miri test --lib xml::tests::`, also with
+`MIRIFLAGS=-Zmiri-tree-borrows`). The XPath engine's `fn:current-dateTime`,
+`fn:current-date` and `fn:current-time` are checked isolated too, from a
+fixed reading of the clock instead of the system clock:
+`cargo +nightly miri test --lib --features xsd11 xpath::context::tests::current_date_time_from_a_fixed_clock`.
+
+The library's whole test suite (`cargo +nightly miri test --lib`) is not the
+verification of record for the `unsafe` blocks, and it does not run under an
+isolated Miri: some of its tests create files and directories, and others
+resolve a schema location against the working directory, which isolation
+refuses. The system clock itself is checked natively, by the integration tests
+(`tests/xpath_implicit_timezone.rs`).

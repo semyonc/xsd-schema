@@ -207,11 +207,20 @@ documentation has the details.
   implementation-defined").
 - **The implicit timezone** comes from the dynamic context
   (`DynamicContext::implicit_timezone`, F&O §10.4). A context without one
-  uses the host's local offset (the process's `TZ`), read once per
-  evaluation together with the instant `fn:current-dateTime` reports. The
-  functions that take no dynamic context (`operators::value_eq`, `eval_binary`,
-  …) read the host's offset when they compare a date/time value;
-  `operators::eval_binary_with_timezone` takes the timezone explicitly.
+  uses UTC (`Z`), whatever the `TZ` of the process; so do the functions that
+  take no dynamic context (`operators::value_eq`, `eval_binary`, …), and so
+  does schema validation, which sets none. A host that wants its local time
+  sets the offset itself (`XPathContext::with_implicit_timezone`);
+  `operators::eval_binary_with_timezone` takes the timezone explicitly. F&O
+  §16.6 and XSD 1.1 Structures §3.13.4.2 clause 7 leave the implicit timezone
+  implementation-defined.
+- **The current dateTime** is `DynamicContext::current_datetime` when the host
+  sets it; otherwise the system clock (`std::time::SystemTime`), read the
+  first time `fn:current-dateTime`, `fn:current-date` or `fn:current-time` is
+  called in a dynamic context and kept for the rest of its evaluation (F&O
+  §16.3, ·stable·), with the clock's fractional seconds, in the implicit
+  timezone. On `wasm32-unknown-unknown`, whose standard library has no clock,
+  these functions raise `XPDY0002` unless the host sets `current_datetime`.
 
 ## 6. Nesting
 

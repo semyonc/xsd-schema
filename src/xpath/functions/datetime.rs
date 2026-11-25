@@ -271,16 +271,21 @@ fn xml_time(value: TimeValue) -> XmlValue {
 /// F&O 1.0 §16.3: "Returns the current dateTime (with timezone) from the
 /// dynamic context … This function is ·stable·." The dynamic context's
 /// [`current_datetime`](DynamicContext::current_datetime) when it is set;
-/// otherwise the current instant — read once per dynamic context, with the
-/// fractional seconds of the system clock — expressed in the implicit
-/// timezone ([`DynamicContext::implicit_timezone_or_host`]), and kept in
+/// otherwise the current instant — read once per dynamic context from the
+/// system clock, with its fractional seconds — expressed in the implicit
+/// timezone ([`DynamicContext::effective_implicit_timezone`]), and kept in
 /// `current_datetime` for the rest of the evaluation.
+///
+/// On `wasm32-unknown-unknown`, whose standard library has no clock, the
+/// current dateTime is a part of the dynamic context that only the host can
+/// give: without `current_datetime` the function raises XPDY0002 (XPath 2.0
+/// Appendix F, err:XPDY0002: "It is a dynamic error if evaluation of an
+/// expression relies on some part of the dynamic context that has not been
+/// assigned a value").
 pub fn current_datetime<N: DomNavigator>(
     context: &mut DynamicContext<'_, N>,
     args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
-    use chrono::{Datelike, Timelike};
-
     if !args.is_empty() {
         return Err(XPathError::wrong_number_of_arguments(
             "current-dateTime",
@@ -293,24 +298,20 @@ pub fn current_datetime<N: DomNavigator>(
     let dt = if let Some(ref cached) = context.current_datetime {
         cached.clone()
     } else {
-        let tz_offset = context.implicit_timezone_or_host();
+        let Some(clock) = context.host_clock() else {
+            return Err(XPathError::XPDY0002 {
+                message: "the current dateTime is undefined: this target has no system \
+                          clock, and the dynamic context sets no current_datetime"
+                    .to_string(),
+            });
+        };
         // The instant, then its local time in the implicit timezone — not the
         // host's wall-clock time with the implicit timezone's label.
-        let local = context.host_clock().now.naive_utc()
-            + chrono::Duration::minutes(i64::from(tz_offset.0));
-        // A leap second reads as the last nanosecond of its minute.
-        let nanos = local.nanosecond().min(999_999_999);
-        let second = Decimal::from(local.second()) + Decimal::new(i64::from(nanos), 9);
-
-        let dt = DateTimeValue {
-            year: local.year(),
-            month: local.month() as u8,
-            day: local.day() as u8,
-            hour: local.hour() as u8,
-            minute: local.minute() as u8,
-            second: second.normalize(),
-            timezone: Some(tz_offset),
-        };
+        let dt = crate::xpath::operators::datetime_from_unix(
+            clock.seconds,
+            clock.nanos,
+            context.effective_implicit_timezone(),
+        )?;
         context.current_datetime = Some(dt.clone());
         dt
     };
@@ -407,7 +408,7 @@ pub fn implicit_timezone<N: DomNavigator>(
         ));
     }
 
-    let tz = context.implicit_timezone_or_host();
+    let tz = context.effective_implicit_timezone();
 
     let duration = timezone_to_day_time_duration(tz);
     Ok(XPathValue::from_atomic(xml_day_time_duration(duration)))
@@ -1266,7 +1267,7 @@ pub fn adjust_datetime_to_timezone<N: DomNavigator>(
         }
     } else {
         // 1-arg form: use implicit timezone
-        context.implicit_timezone_or_host()
+        context.effective_implicit_timezone()
     };
 
     validate_timezone_offset(target_tz.0)?;
@@ -1343,7 +1344,7 @@ pub fn adjust_date_to_timezone<N: DomNavigator>(
         }
     } else {
         // 1-arg form: use implicit timezone
-        context.implicit_timezone_or_host()
+        context.effective_implicit_timezone()
     };
 
     validate_timezone_offset(target_tz.0)?;
@@ -1418,7 +1419,7 @@ pub fn adjust_time_to_timezone<N: DomNavigator>(
         }
     } else {
         // 1-arg form: use implicit timezone
-        context.implicit_timezone_or_host()
+        context.effective_implicit_timezone()
     };
 
     validate_timezone_offset(target_tz.0)?;
@@ -1762,27 +1763,6 @@ mod tests {
     // ========================================================================
     // Current time function tests
     // ========================================================================
-
-    #[test]
-    fn test_current_datetime_returns_value() {
-        let mut ctx = make_context();
-        let result = current_datetime(&mut ctx, vec![]).unwrap();
-        assert!(!result.is_empty());
-    }
-
-    #[test]
-    fn test_current_date_returns_value() {
-        let mut ctx = make_context();
-        let result = current_date(&mut ctx, vec![]).unwrap();
-        assert!(!result.is_empty());
-    }
-
-    #[test]
-    fn test_current_time_returns_value() {
-        let mut ctx = make_context();
-        let result = current_time(&mut ctx, vec![]).unwrap();
-        assert!(!result.is_empty());
-    }
 
     #[test]
     fn test_implicit_timezone_returns_value() {
