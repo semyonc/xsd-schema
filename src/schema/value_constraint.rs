@@ -432,7 +432,9 @@ impl SchemaSet {
         let bindings = self.value_constraint_namespaces(source);
         let resolver =
             bindings.map(|ns| crate::validation::simple::snapshot_prefixes(ns, &self.name_table));
-        crate::validation::simple::validate_simple_type_in(
+        // A value constraint's literal is a schema property: read at the set's
+        // instant (`validate_schema_literal`).
+        crate::validation::simple::validate_schema_literal(
             literal,
             type_key,
             self,

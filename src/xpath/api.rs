@@ -642,6 +642,9 @@ pub struct XPathEvaluator<'expr, 'ctx> {
     regex_cache: Option<&'ctx RegexCache>,
     /// Where the run's warnings go; see [`with_warnings`](Self::with_warnings).
     warnings: Option<&'ctx RefCell<Vec<XPathWarning>>>,
+    /// The clock of the validation run the evaluation belongs to; see
+    /// [`with_run_clock`](Self::with_run_clock).
+    run_clock: Option<&'ctx crate::clock::SharedClock>,
 }
 
 impl<'expr, 'ctx> XPathEvaluator<'expr, 'ctx> {
@@ -653,6 +656,7 @@ impl<'expr, 'ctx> XPathEvaluator<'expr, 'ctx> {
             pending_vars: Vec::new(),
             regex_cache: None,
             warnings: None,
+            run_clock: None,
         }
     }
 
@@ -740,6 +744,14 @@ impl<'expr, 'ctx> XPathEvaluator<'expr, 'ctx> {
         self
     }
 
+    /// Evaluate as part of the validation run whose clock is `clock`, if any:
+    /// `fn:current-dateTime` reports the run's instant (XSD 1.1 Structures
+    /// §3.13.4.2 clause 6) instead of reading the system clock for itself.
+    pub(crate) fn with_run_clock(mut self, clock: Option<&'ctx crate::clock::SharedClock>) -> Self {
+        self.run_clock = clock;
+        self
+    }
+
     /// Evaluate the expression and return the full result.
     ///
     /// This is the most flexible method, returning the raw `XPathValue` which
@@ -791,6 +803,9 @@ impl<'expr, 'ctx> XPathEvaluator<'expr, 'ctx> {
         // Create dynamic context
         let mut dyn_ctx = DynamicContext::new(self.static_ctx, self.expr.var_slots);
         dyn_ctx.set_regex_cache(self.regex_cache);
+        if let Some(clock) = self.run_clock {
+            dyn_ctx.set_run_clock(clock);
+        }
 
         // Set context node if provided
         if let Some(node) = context_node {
@@ -943,6 +958,9 @@ impl<'expr, 'ctx> XPathEvaluator<'expr, 'ctx> {
         // Create dynamic context
         let mut dyn_ctx = DynamicContext::new(self.static_ctx, self.expr.var_slots);
         dyn_ctx.set_regex_cache(self.regex_cache);
+        if let Some(clock) = self.run_clock {
+            dyn_ctx.set_run_clock(clock);
+        }
 
         // Set context node if provided
         if let Some(node) = context_node {

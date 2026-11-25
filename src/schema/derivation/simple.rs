@@ -780,7 +780,8 @@ fn validate_facet_values_against_base_type(
     // (compared by value, also for a list or a union base).
     if let Some(ref enum_facet) = type_def.facets.enumeration {
         for value in sorted_values(enum_facet) {
-            if crate::validation::simple::validate_simple_type(value, base_key, schema_set).is_err()
+            if crate::validation::simple::validate_schema_literal(value, base_key, schema_set, None)
+                .is_err()
             {
                 return Err(SchemaError::structural(
                     "enumeration-valid-restriction",
@@ -799,7 +800,9 @@ fn validate_facet_values_against_base_type(
     // equality), even though that value is not in the base's value space.
     let check_bound =
         |value: &str, constraint: &'static str, kind: FacetKind| -> SchemaResult<()> {
-            match crate::validation::simple::validate_simple_type(value, base_key, schema_set) {
+            match crate::validation::simple::validate_schema_literal(
+                value, base_key, schema_set, None,
+            ) {
                 Ok(_) => Ok(()),
                 Err(_) if is_bound_self_violation(kind, schema_set, base_key, value) => Ok(()),
                 Err(_) => Err(SchemaError::structural(
@@ -931,9 +934,11 @@ fn compare_bound_literals(
 ) -> Option<std::cmp::Ordering> {
     let parse_base = bound_comparison_base(schema_set, base_key);
     let lower_value =
-        crate::validation::simple::validate_simple_type(lower, parse_base, schema_set).ok()?;
+        crate::validation::simple::validate_schema_literal(lower, parse_base, schema_set, None)
+            .ok()?;
     let upper_value =
-        crate::validation::simple::validate_simple_type(upper, parse_base, schema_set).ok()?;
+        crate::validation::simple::validate_schema_literal(upper, parse_base, schema_set, None)
+            .ok()?;
     compare_xml_values(
         schema_set.is_xsd10(),
         (&lower_value.typed_value, lower),
@@ -1136,7 +1141,7 @@ pub(super) fn validate_simple_content_restriction_facets(
     })?;
 
     let in_base = |value: &str| {
-        crate::validation::simple::validate_simple_type(value, facet_base, schema_set)
+        crate::validation::simple::validate_schema_literal(value, facet_base, schema_set, None)
     };
     if let Some(enumeration) = &sc.facets.enumeration {
         if let Some(value) = sorted_values(enumeration)

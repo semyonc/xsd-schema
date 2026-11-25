@@ -543,7 +543,7 @@ mod tests {
         };
         assert!(string.is_some() && int.is_some() && string != int);
         let select = |schema_set: &SchemaSet| {
-            evaluate_type_alternatives(elem, local, None, &[], None, None, schema_set)
+            evaluate_type_alternatives(elem, local, None, &[], None, None, schema_set, None)
         };
         assert_eq!(select(&schema_set), string);
         assert_eq!(select(&schema_set), string);

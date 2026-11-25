@@ -330,6 +330,9 @@ fn converted_decimal_conforms(
         &value_facets,
         crate::validation::compiled_xpath::AssertionFacetsOwner::Simple(key),
         schema_set,
+        // A cast outside validation (assertions are compiled without the
+        // schema set's casts): no run's clock.
+        None,
     )
     .is_ok()
 }

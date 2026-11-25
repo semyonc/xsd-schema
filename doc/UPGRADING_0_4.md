@@ -181,6 +181,25 @@ results as with 0.3.1, failures included by name.
   library has no clock, `fn:current-dateTime` without
   `DynamicContext::current_datetime` raises `XPDY0002` (0.3 read the
   browser's clock through `chrono`).
+- **One current dateTime per validation run (XSD 1.1).** Every assertion,
+  assertion facet and type alternative of a run reports one instant — read
+  from the system clock the first time one of them asks, or given by the host
+  with the new `ValidationRuntime::set_current_time` (also the way to give
+  validation a clock on `wasm32-unknown-unknown`). In 0.3 each evaluation
+  read the clock, so a schema whose assertions call `fn:current-dateTime`
+  could get a verdict that depended on how fast the document arrived. A
+  schema set's own literals (enumeration values, `default` and `fixed`
+  values) are schema properties, read at one instant of the set's own, the
+  same in every run. Nothing changes for a schema without an `xs:assertion`
+  facet that calls `fn:current-dateTime`, `fn:current-date` or
+  `fn:current-time`.
+- **A handler that wraps a `TypedBuilderHandler`** in a
+  `ValidationEventHandler` of its own forwards the two new methods of the
+  trait to it, `wants_typed_values` and `after_end_element_values`, as it
+  forwards the others; `after_end_element` is then no longer called for it.
+  Without them the tree is built as in 0.3 (each element's content validated
+  a second time at its end). A handler passed to `TypedBuilderHandler` as
+  its inner handler, or to `build_typed_document_with`, needs no change.
 
 - **Input that is not UTF-8** is refused by quick-xml 0.42 while it reads; the
   readers report it as in 0.3, with the same well-formedness rule, message and

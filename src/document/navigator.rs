@@ -19,7 +19,6 @@ use crate::navigator::{
 };
 use crate::schema::SchemaSet;
 use crate::validation::info::ContentType;
-use crate::validation::simple::validate_simple_type_in;
 
 use super::buffer::BufferDocument;
 use super::node::{Node, NodeType};
@@ -52,6 +51,9 @@ pub struct BufferDocNavigator<'a> {
     attr_index: u16,
     /// Collected namespaces for All/ExcludeXml traversal.
     ns_list: Vec<NsRef>,
+    /// The clock of the validation run whose assertion this navigator serves
+    /// (see [`with_run_clock`](Self::with_run_clock)), or `None`.
+    run_clock: Option<&'a crate::clock::SharedClock>,
 }
 
 impl<'a> BufferDocNavigator<'a> {
@@ -67,7 +69,18 @@ impl<'a> BufferDocNavigator<'a> {
             current_ns: NsRef::NULL,
             attr_index: 0,
             ns_list: Vec::new(),
+            run_clock: None,
         }
+    }
+
+    /// This navigator, serving an expression of the validation run whose
+    /// clock is `clock`: a typed value it computes — the simple-type
+    /// validation of a node's string value, XSD 1.1 assertion facets
+    /// included — reports the run's current dateTime (XSD 1.1 Structures
+    /// §3.13.4.2 clause 6). The navigators it moves to and clones keep it.
+    pub(crate) fn with_run_clock(mut self, clock: Option<&'a crate::clock::SharedClock>) -> Self {
+        self.run_clock = clock;
+        self
     }
 
     /// Creates a navigator for XSD 1.1 assertion evaluation.
@@ -156,9 +169,9 @@ impl<'a> BufferDocNavigator<'a> {
         }
     }
 
-    /// A navigator on the attribute node `attr_ref` (the attribute's index
-    /// among its element's attributes set, for document order).
-    fn at_attribute(doc: &'a BufferDocument<'a>, attr_ref: u32) -> Self {
+    /// The position of the attribute node `attr_ref`: its owning element and
+    /// its index among that element's attributes (for document order).
+    fn attribute_position(doc: &BufferDocument<'_>, attr_ref: u32) -> (u32, u16) {
         let owner = doc.nodes.get(attr_ref).parent;
         let mut index: u16 = 0;
         let mut cursor = owner + 1;
@@ -166,10 +179,39 @@ impl<'a> BufferDocNavigator<'a> {
             cursor = doc.nodes.get(cursor).next_sibling;
             index += 1;
         }
+        (owner, index)
+    }
+
+    /// A navigator on `node` — an element, an attribute or any other node of
+    /// the same document — in the same context as this one: the same visible
+    /// tree (an assertion's or a parentless node's) and the same validation
+    /// run's clock. What a node lookup returns (`fn:id`, `fn:idref`) is made
+    /// here.
+    ///
+    /// Written as a full struct literal, with no `..` update: a field added
+    /// to the navigator has to be placed here — carried with the context, or
+    /// reset with the position — before this compiles.
+    fn derive(&self, node: u32) -> Self {
+        let doc = self.doc;
+        let (virtual_parent, attr_index) = if doc.nodes.get(node).node_type() == NodeType::Attribute
+        {
+            Self::attribute_position(doc, node)
+        } else {
+            (NULL, 0)
+        };
         Self {
-            virtual_parent: owner,
-            attr_index: index,
-            ..Self::new(doc, attr_ref)
+            doc,
+            // The position: the node, nothing else of where this one stands.
+            current: node,
+            virtual_parent,
+            current_ns: NsRef::NULL,
+            attr_index,
+            ns_list: Vec::new(),
+            // The context: carried.
+            assertion_absolute_root: self.assertion_absolute_root,
+            assertion_fragment_root: self.assertion_fragment_root,
+            orphan_root: self.orphan_root,
+            run_clock: self.run_clock,
         }
     }
 
@@ -1217,11 +1259,12 @@ impl<'a> DomNavigator for BufferDocNavigator<'a> {
         // does with the element's, so that the typed value and the verdict
         // agree (enumeration by expanded name, `$value` of an assertion).
         let resolver = |prefix: Option<&str>| self.prefix_binding(prefix);
-        match validate_simple_type_in(
+        match crate::validation::simple::validate_simple_type_at(
             &effective_value,
             binding.type_key,
             schema_set,
             Some(&resolver),
+            self.run_clock,
         ) {
             Ok(r) => TypedValue::Value(self.resolve_qname_typed_value(r.typed_value)),
             Err(_) => TypedValue::Untyped,
@@ -1262,18 +1305,7 @@ impl<'a> DomNavigator for BufferDocNavigator<'a> {
             .doc
             .nodes_by_idref(id, range)
             .into_iter()
-            .map(|r| {
-                let node = self.doc.nodes.get(r);
-                let mut nav = if node.node_type() == NodeType::Attribute {
-                    BufferDocNavigator::at_attribute(self.doc, r)
-                } else {
-                    BufferDocNavigator::new(self.doc, r)
-                };
-                nav.assertion_absolute_root = self.assertion_absolute_root;
-                nav.assertion_fragment_root = self.assertion_fragment_root;
-                nav.orphan_root = self.orphan_root;
-                nav
-            })
+            .map(|r| self.derive(r))
             .collect())
     }
 
@@ -1301,13 +1333,7 @@ impl<'a> DomNavigator for BufferDocNavigator<'a> {
         } else {
             self.doc.get_element_by_id_in_tree(self.current, id)
         };
-        Ok(found.map(|r| {
-            let mut nav = BufferDocNavigator::new(self.doc, r);
-            nav.assertion_absolute_root = self.assertion_absolute_root;
-            nav.assertion_fragment_root = self.assertion_fragment_root;
-            nav.orphan_root = self.orphan_root;
-            nav
-        }))
+        Ok(found.map(|r| self.derive(r)))
     }
 }
 

@@ -11039,3 +11039,468 @@ mod skip_attribute_tests {
         }
     }
 }
+
+#[cfg(feature = "xsd11")]
+mod run_clock_tests {
+    //! The current dateTime of a validation run (XSD 1.1 Structures
+    //! §3.13.4.2 clause 6) when the host gives it.
+    use super::*;
+    use crate::validation::{drive_quick_xml, CollectingValidationSink};
+    use std::time::{Duration, UNIX_EPOCH};
+
+    /// Every expression of a run reports the host's instant — a complex
+    /// type's assertion, the attribute and element facets, a type
+    /// alternative, and the typed values and ids of the assertion's data
+    /// model — and nothing reads the system clock: this test runs under an
+    /// isolated Miri, which refuses the system clock
+    /// (`cargo +nightly miri test --lib --features xsd11 run_clock_tests`).
+    #[test]
+    fn a_run_with_the_host_s_instant_reads_no_clock() {
+        let early = "current-dateTime() lt xs:dateTime('2000-01-01T00:00:00Z')";
+        let host = "xs:dateTime('1999-12-31T23:00:00Z')";
+        let schema_set = load_schema_xsd11(&format!(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:simpleType name="TimedId"><xs:restriction base="xs:ID">
+                    <xs:assertion test="{early}"/>
+                </xs:restriction></xs:simpleType>
+                <xs:simpleType name="Early"><xs:restriction base="xs:string">
+                    <xs:assertion test="{early}"/>
+                </xs:restriction></xs:simpleType>
+                <xs:simpleType name="U"><xs:union memberTypes="Early xs:token"/></xs:simpleType>
+                <xs:simpleType name="Never"><xs:restriction base="xs:string">
+                    <xs:assertion test="false()"/>
+                </xs:restriction></xs:simpleType>
+                <xs:element name="doc"><xs:complexType>
+                    <xs:sequence>
+                        <xs:element name="a" maxOccurs="unbounded"><xs:complexType>
+                            <xs:attribute name="id" type="TimedId"/>
+                        </xs:complexType></xs:element>
+                        <xs:element name="w" type="xs:string">
+                            <xs:alternative test="current-dateTime() ne {host}" type="Never"/>
+                        </xs:element>
+                        <xs:element name="v" type="U"/>
+                    </xs:sequence>
+                    <xs:attribute name="u" type="U"/>
+                    <xs:assert test="current-dateTime() eq {host}
+                        and exists(id('one')) and exists(id('foo'))
+                        and string(@u) eq '  a  b  ' and not(data(v) instance of xs:token)"/>
+                </xs:complexType></xs:element>
+            </xs:schema>"#
+        ));
+        let validator = SchemaValidator::new(
+            &schema_set,
+            ValidationFlags::default() | ValidationFlags::PROCESS_ASSERTIONS,
+        );
+        let (mut errors, mut warnings) = (Vec::new(), Vec::new());
+        {
+            let mut runtime = validator.start_run(CollectingValidationSink {
+                errors: &mut errors,
+                warnings: &mut warnings,
+            });
+            // 1999-12-31T23:00:00Z.
+            runtime.set_current_time(UNIX_EPOCH + Duration::from_secs(946_681_200));
+            let instance =
+                "<doc u='  a  b  '><a id='one'/><a id='foo'/><w>w</w><v> x  y </v></doc>";
+            drive_quick_xml(instance.as_bytes(), &mut runtime, &schema_set).expect("drives");
+        }
+        let errors: Vec<String> = errors.iter().map(|e| e.to_string()).collect();
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+    /// A union whose first member accepts a value only before 2000 and keeps
+    /// its spaces, the second (`xs:token`) collapses them; an enumeration of a
+    /// union simple type, one of a simple content restriction, a `fixed`
+    /// value and a `default` value, each `"  a  b  "`.
+    const LITERALS: &str = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+        <xs:simpleType name="Early"><xs:restriction base="xs:string">
+            <xs:assertion test="current-dateTime() lt xs:dateTime('2000-01-01T00:00:00Z')"/>
+        </xs:restriction></xs:simpleType>
+        <xs:simpleType name="U"><xs:union memberTypes="Early xs:token"/></xs:simpleType>
+        <xs:simpleType name="U2"><xs:restriction base="U"/></xs:simpleType>
+        <xs:simpleType name="E"><xs:restriction base="U">
+            <xs:enumeration value="  a  b  "/>
+        </xs:restriction></xs:simpleType>
+        <xs:complexType name="Base"><xs:simpleContent><xs:extension base="U"/></xs:simpleContent></xs:complexType>
+        <xs:complexType name="R"><xs:simpleContent><xs:restriction base="Base">
+            <xs:enumeration value="  a  b  "/>
+        </xs:restriction></xs:simpleContent></xs:complexType>
+        <xs:element name="doc"><xs:complexType>
+            <xs:sequence>
+                <xs:element name="f" type="U" fixed="  a  b  " minOccurs="0" maxOccurs="unbounded"/>
+                <xs:element name="e" type="E" minOccurs="0"/>
+                <xs:element name="r" type="R" minOccurs="0"/>
+                <xs:element name="x" type="U" default="  a  b  " minOccurs="0"/>
+            </xs:sequence>
+            <xs:attribute name="d" type="U" default="  a  b  "/>
+        </xs:complexType></xs:element>
+    </xs:schema>"#;
+
+    /// 1999-12-31T23:00:00Z and 2000-01-01T01:00:00Z.
+    fn before_2000() -> std::time::SystemTime {
+        UNIX_EPOCH + Duration::from_secs(946_681_200)
+    }
+    fn after_2000() -> std::time::SystemTime {
+        UNIX_EPOCH + Duration::from_secs(946_688_400)
+    }
+
+    /// The schema of `LITERALS` with its literals read at `schema_instant`.
+    fn literal_schema(schema_instant: std::time::SystemTime) -> SchemaSet {
+        let mut schema_set = SchemaSet::xsd11();
+        assert!(schema_set.fix_schema_instant(schema_instant));
+        load_and_process_schema(
+            LITERALS.as_bytes(),
+            "memory:///literals.xsd",
+            &mut schema_set,
+            None,
+        )
+        .expect("failed to load schema");
+        schema_set
+    }
+
+    /// The constraint codes of a run at `run_instant` over `instance`.
+    fn run_codes(
+        schema_set: &SchemaSet,
+        flags: ValidationFlags,
+        run_instant: std::time::SystemTime,
+        instance: &str,
+    ) -> Vec<&'static str> {
+        let validator =
+            SchemaValidator::new(schema_set, flags | ValidationFlags::PROCESS_ASSERTIONS);
+        let (mut errors, mut warnings) = (Vec::new(), Vec::new());
+        {
+            let mut runtime = validator.start_run(CollectingValidationSink {
+                errors: &mut errors,
+                warnings: &mut warnings,
+            });
+            runtime.set_current_time(run_instant);
+            drive_quick_xml(instance.as_bytes(), &mut runtime, schema_set).expect("drives");
+        }
+        errors.iter().map(|e| e.constraint).collect()
+    }
+
+    /// An enumeration's values and a value constraint's {value} are schema
+    /// properties: read at the schema set's instant (here before 2000, so the
+    /// literal is an `Early` string with its spaces), whatever the run's
+    /// instant and the wall clock. A run after 2000 reads the instance as an
+    /// `xs:token` (`a b`), which is then none of them — on the declared type's
+    /// path and on an `xsi:type`'s alike. No system clock is read (isolated
+    /// Miri).
+    #[test]
+    fn schema_literals_are_read_at_the_schema_set_s_instant() {
+        let schema_set = literal_schema(before_2000());
+        let flags = ValidationFlags::default();
+        let fits = "<doc><f>  a  b  </f><e>  a  b  </e><r>  a  b  </r></doc>";
+        assert_eq!(
+            run_codes(&schema_set, flags, before_2000(), fits),
+            Vec::<&str>::new()
+        );
+        // After 2000 the instance values are tokens: an enumeration violation
+        // under the simple type and under the simple content alike.
+        let codes = run_codes(
+            &schema_set,
+            flags,
+            after_2000(),
+            "<doc><e>  a  b  </e><r>  a  b  </r></doc>",
+        );
+        assert_eq!(
+            codes
+                .iter()
+                .filter(|c| **c == "cvc-enumeration-valid")
+                .count(),
+            2,
+            "{codes:?}"
+        );
+        // The fixed value, by the declared type and by an `xsi:type`: one
+        // {value}, the schema's, on both paths.
+        let instance = r#"<doc xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"><f>a b</f><f xsi:type="U2">a b</f></doc>"#;
+        let codes = run_codes(&schema_set, flags, after_2000(), instance);
+        assert_eq!(
+            codes.iter().filter(|c| **c == "cvc-elt.5.2.2").count(),
+            2,
+            "{codes:?}"
+        );
+        // The same schema read after 2000: the literals are tokens, which the
+        // instances are then too.
+        let schema_set = literal_schema(after_2000());
+        assert_eq!(
+            run_codes(&schema_set, flags, after_2000(), instance),
+            Vec::<&str>::new()
+        );
+    }
+
+    /// A typed build writes a defaulted attribute with the constraint's
+    /// value, the schema's, with or without `BUILD_PSVI_TYPED_VALUES`: no
+    /// flag changes the document's content. No system clock is read.
+    #[test]
+    fn a_defaulted_attribute_is_the_schema_s_value_whatever_the_flags() {
+        use crate::document::{
+            build_typed_document_with, BufferDocumentOptions, TypedBuildOptions,
+        };
+        use crate::validation::NoopHandler;
+        let schema_set = literal_schema(before_2000());
+        for flags in [
+            ValidationFlags::default(),
+            ValidationFlags::default() & !ValidationFlags::BUILD_PSVI_TYPED_VALUES,
+        ] {
+            let validator =
+                SchemaValidator::new(&schema_set, flags | ValidationFlags::PROCESS_ASSERTIONS);
+            let (mut errors, mut warnings) = (Vec::new(), Vec::new());
+            let arena = bumpalo::Bump::new();
+            let built = {
+                let mut runtime = validator.start_run(CollectingValidationSink {
+                    errors: &mut errors,
+                    warnings: &mut warnings,
+                });
+                runtime.set_current_time(after_2000());
+                build_typed_document_with(
+                    "<doc/>".as_bytes(),
+                    &arena,
+                    &schema_set,
+                    &mut runtime,
+                    &mut NoopHandler,
+                    TypedBuildOptions::default()
+                        .with_document_options(BufferDocumentOptions::full()),
+                )
+                .expect("the build completes")
+            };
+            assert!(errors.is_empty(), "{flags:?}: {errors:?}");
+            let ctx = crate::xpath::XPathContext::new(&schema_set.name_table);
+            let expr = crate::xpath::XPathExpr::compile("string(/doc/@d)", &ctx).expect("compiles");
+            let value = expr
+                .evaluator(&ctx)
+                .run_with_node(built.document.create_navigator())
+                .expect("evaluates");
+            assert_eq!(
+                value.to_owned_string().as_deref(),
+                Some("  a  b  "),
+                "{flags:?}"
+            );
+        }
+    }
+
+    /// An empty element takes the {lexical form} its schema set recorded for
+    /// the value constraint (Structures §3.3.5.4 clause 1.1), under the
+    /// declared type as under any other: here the schema set read the literal
+    /// before 2000 (an `Early` string, spaces kept) and the run is after 2000,
+    /// where reading the attribute again would give the token `a b`. The run
+    /// reports that form, and a typed build has it as the element's text —
+    /// through `build_typed_document_with` and through a `TypedBuilderHandler`
+    /// driven directly, with either flag set — as the defaulted attribute of
+    /// the same type and literal has. No system clock is read.
+    #[test]
+    fn an_empty_element_takes_the_lexical_form_the_schema_set_recorded() {
+        use crate::document::{
+            build_typed_document_with, BufferDocument, BufferDocumentBuilder,
+            BufferDocumentOptions, TypedBuildOptions, TypedBuilderHandler,
+        };
+        use crate::validation::{
+            drive_quick_xml_with, EndElementInfo, EndElementValues, NoopHandler,
+            ValidationEventHandler,
+        };
+        /// The [schema normalized value] of every element end.
+        #[derive(Default)]
+        struct Normalized(Vec<Option<String>>);
+        impl ValidationEventHandler for Normalized {
+            type Error = std::convert::Infallible;
+            fn wants_typed_values(&self) -> bool {
+                true
+            }
+            fn after_end_element_values(
+                &mut self,
+                _info: &EndElementInfo,
+                values: EndElementValues<'_>,
+                _depth: usize,
+            ) -> Result<(), Self::Error> {
+                self.0.push(values.normalized_value.map(str::to_owned));
+                Ok(())
+            }
+        }
+
+        let schema_set = literal_schema(before_2000());
+        let recorded = schema_set
+            .arenas
+            .elements
+            .values()
+            .find(|e| e.default_value.is_some())
+            .and_then(|x| schema_set.value_constraint_lexical_form(x))
+            .expect("the recorded lexical form of x");
+        assert_eq!(recorded, "  a  b  ");
+
+        let text = |doc: &BufferDocument<'_>| {
+            let ctx = crate::xpath::XPathContext::new(&schema_set.name_table);
+            ["string(/doc/x)", "string(/doc/@d)"].map(|xpath| {
+                crate::xpath::XPathExpr::compile(xpath, &ctx)
+                    .expect("compiles")
+                    .evaluator(&ctx)
+                    .run_with_node(doc.create_navigator())
+                    .expect("evaluates")
+                    .to_owned_string()
+                    .unwrap_or_default()
+            })
+        };
+        let options = BufferDocumentOptions::full();
+        for flags in [
+            ValidationFlags::default(),
+            ValidationFlags::default() & !ValidationFlags::BUILD_PSVI_TYPED_VALUES,
+        ] {
+            let validator =
+                SchemaValidator::new(&schema_set, flags | ValidationFlags::PROCESS_ASSERTIONS);
+            let run = || {
+                let mut runtime = validator.start_run(crate::document::SilentValidationSink);
+                runtime.set_current_time(after_2000());
+                runtime
+            };
+
+            let mut ends = Normalized::default();
+            let outcome = drive_quick_xml_with(
+                "<doc><x/></doc>".as_bytes(),
+                &mut run(),
+                &schema_set,
+                &mut ends,
+            )
+            .expect("drives");
+            assert_eq!(
+                outcome.root_validity,
+                Some(SchemaValidity::Valid),
+                "{flags:?}"
+            );
+            assert_eq!(ends.0, [Some(recorded.clone()), None], "{flags:?}");
+
+            let arena = bumpalo::Bump::new();
+            let built = build_typed_document_with(
+                "<doc><x/></doc>".as_bytes(),
+                &arena,
+                &schema_set,
+                &mut run(),
+                &mut NoopHandler,
+                TypedBuildOptions::default().with_document_options(options),
+            )
+            .expect("the build completes");
+            assert_eq!(text(&built.document), ["  a  b  ", "  a  b  "], "{flags:?}");
+
+            let arena = bumpalo::Bump::new();
+            let mut builder = BufferDocumentBuilder::new(
+                &arena,
+                &schema_set.name_table,
+                Some(&schema_set),
+                options,
+            )
+            .expect("a builder");
+            {
+                let mut handler = TypedBuilderHandler::new(&mut builder);
+                drive_quick_xml_with(
+                    "<doc><x/></doc>".as_bytes(),
+                    &mut run(),
+                    &schema_set,
+                    &mut handler,
+                )
+                .unwrap_or_else(|_| panic!("drives"));
+            }
+            let direct = builder.finalize().expect("the document");
+            assert_eq!(text(&direct), ["  a  b  ", "  a  b  "], "{flags:?}");
+        }
+    }
+
+    /// Only a type one of whose `xs:assertion` facets can read the current
+    /// dateTime is handled as time-dependent: the facet may be the type's
+    /// own, a base type's, a list's item type's, a union's member type's, or
+    /// that of a complex type's simple content. Any other type — one with an
+    /// assertion that reads no clock included — is not, and a schema set
+    /// whose only XPath expressions read no clock asks no type at all.
+    #[test]
+    fn only_a_type_whose_assertion_reads_the_clock_is_time_dependent() {
+        let schema_set = load_schema_xsd11(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:simpleType name="Plain"><xs:restriction base="xs:token"><xs:maxLength value="9"/></xs:restriction></xs:simpleType>
+                <xs:simpleType name="Even"><xs:restriction base="xs:int">
+                    <xs:assertion test="$value mod 2 = 0"/>
+                </xs:restriction></xs:simpleType>
+                <xs:simpleType name="Early"><xs:restriction base="xs:string">
+                    <xs:assertion test="fn:current-dateTime() lt xs:dateTime('2000-01-01T00:00:00Z')" xmlns:fn="http://www.w3.org/2005/xpath-functions"/>
+                </xs:restriction></xs:simpleType>
+                <xs:simpleType name="Today"><xs:restriction base="xs:date">
+                    <xs:assertion test="$value le current-date()"/>
+                </xs:restriction></xs:simpleType>
+                <xs:simpleType name="Derived"><xs:restriction base="Early"><xs:maxLength value="9"/></xs:restriction></xs:simpleType>
+                <xs:simpleType name="ListOfEarly"><xs:list itemType="Derived"/></xs:simpleType>
+                <xs:simpleType name="ShortList"><xs:restriction base="ListOfEarly"><xs:maxLength value="2"/></xs:restriction></xs:simpleType>
+                <xs:simpleType name="UnionOfEarly"><xs:union memberTypes="xs:int ShortList"/></xs:simpleType>
+                <xs:simpleType name="UnionOfEven"><xs:union memberTypes="Even Plain"/></xs:simpleType>
+                <xs:simpleType name="ListOfEven"><xs:list itemType="Even"/></xs:simpleType>
+                <xs:complexType name="ContentEarly"><xs:simpleContent><xs:extension base="UnionOfEarly"/></xs:simpleContent></xs:complexType>
+                <xs:complexType name="ContentPlain"><xs:simpleContent><xs:extension base="Plain"/></xs:simpleContent></xs:complexType>
+                <xs:complexType name="ContentFacet"><xs:simpleContent><xs:restriction base="ContentPlain">
+                    <xs:assertion test="string(current-time()) ne $value"/>
+                </xs:restriction></xs:simpleContent></xs:complexType>
+                <xs:complexType name="ContentOfFacet"><xs:simpleContent><xs:extension base="ContentFacet"/></xs:simpleContent></xs:complexType>
+                <xs:complexType name="Mixed" mixed="true"><xs:sequence/>
+                    <xs:assert test="current-dateTime() gt xs:dateTime('1970-01-01T00:00:00Z')"/>
+                </xs:complexType>
+                <xs:element name="doc" type="Mixed"/>
+            </xs:schema>"#,
+        );
+        let reads = |name: &str| {
+            let key = schema_set
+                .lookup_type(None, schema_set.name_table.add(name))
+                .unwrap_or_else(|| panic!("the type {name}"));
+            schema_set.arenas.reads_clock(key)
+        };
+        for name in [
+            "Early",
+            "Today",
+            "Derived",
+            "ListOfEarly",
+            "ShortList",
+            "UnionOfEarly",
+            "ContentEarly",
+            "ContentFacet",
+            "ContentOfFacet",
+        ] {
+            assert!(reads(name), "{name} reads the clock");
+            assert!(reads(name), "{name}, from the cache");
+        }
+        // A complex type's own `xs:assert` is no facet of a value: the run
+        // evaluates it once per element, at the run's instant.
+        for name in [
+            "Plain",
+            "Even",
+            "UnionOfEven",
+            "ListOfEven",
+            "ContentPlain",
+            "Mixed",
+        ] {
+            assert!(!reads(name), "{name} reads no clock");
+        }
+        let builtin = |code| {
+            schema_set
+                .builtin_types()
+                .get_by_type_code(code)
+                .map(TypeKey::Simple)
+                .expect("a built-in type")
+        };
+        assert!(!schema_set.arenas.reads_clock(builtin(XmlTypeCode::String)));
+        assert!(!schema_set
+            .arenas
+            .reads_clock(builtin(XmlTypeCode::AnySimpleType)));
+        assert!(!schema_set
+            .arenas
+            .reads_clock(TypeKey::Complex(schema_set.any_type_key())));
+        let facts = PreparedSchemaFacts::of(&schema_set);
+        assert!(facts.has_xpath_expressions && facts.has_clock_reading_facets);
+
+        // Assertions, a type alternative and an `xs:assert` that reads the
+        // clock, but no facet that does: nothing is time-dependent.
+        let schema_set = load_schema_xsd11(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:simpleType name="Even"><xs:restriction base="xs:int">
+                    <xs:assertion test="$value mod 2 = 0"/>
+                </xs:restriction></xs:simpleType>
+                <xs:element name="doc"><xs:complexType>
+                    <xs:attribute name="a" type="Even" fixed="2"/>
+                    <xs:assert test="current-dateTime() gt xs:dateTime('1970-01-01T00:00:00Z')"/>
+                </xs:complexType></xs:element>
+            </xs:schema>"#,
+        );
+        let facts = PreparedSchemaFacts::of(&schema_set);
+        assert!(facts.has_xpath_expressions && !facts.has_clock_reading_facets);
+    }
+}

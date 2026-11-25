@@ -73,6 +73,11 @@ pub(crate) fn resolve_alternative_default_ns(
 /// fragment's document-level base URI; the schema document URI is
 /// separately exposed to `fn:static-base-uri()` via the XPath static
 /// context.
+///
+/// `clock` is the clock of the validation run (`None` outside one): a test
+/// reports its instant as the current dateTime, so that an alternative and the
+/// assertions of the same run agree (XSD 1.1 Structures §3.13.4.2 clause 6).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn evaluate_type_alternatives(
     elem_key: ElementKey,
     elem_local_name: NameId,
@@ -81,6 +86,7 @@ pub(crate) fn evaluate_type_alternatives(
     instance_ns: Option<&NamespaceContextSnapshot>,
     instance_base_uri: Option<&str>,
     schema_set: &SchemaSet,
+    clock: Option<&crate::clock::SharedClock>,
 ) -> Option<TypeKey> {
     let alternatives = &schema_set.arenas.elements[elem_key].alternatives;
     if alternatives.is_empty() {
@@ -186,11 +192,12 @@ pub(crate) fn evaluate_type_alternatives(
             };
             let test_expr = &compiled.test;
 
-            let nav = BufferDocNavigator::new(&doc, elem_ref);
+            let nav = BufferDocNavigator::new(&doc, elem_ref).with_run_clock(clock);
             let warnings = std::cell::RefCell::new(Vec::new());
             let outcome = expr
                 .evaluator(&ctx)
                 .with_warnings(&warnings)
+                .with_run_clock(clock)
                 .run_with_node(nav);
             super::assertions::note_expression_warnings(
                 "type alternative test",
@@ -267,8 +274,16 @@ mod tests {
         );
         let elem_key = find_elem_key(&schema_set, "root");
         let local_name = schema_set.name_table.add("root");
-        let result =
-            evaluate_type_alternatives(elem_key, local_name, None, &[], None, None, &schema_set);
+        let result = evaluate_type_alternatives(
+            elem_key,
+            local_name,
+            None,
+            &[],
+            None,
+            None,
+            &schema_set,
+            None,
+        );
         assert!(result.is_none());
     }
 
@@ -359,6 +374,7 @@ mod tests {
             None,
             None,
             &schema_set,
+            None,
         );
         let type_a = find_type_key(&schema_set, "typeA");
         assert_eq!(result_a, Some(type_a));
@@ -380,6 +396,7 @@ mod tests {
             Some(&snapshot),
             Some("file:///some/instance.xml"),
             &schema_set,
+            None,
         );
         assert_eq!(
             result_a_with_ns,
@@ -398,6 +415,7 @@ mod tests {
             Some(&snapshot),
             Some("file:///some/instance.xml"),
             &schema_set,
+            None,
         );
         let type_b = find_type_key(&schema_set, "typeB");
         assert_eq!(
@@ -416,6 +434,7 @@ mod tests {
             Some(&snapshot),
             Some("file:///x.xml"),
             &schema_set,
+            None,
         );
         let attrs_b2 = vec![(None, kind_name, "B".to_string())];
         let r2 = evaluate_type_alternatives(
@@ -426,6 +445,7 @@ mod tests {
             Some(&snapshot),
             Some("file:///x.xml"),
             &schema_set,
+            None,
         );
         let attrs_x = vec![(None, kind_name, "X".to_string())];
         let r3 = evaluate_type_alternatives(
@@ -436,6 +456,7 @@ mod tests {
             Some(&snapshot),
             Some("file:///x.xml"),
             &schema_set,
+            None,
         );
         assert_eq!(r1, Some(type_a), "first sequential CTA: expected typeA");
         assert_eq!(r2, Some(type_b), "second sequential CTA: expected typeB");
@@ -451,6 +472,7 @@ mod tests {
             None,
             None,
             &schema_set,
+            None,
         );
         let type_b = find_type_key(&schema_set, "typeB");
         assert_eq!(result_b, Some(type_b));
@@ -482,8 +504,16 @@ mod tests {
 
         // kind='X' -> no match, no default -> None
         let attrs = vec![(None, kind_name, "X".to_string())];
-        let result =
-            evaluate_type_alternatives(elem_key, local_name, None, &attrs, None, None, &schema_set);
+        let result = evaluate_type_alternatives(
+            elem_key,
+            local_name,
+            None,
+            &attrs,
+            None,
+            None,
+            &schema_set,
+            None,
+        );
         assert!(result.is_none());
     }
 
@@ -519,8 +549,16 @@ mod tests {
 
         // kind='X' -> no test match -> default fallback
         let attrs = vec![(None, kind_name, "X".to_string())];
-        let result =
-            evaluate_type_alternatives(elem_key, local_name, None, &attrs, None, None, &schema_set);
+        let result = evaluate_type_alternatives(
+            elem_key,
+            local_name,
+            None,
+            &attrs,
+            None,
+            None,
+            &schema_set,
+            None,
+        );
         let default_type = find_type_key(&schema_set, "defaultType");
         assert_eq!(result, Some(default_type));
     }
@@ -556,8 +594,16 @@ mod tests {
         let local_name = schema_set.name_table.add("root");
         let mode_name = schema_set.name_table.add("mode");
         let attrs = vec![(None, mode_name, "simple".to_string())];
-        let result =
-            evaluate_type_alternatives(elem_key, local_name, None, &attrs, None, None, &schema_set);
+        let result = evaluate_type_alternatives(
+            elem_key,
+            local_name,
+            None,
+            &attrs,
+            None,
+            None,
+            &schema_set,
+            None,
+        );
         assert!(result.is_some());
         assert_eq!(result, elem.alternatives[0].resolved_type);
     }
@@ -738,6 +784,7 @@ mod tests {
             None,
             None,
             &schema_set,
+            None,
         );
         let small_type = find_type_key(&schema_set, "smallType");
         assert_eq!(result_small, Some(small_type));
@@ -752,6 +799,7 @@ mod tests {
             None,
             None,
             &schema_set,
+            None,
         );
         let large_type = find_type_key(&schema_set, "largeType");
         assert_eq!(result_large, Some(large_type));

@@ -152,6 +152,8 @@
 
 // Core type definitions
 pub mod arenas;
+/// The system clock and the instant a validation run's expressions share.
+pub(crate) mod clock;
 pub mod error;
 pub mod ids;
 

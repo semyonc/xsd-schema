@@ -24,7 +24,7 @@ use crate::types::XmlTypeCode;
 use crate::validation::content::{CompiledContentModel, ContentValidatorState};
 use crate::validation::info::{ContentType, ValidationFlags};
 use crate::validation::runtime::determine_content_type;
-use crate::validation::{validate_simple_type, SchemaValidator};
+use crate::validation::SchemaValidator;
 
 use super::alphabet::{step_alphabet, ComposedAlphabet};
 use super::model::*;
@@ -535,7 +535,8 @@ impl<'a> Builder<'a> {
                 let c = self.plan.checks[check as usize];
                 if c.kind == CheckKind::Uncovered
                     || c.flags & CHECK_ID != 0
-                    || validate_simple_type(v, ty?, set).is_err()
+                    || crate::validation::simple::validate_schema_literal(v, ty?, set, None)
+                        .is_err()
                 {
                     return None;
                 }

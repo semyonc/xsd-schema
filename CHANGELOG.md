@@ -90,6 +90,24 @@ corpora give the same results.
   documents and errors with their byte positions. The `BufRead` functions
   still accept a slice (`&[u8]` is a `BufRead`) and still read it through a
   buffer. See *Performance*.
+- XSD 1.1 (`xsd11`): `ValidationRuntime::set_current_time` gives a validation
+  run its current dateTime, the instant every assertion, assertion facet and
+  type alternative of the run reports from `fn:current-dateTime` (in the
+  implicit timezone, UTC). A host makes a verdict that depends on the current
+  dateTime reproducible with it, and on `wasm32-unknown-unknown`, whose
+  standard library has no clock, gives validation one.
+- `ValidationEventHandler::wants_typed_values` and
+  `ValidationEventHandler::after_end_element_values` (both defaulted), with
+  the view `validation::EndElementValues`: a handler that asks is lent, at
+  each element end, the element's typed value and \[schema normalized value\]
+  as the run found them — in place of `after_end_element`, which carries the
+  verdict only — and gets the typed value of every defaulted attribute
+  (`DefaultAttribute::typed_value`) whatever `BUILD_PSVI_TYPED_VALUES` says.
+  A handler that builds a typed tree or typed records needs no second
+  validation of the lexical forms. A handler that does not ask is driven
+  exactly as before. `TypedBuilderHandler` asks, so a typed document is the
+  same whether `build_typed_document_with` or the caller's own
+  `drive_quick_xml_with` drives it.
 
 ### Changed
 
@@ -136,6 +154,41 @@ corpora give the same results.
 
 ### Fixed
 
+- XSD 1.1: one validation run has one current dateTime (Structures §3.13.4.2
+  clause 6: "The current dateTime is ·implementation-defined·, but is
+  constant during an ·assessment· episode"). Every assertion (`xs:assert`, an
+  `xs:assertion` facet of an attribute's, an element's, a list item's or a
+  union member's type) and every type alternative of a run reports the run's
+  instant — the host's, or the system clock read the first time one of them
+  asks for it — where each used to read the clock for itself. The
+  assertion's data model no longer validates a value again with another
+  clock either: it files the ids and idrefs the run accepted, gives a value
+  of a union whose assertions read the current dateTime the whitespace of
+  the member the run took, and computes the typed values it needs (`$value`,
+  `fn:data`, also of the nodes `fn:id` and `fn:idref` return) with the run's
+  instant. So a verdict no longer depends on how fast the document arrives:
+  an `xs:ID` type with an assertion valid until a deadline, read with a pause
+  past the deadline between two ids, used to accept both ids and then fail
+  `exists(id('one')) and exists(id('foo'))`. A typed build
+  (`build_typed_document_with`, or a `TypedBuilderHandler` driven with
+  `drive_quick_xml_with`) holds what its run found — ids, such a union's
+  whitespace, defaulted attributes — with or without
+  `BUILD_PSVI_TYPED_VALUES`.
+- XSD 1.1: a schema set's own literals — an enumeration's values, a value
+  constraint's {value}, the literals of its schema-time checks — are read at
+  one instant of the set's own (the system clock, read the first time one of
+  them needs it), so that a literal whose type's assertion reads the current
+  dateTime has one value per schema set. It used to be read again on each use
+  with the system clock: an enumeration of a simple content restriction of a
+  union, or a `fixed` value checked under the declared type and under an
+  `xsi:type`, could give two verdicts for one schema set and one instant.
+  For a type one of whose `xs:assertion` facets calls `fn:current-dateTime`,
+  `fn:current-date` or `fn:current-time` — and for no other type — a `fixed`
+  value is compared by value with the {value} the schema set recorded, read
+  with the bindings of its declaration, and an empty element takes the
+  {lexical form} the schema set recorded (Structures §3.3.5.4 clause 1.1),
+  as a defaulted attribute does. Value constraints of every other type are
+  handled as before, whatever XPath expressions the schema set has.
 - XSD 1.1 and XPath (`xsd11`): under the `i` flag (`fn:matches`, `fn:replace`,
   `fn:tokenize`), a repetition followed by a literal no longer rejects matches:
   `fn:matches("file.XML", ".*\.xml", "i")` is true, and so are `.*1` on "a1"

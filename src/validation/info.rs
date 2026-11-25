@@ -577,9 +577,12 @@ pub struct DefaultAttribute {
     /// §3.3.18), so that an `xs:QName` / `xs:NOTATION` value has the schema's
     /// expanded name, whatever the instance binds its prefix to. Present when
     /// the run retains PSVI typed values
-    /// ([`ValidationFlags::BUILD_PSVI_TYPED_VALUES`]), and always for a type
-    /// whose values can be or hold QNames or NOTATIONs; `None` otherwise, or
-    /// when the value is not valid for the type.
+    /// ([`ValidationFlags::BUILD_PSVI_TYPED_VALUES`]), always for a type
+    /// whose values can be or hold QNames or NOTATIONs, and for every typed
+    /// attribute when the streaming driver serves a handler that asks for
+    /// typed values
+    /// ([`ValidationEventHandler::wants_typed_values`](crate::validation::ValidationEventHandler::wants_typed_values));
+    /// `None` otherwise, or when the value is not valid for the type.
     pub typed_value: Option<XmlValue>,
 }
 

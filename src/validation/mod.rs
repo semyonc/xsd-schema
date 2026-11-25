@@ -75,8 +75,8 @@ pub use navigator_driver::drive_navigator;
 pub use quick_xml_driver::{
     drive_quick_xml, drive_quick_xml_bytes, drive_quick_xml_in, drive_quick_xml_with,
     drive_quick_xml_with_bytes, drive_quick_xml_with_in, AttributeView, DoctypeView, DriveError,
-    DriveOutcome, DriveWithError, ElementStartView, EndElementInfo, EndOfAttributesView,
-    NoopHandler, TextKind, ValidationEventHandler,
+    DriveOutcome, DriveWithError, ElementStartView, EndElementInfo, EndElementValues,
+    EndOfAttributesView, NoopHandler, TextKind, ValidationEventHandler,
 };
 pub use runtime::ValidationRuntime;
 pub use validator::{

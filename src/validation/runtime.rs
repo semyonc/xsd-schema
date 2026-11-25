@@ -553,6 +553,21 @@ pub struct ValidationRuntime<'a, S: ValidationSink> {
     /// skips the collection around each value it validates.
     #[cfg(feature = "xsd11")]
     has_xpath_expressions: bool,
+    /// Whether any `xs:assertion` facet of the schema set can read the
+    /// current dateTime ([`schema_has_clock_reading_facets`]). When `false`
+    /// — every schema set whose assertion facets, if it has any, call no
+    /// `fn:current-dateTime` — no type is asked whether it reads a clock
+    /// ([`literal_values_may_vary`](Self::literal_values_may_vary)).
+    #[cfg(feature = "xsd11")]
+    has_clock_reading_facets: bool,
+    /// The current dateTime of this run: lent to every XPath evaluation the
+    /// run makes — XSD 1.1 assertions, assertion facets, type alternatives,
+    /// and the typed values the assertion fragment computes — so that they
+    /// all report one instant (XSD 1.1 Structures §3.13.4.2 clause 6). Read
+    /// from the system clock the first time an expression asks, unless the
+    /// host set it ([`set_current_time`](Self::set_current_time)); a run that
+    /// evaluates no `fn:current-dateTime` reads no clock.
+    run_clock: crate::clock::SharedClock,
     /// The serial of the element whose start reported its `xsi:type` as
     /// resolving to no type (`cvc-elt.4.1`), so that its `xsi:type`
     /// attribute, invalid by XSD 1.1 §3.2.4.1 clause 5, is not reported a
@@ -572,6 +587,8 @@ pub(crate) struct PreparedSchemaFacts {
     pub(crate) has_inheritable_attributes: bool,
     /// [`schema_has_xpath_expressions`].
     pub(crate) has_xpath_expressions: bool,
+    /// [`schema_has_clock_reading_facets`].
+    pub(crate) has_clock_reading_facets: bool,
 }
 
 #[cfg(feature = "xsd11")]
@@ -580,6 +597,7 @@ impl PreparedSchemaFacts {
         PreparedSchemaFacts {
             has_inheritable_attributes: schema_has_inheritable_attributes(schema_set),
             has_xpath_expressions: schema_has_xpath_expressions(schema_set),
+            has_clock_reading_facets: schema_has_clock_reading_facets(schema_set),
         }
     }
 }
@@ -608,6 +626,30 @@ fn schema_has_xpath_expressions(schema_set: &SchemaSet) -> bool {
                 )
         })
         || arenas.elements.values().any(|e| !e.alternatives.is_empty())
+}
+
+/// Whether any `xs:assertion` facet of the schema set — of a simple type or of
+/// a complex type's simple content — can read the current dateTime
+/// ([`assertion_reads_clock`](crate::arenas::assertion_reads_clock)). `false`
+/// guarantees that no value's validation depends on the instant it is made
+/// at, so that a literal of the schema reads as an instance value written the
+/// same way does: the runtime then asks no type whether it reads a clock
+/// ([`ValidationRuntime::literal_values_may_vary`]).
+#[cfg(feature = "xsd11")]
+fn schema_has_clock_reading_facets(schema_set: &SchemaSet) -> bool {
+    use crate::arenas::assertion_reads_clock;
+    let arenas = &schema_set.arenas;
+    arenas
+        .simple_types
+        .values()
+        .any(|st| st.facets.assertions.iter().any(assertion_reads_clock))
+        || arenas.complex_types.values().any(|ct| {
+            matches!(
+                &ct.content,
+                crate::parser::frames::ComplexContentResult::Simple(sc)
+                    if sc.facets.assertions.iter().any(assertion_reads_clock)
+            )
+        })
 }
 
 /// Whether the schema declares any attribute with `{inheritable}` = true
@@ -1128,6 +1170,9 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             has_inheritable_attributes: facts.has_inheritable_attributes,
             #[cfg(feature = "xsd11")]
             has_xpath_expressions: facts.has_xpath_expressions,
+            #[cfg(feature = "xsd11")]
+            has_clock_reading_facets: facts.has_clock_reading_facets,
+            run_clock: crate::clock::SharedClock::new(),
             xsi_type_unresolved_reported: None,
             _not_thread_safe: PhantomData,
         }
@@ -1265,6 +1310,68 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         self.validation_root
     }
 
+    /// Give the run its current dateTime: the instant that every XSD 1.1
+    /// assertion, assertion facet and type alternative of the run reports
+    /// from `fn:current-dateTime` (and `fn:current-date`, `fn:current-time`),
+    /// expressed in the implicit timezone, UTC.
+    ///
+    /// XSD 1.1 Structures §3.13.4.2 clause 6: "The current dateTime is
+    /// ·implementation-defined·, but is constant during an ·assessment·
+    /// episode." Without this call the run reads the system clock once, the
+    /// first time one of its expressions asks for the current dateTime, and
+    /// every later expression of the run reports that same instant; a run
+    /// that evaluates no `fn:current-dateTime` reads no clock. With it the
+    /// run reads no clock at all, so a host can make a verdict that depends on
+    /// the current dateTime reproducible — and on `wasm32-unknown-unknown`,
+    /// whose standard library has no clock, this is how a host gives
+    /// validation one (there `fn:current-dateTime` otherwise raises the
+    /// dynamic error `XPDY0002`, which fails the assertion).
+    ///
+    /// Call it before the first event of the run; a later call changes the
+    /// instant the expressions evaluated after it report.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::time::{Duration, UNIX_EPOCH};
+    /// use xsd_schema::validation::{
+    ///     drive_quick_xml, CollectingValidationSink, SchemaValidator, SchemaValidity,
+    ///     ValidationFlags,
+    /// };
+    /// use xsd_schema::{SchemaSetBuilder, XsdVersion};
+    ///
+    /// let xsd = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+    ///   <xs:element name="offer">
+    ///     <xs:complexType>
+    ///       <xs:assert test="current-dateTime() lt xs:dateTime('2000-01-01T00:00:00Z')"/>
+    ///     </xs:complexType>
+    ///   </xs:element>
+    /// </xs:schema>"#;
+    /// let schema_set = SchemaSetBuilder::with_version(XsdVersion::V1_1)
+    ///     .add_source(xsd, "file:///offer.xsd")?
+    ///     .compile()?
+    ///     .into_schema_set();
+    /// let validator = SchemaValidator::new(
+    ///     &schema_set,
+    ///     ValidationFlags::default() | ValidationFlags::PROCESS_ASSERTIONS,
+    /// );
+    /// let (mut errors, mut warnings) = (Vec::new(), Vec::new());
+    /// let mut runtime = validator.start_run(CollectingValidationSink {
+    ///     errors: &mut errors,
+    ///     warnings: &mut warnings,
+    /// });
+    /// // 1999-12-31T23:00:00Z: the offer has not expired yet.
+    /// runtime.set_current_time(UNIX_EPOCH + Duration::from_secs(946_681_200));
+    /// let outcome = drive_quick_xml("<offer/>".as_bytes(), &mut runtime, &schema_set)?;
+    /// assert_eq!(outcome.root_validity, Some(SchemaValidity::Valid));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    #[cfg(feature = "xsd11")]
+    pub fn set_current_time(&mut self, now: std::time::SystemTime) {
+        self.run_clock =
+            crate::clock::SharedClock::fixed(crate::clock::HostClock::from_system_time(now));
+    }
+
     /// Returns accumulated `xsi:schemaLocation` hints.
     ///
     /// Each hint contains a namespace/location pair plus the instance base
@@ -1390,10 +1497,29 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         binding: crate::document::type_remap::NodeSchemaBinding,
         context: &str,
     ) -> bool {
+        self.install_fragment_binding_from(node_ref, binding, context, None)
+    }
+
+    /// [`install_fragment_binding`](Self::install_fragment_binding) for an
+    /// attribute this run has validated: `typed` is the typed value it gave the
+    /// attribute (`Some(None)`: not valid), from which the fragment files its
+    /// id and idrefs entries instead of validating the value again.
+    #[cfg(feature = "xsd11")]
+    fn install_fragment_binding_from(
+        &mut self,
+        node_ref: u32,
+        binding: crate::document::type_remap::NodeSchemaBinding,
+        context: &str,
+        typed: Option<Option<&XmlValue>>,
+    ) -> bool {
         let Some(builder) = self.fragment_builder.as_mut() else {
             return true;
         };
-        if let Err(e) = builder.set_node_binding(node_ref, binding) {
+        let bound = match typed {
+            Some(typed) => builder.set_node_binding_validated(node_ref, binding, typed),
+            None => builder.set_node_binding(node_ref, binding),
+        };
+        if let Err(e) = bound {
             self.abort_assertion_buffer_op(context, e);
             return false;
         }
@@ -3646,13 +3772,18 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         // The assertion's data model is built from the PSVI: a valid
         // attribute's string value is its [schema normalized value] (XDM 1.0
         // §6.3.4).
+        // A union's is the one the member that accepted the value gave, which
+        // the run's result carries (`validated_normalized`).
         if info.validity == SchemaValidity::Valid {
             let schema_set = self.schema_set;
             if let Some(builder) = self.fragment_builder.as_mut() {
-                let normalized = super::simple::schema_normalized(
+                let normalized = super::simple::validated_normalized(
                     builder.attribute_value(attr_ref),
                     type_key,
                     schema_set,
+                    info.typed_value.as_ref(),
+                    info.normalized_value.as_deref(),
+                    Some(&self.run_clock),
                 );
                 if let Some(normalized) = normalized {
                     builder.set_attribute_value(attr_ref, &normalized);
@@ -3665,7 +3796,12 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             attribute_decl: info.attribute_decl,
             content_type: None,
         };
-        let _ = self.install_fragment_binding(attr_ref, binding, "attr binding");
+        let _ = self.install_fragment_binding_from(
+            attr_ref,
+            binding,
+            "attr binding",
+            Some(info.typed_value.as_ref()),
+        );
     }
 
     /// Signal end of attributes; checks for missing required attributes and
@@ -3721,6 +3857,42 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     /// collects none.
     pub fn take_default_attributes(&mut self) -> Vec<DefaultAttribute> {
         std::mem::take(&mut self.default_attributes)
+    }
+
+    /// [`take_default_attributes`](Self::take_default_attributes) with the
+    /// typed value of every defaulted attribute that has a type
+    /// ([`DefaultAttribute::typed_value`]) — its value constraint's {value},
+    /// read at the schema set's instant with the bindings of the declaration
+    /// that carries it — whatever `BUILD_PSVI_TYPED_VALUES` says: those the
+    /// end of the attributes did not compute are computed here, from the same
+    /// attribute uses. Call it where `take_default_attributes` is called,
+    /// before the element's content. This is how the streaming driver serves
+    /// a handler that asks for typed values
+    /// ([`ValidationEventHandler::wants_typed_values`](super::ValidationEventHandler::wants_typed_values)).
+    pub(crate) fn take_default_attributes_typed(&mut self) -> Vec<DefaultAttribute> {
+        let mut defaults = std::mem::take(&mut self.default_attributes);
+        let untyped = |d: &DefaultAttribute| d.typed_value.is_none() && d.type_key.is_some();
+        if !defaults.iter().any(untyped) {
+            return defaults;
+        }
+        let Some(TypeKey::Complex(ct_key)) =
+            self.validation_stack.last().and_then(|s| s.schema_type)
+        else {
+            return defaults;
+        };
+        self.for_each_attribute_use(ct_key, |u| {
+            let (Some(value), Some(type_key)) = (u.value, u.type_key) else {
+                return;
+            };
+            let default = defaults.iter_mut().find(|d| {
+                d.local_name == u.name && d.namespace == u.namespace && d.typed_value.is_none()
+            });
+            if let Some(default) = default {
+                default.typed_value =
+                    self.value_constraint_typed_value(value, type_key, u.value_source);
+            }
+        });
+        defaults
     }
 
     /// The end-of-attributes step shared by both entry points above:
@@ -3871,6 +4043,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                         ev_state.ns_context.as_ref(),
                         Some(self.instance_base_uri.as_str()).filter(|s| !s.is_empty()),
                         self.schema_set,
+                        Some(&self.run_clock),
                     )
                 });
                 self.report_expression_warnings(raised);
@@ -4040,7 +4213,9 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         let ctx = self.schema_set.value_constraint_namespaces(source);
         let names = &self.schema_set.name_table;
         let resolver = ctx.map(|ns| super::simple::snapshot_prefixes(ns, names));
-        let typed = super::simple::validate_simple_type_in(
+        // A value constraint's literal is a schema property: read at the
+        // schema set's instant, the same in every run and on every path.
+        let typed = super::simple::validate_schema_literal(
             value,
             type_key,
             self.schema_set,
@@ -4068,6 +4243,30 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         self.flags
             .contains(ValidationFlags::BUILD_PSVI_TYPED_VALUES)
             || super::simple::type_has_qname_values(type_key, self.schema_set)
+    }
+
+    /// Whether a literal of the schema set read under `type_key` can be
+    /// another value than an instance value written the same way: only when
+    /// an XSD 1.1 `xs:assertion` facet that the type's validation evaluates
+    /// reads the current dateTime
+    /// ([`ArenasGuard::reads_clock`](crate::arenas::ArenasGuard::reads_clock)),
+    /// which the schema set reads at its own instant and the run at the
+    /// run's. For such a type a value constraint is compared, and taken, as
+    /// the {value} and {lexical form} the schema set recorded, never by the
+    /// literal's spelling. For every other type — every type of a schema set
+    /// without such a facet, whatever other XPath expressions it has — this
+    /// is `false`, and the literal is handled exactly as without assertions.
+    fn literal_values_may_vary(&self, type_key: Option<TypeKey>) -> bool {
+        #[cfg(feature = "xsd11")]
+        {
+            self.has_clock_reading_facets
+                && type_key.is_some_and(|tk| self.schema_set.arenas.reads_clock(tk))
+        }
+        #[cfg(not(feature = "xsd11"))]
+        {
+            let _ = type_key;
+            false
+        }
     }
 
     /// The `&self` scan behind
@@ -4498,6 +4697,50 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         (validity, validation_attempted)
     }
 
+    /// End the element as [`validate_end_element`](Self::validate_end_element)
+    /// does and lend `receive` what the run found for it: its `[validity]`
+    /// and `[validation attempted]`, its typed value (its \[schema actual
+    /// value\]) and its \[schema normalized value\] — each value when the
+    /// run has one (none for an element whose content is not valid for its
+    /// type, that is nilled, or that has no simple content; no typed value
+    /// where the run validated the lexical form alone, without
+    /// `BUILD_PSVI_TYPED_VALUES`). The values are the
+    /// run's own, borrowed for the call: no `SchemaInfo` is assembled and
+    /// nothing is copied. This is how the streaming driver serves a handler
+    /// that asks for them
+    /// ([`ValidationEventHandler::wants_typed_values`](super::ValidationEventHandler::wants_typed_values)).
+    pub(crate) fn validate_end_element_with<R>(
+        &mut self,
+        receive: impl FnOnce(SchemaValidity, ValidationAttempted, Option<&XmlValue>, Option<&str>) -> R,
+    ) -> R {
+        let finished = match self.finish_top_element(true) {
+            Some(f) => f,
+            None => {
+                return receive(
+                    SchemaValidity::Invalid,
+                    ValidationAttempted::None,
+                    None,
+                    None,
+                )
+            }
+        };
+        #[cfg(feature = "xsd11")]
+        let (ev_state, _assertion_outcome) = finished;
+        #[cfg(not(feature = "xsd11"))]
+        let ev_state = finished;
+
+        let validation_attempted = self.finalize_element(&ev_state);
+        let validity = assessed_validity(&ev_state);
+        let received = receive(
+            validity,
+            validation_attempted,
+            ev_state.typed_value.as_ref(),
+            ev_state.normalized_value.as_deref(),
+        );
+        self.state_pool.push(ev_state);
+        received
+    }
+
     /// F2/B1 step 1: content-model completion check (cvc-complex-type.2.4).
     ///
     /// For element-only or mixed content, verify the content model reached an
@@ -4733,10 +4976,18 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     // written normalizes to that form; under another type the
                     // form itself is read (its white space may differ: a union
                     // member's, `xs:anySimpleType`'s).
+                    // Under the declared type too when one of its assertions
+                    // reads the current dateTime: the form the schema set
+                    // recorded, not a second reading of the attribute at the
+                    // run's instant, which could normalize it as another
+                    // union member (`literal_values_may_vary`).
                     let declared = elem_data
                         .resolved_type
                         .unwrap_or_else(|| TypeKey::Complex(schema_set.any_type_key()));
-                    if ev_state.is_default && ev_state.schema_type != Some(declared) {
+                    if ev_state.is_default
+                        && (ev_state.schema_type != Some(declared)
+                            || self.literal_values_may_vary(Some(declared)))
+                    {
                         if let Some(lexical) = schema_set.value_constraint_lexical_form(elem_data) {
                             ev_state.text_content = lexical;
                             overridden = true;
@@ -4776,11 +5027,12 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                             .as_ref()
                             .map(|r| r as super::simple::PrefixResolver<'_>);
                         if keep_normalized {
-                            super::simple::validate_simple_type_in(
+                            super::simple::validate_simple_type_at(
                                 &ev_state.text_content,
                                 schema_type,
                                 self.schema_set,
                                 resolver,
+                                Some(&self.run_clock),
                             )
                         } else {
                             super::simple::validate_simple_type_in_without_normalized(
@@ -4788,6 +5040,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                                 schema_type,
                                 self.schema_set,
                                 resolver,
+                                Some(&self.run_clock),
                             )
                         }
                     });
@@ -4953,10 +5206,17 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     let declared = elem_data
                         .resolved_type
                         .unwrap_or_else(|| TypeKey::Complex(schema_set.any_type_key()));
+                    // The {value} the schema reads (a schema property): compared
+                    // with under another governing type, and under the declared
+                    // one too when an assertion of it reads the current
+                    // dateTime (`literal_values_may_vary`), so that both paths
+                    // compare with the one {value}.
+                    let by_record = ev_state.schema_type != Some(declared)
+                        || self.literal_values_may_vary(Some(declared));
                     let declared_value = ev_state
                         .typed_value
                         .as_ref()
-                        .filter(|_| !substituted_fixed && ev_state.schema_type != Some(declared))
+                        .filter(|_| !substituted_fixed && by_record)
                         .and_then(|_| schema_set.value_constraint_value(elem_data))
                         .filter(|(_, value)| value.type_code != XmlTypeCode::UntypedAtomic);
                     let matches = if substituted_fixed {
@@ -4994,13 +5254,15 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                                 .value_constraint_namespaces(elem_data.source.as_ref()),
                             ev_state.schema_type,
                             self.schema_set,
+                            self.literal_values_may_vary(ev_state.schema_type),
                         )
                     } else {
-                        super::simple::fixed_values_equal(
+                        super::simple::fixed_values_equal_at(
                             &ev_state.text_content,
                             fixed,
                             ev_state.schema_type,
                             self.schema_set,
+                            Some(&self.run_clock),
                         )
                     };
                     if !matches {
@@ -5108,17 +5370,22 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     ev_state.is_nil,
                 ) {
                     if builder.has_only_pending_text() {
-                        let normalized = super::simple::schema_normalized(
+                        let normalized = super::simple::validated_normalized(
                             builder.pending_text(),
                             type_key,
                             self.schema_set,
+                            ev_state.typed_value.as_ref(),
+                            ev_state.normalized_value.as_deref(),
+                            Some(&self.run_clock),
                         );
                         if let Some(normalized) = normalized {
                             builder.replace_pending_text(&normalized);
                         }
                     }
                 }
-                if let Err(e) = builder.end_element() {
+                // The element's id and idrefs entries come from the typed
+                // value this run gave it, not from a second validation.
+                if let Err(e) = builder.end_element_validated(ev_state.typed_value.as_ref()) {
                     self.abort_assertion_buffer_op("end_element", e);
                     ev_state.validity = SchemaValidity::Invalid;
                     break 'assertion_eval;
@@ -5163,6 +5430,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                                         pf.element_ref,
                                         pf.complex_type_key,
                                         self.schema_set,
+                                        &self.run_clock,
                                     )
                                 });
                                 self.report_expression_warnings_deferred(
@@ -5191,6 +5459,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                                     frame.element_ref,
                                     frame.complex_type_key,
                                     self.schema_set,
+                                    &self.run_clock,
                                 )
                             });
                             self.report_expression_warnings(raised);
@@ -7099,13 +7368,14 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             .last()
             .and_then(|ev| ev.ns_context.as_ref())
             .map(|ns| super::simple::snapshot_prefixes(ns, names));
-        super::simple::validate_simple_type_in(
+        super::simple::validate_simple_type_at(
             value,
             type_key,
             self.schema_set,
             resolver
                 .as_ref()
                 .map(|r| r as super::simple::PrefixResolver<'_>),
+            Some(&self.run_clock),
         )
     }
 
@@ -7192,9 +7462,16 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                         .value_constraint_namespaces(fixed_source.as_ref()),
                     attr_type,
                     self.schema_set,
+                    self.literal_values_may_vary(attr_type),
                 )
             } else {
-                super::simple::fixed_values_equal(value, &fixed, attr_type, self.schema_set)
+                super::simple::fixed_values_equal_at(
+                    value,
+                    &fixed,
+                    attr_type,
+                    self.schema_set,
+                    Some(&self.run_clock),
+                )
             };
             if !matches {
                 let attr_name = self.schema_set.name_table.resolve(local_name);
@@ -7984,13 +8261,15 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                             fixed_ns,
                             attr_type,
                             self.schema_set,
+                            self.literal_values_may_vary(attr_type),
                         )
                     } else {
-                        super::simple::fixed_values_equal(
+                        super::simple::fixed_values_equal_at(
                             value,
                             &fixed_val,
                             attr_type,
                             self.schema_set,
+                            Some(&self.run_clock),
                         )
                     };
                     if !matches {
@@ -8112,13 +8391,15 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                             fixed_ns,
                             attr_type,
                             self.schema_set,
+                            self.literal_values_may_vary(attr_type),
                         )
                     } else {
-                        super::simple::fixed_values_equal(
+                        super::simple::fixed_values_equal_at(
                             value,
                             &fixed_val,
                             attr_type,
                             self.schema_set,
+                            Some(&self.run_clock),
                         )
                     };
                     if !matches {

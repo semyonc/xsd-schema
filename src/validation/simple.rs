@@ -17,6 +17,7 @@ use crate::types::XmlTypeCode;
 use rust_decimal::Decimal;
 
 use super::errors::{self, ValidationError};
+use crate::clock::SharedClock;
 #[cfg(feature = "xsd11")]
 use crate::validation::compiled_xpath::AssertionFacetsOwner;
 
@@ -48,7 +49,7 @@ pub fn validate_simple_type(
     type_key: TypeKey,
     schema_set: &SchemaSet,
 ) -> Result<SimpleTypeResult, ValidationError> {
-    validate_simple_type_inner(value, type_key, schema_set, None)
+    validate_simple_type_inner(value, type_key, schema_set, None, None)
 }
 
 /// How simple-type validation resolves the prefix of an `xs:QName` /
@@ -93,7 +94,45 @@ pub(crate) fn validate_simple_type_in(
     schema_set: &SchemaSet,
     resolver: Option<PrefixResolver<'_>>,
 ) -> Result<SimpleTypeResult, ValidationError> {
-    validate_simple_type_inner(value, type_key, schema_set, resolver)
+    validate_simple_type_inner(value, type_key, schema_set, resolver, None)
+}
+
+/// [`validate_simple_type_in`] as part of a validation run: the XSD 1.1
+/// assertions on the value (`xs:assertion` facets, also those of list item
+/// and union member types, and of enumeration literals read for comparison)
+/// report the run's current dateTime, `clock` — XSD 1.1 Structures §3.13.4.2
+/// clause 6: "The current dateTime is ·implementation-defined·, but is
+/// constant during an ·assessment· episode". Without a run
+/// ([`validate_simple_type_in`]) each assertion reads the system clock for
+/// itself, as a standalone XPath evaluation does.
+pub(crate) fn validate_simple_type_at(
+    value: &str,
+    type_key: TypeKey,
+    schema_set: &SchemaSet,
+    resolver: Option<PrefixResolver<'_>>,
+    clock: Option<&SharedClock>,
+) -> Result<SimpleTypeResult, ValidationError> {
+    validate_simple_type_inner(value, type_key, schema_set, resolver, clock)
+}
+
+/// A literal of the schema set's own — a facet value, an enumeration value,
+/// a `default` / `fixed` value — validated against `type_key` at the instant
+/// the set reads its literals (its `schema_clock`): such a value is a schema
+/// property, the same on every path and in every validation run, whatever an
+/// XSD 1.1 assertion of its type reads from `fn:current-dateTime`.
+pub(crate) fn validate_schema_literal(
+    value: &str,
+    type_key: TypeKey,
+    schema_set: &SchemaSet,
+    resolver: Option<PrefixResolver<'_>>,
+) -> Result<SimpleTypeResult, ValidationError> {
+    validate_simple_type_inner(
+        value,
+        type_key,
+        schema_set,
+        resolver,
+        Some(schema_set.schema_clock()),
+    )
 }
 
 /// [`validate_simple_type_in`] for a caller that discards the PSVI
@@ -106,6 +145,7 @@ pub(crate) fn validate_simple_type_in_without_normalized(
     type_key: TypeKey,
     schema_set: &SchemaSet,
     resolver: Option<PrefixResolver<'_>>,
+    clock: Option<&SharedClock>,
 ) -> Result<SimpleTypeResult, ValidationError> {
     if let TypeKey::Simple(sk) = type_key {
         if schema_set
@@ -114,10 +154,10 @@ pub(crate) fn validate_simple_type_in_without_normalized(
             .get(sk)
             .is_some_and(|st| st.variety == SimpleTypeVariety::Atomic)
         {
-            return validate_atomic_type_with(value, sk, schema_set, resolver, false);
+            return validate_atomic_type_with(value, sk, schema_set, resolver, false, clock);
         }
     }
-    validate_simple_type_inner(value, type_key, schema_set, resolver)
+    validate_simple_type_inner(value, type_key, schema_set, resolver, clock)
 }
 
 /// Whether `value` holds an `xs:QName` / `xs:NOTATION` value in the value
@@ -248,7 +288,10 @@ pub(crate) fn fixed_values_equal_in(
 ) -> bool {
     match resolved_pair(a, a_ns, b, b_ns, type_key, schema_set) {
         Some((a, b)) => typed_values_equal(&a, &b),
-        None => fixed_values_equal(a, b, type_key, schema_set),
+        None => {
+            let schema = Some(schema_set.schema_clock());
+            fixed_values_equal_with(a, schema, b, schema, type_key, schema_set)
+        }
     }
 }
 
@@ -292,8 +335,8 @@ fn resolved_pair(
         snapshot_prefixes(a_ns, names),
         snapshot_prefixes(b_ns, names),
     );
-    let a = validate_simple_type_in(a, type_key, schema_set, Some(&ra)).ok()?;
-    let b = validate_simple_type_in(b, type_key, schema_set, Some(&rb)).ok()?;
+    let a = validate_schema_literal(a, type_key, schema_set, Some(&ra)).ok()?;
+    let b = validate_schema_literal(b, type_key, schema_set, Some(&rb)).ok()?;
     (holds_qname_value(&a.typed_value) && holds_qname_value(&b.typed_value))
         .then_some((a.typed_value, b.typed_value))
 }
@@ -307,6 +350,14 @@ fn resolved_pair(
 /// D.{value constraint}.{value}", the {value} being "the ·actual value· …
 /// of the [attribute]" on the declaration. Otherwise (or when the literal does
 /// not resolve) as [`fixed_matches_typed`].
+///
+/// `values_only` is for a type one of whose XSD 1.1 assertions reads the
+/// current dateTime (`ArenasGuard::reads_clock`), and for no other: such an
+/// assertion can make the instance (read at the run's instant) and the
+/// literal (read at the schema set's, [`validate_schema_literal`]) two values
+/// though they are written alike, so the two values are always compared
+/// ([`fixed_matches_by_value`]). Every other type takes the path above,
+/// whatever XPath expressions the schema set has elsewhere.
 pub(crate) fn fixed_matches_typed_in(
     instance_raw: &str,
     instance_typed: &XmlValue,
@@ -314,18 +365,80 @@ pub(crate) fn fixed_matches_typed_in(
     fixed_ns: Option<&NamespaceContextSnapshot>,
     type_key: Option<TypeKey>,
     schema_set: &SchemaSet,
+    values_only: bool,
 ) -> bool {
+    if values_only {
+        if let Some(matches) = fixed_matches_by_value(
+            instance_raw,
+            instance_typed,
+            fixed,
+            fixed_ns,
+            type_key,
+            schema_set,
+        ) {
+            return matches;
+        }
+    }
     if let (Some(fixed_ns), Some(tk)) = (fixed_ns, type_key) {
         if holds_qname_value(instance_typed) {
             let resolver = snapshot_prefixes(fixed_ns, &schema_set.name_table);
-            if let Ok(fixed) = validate_simple_type_in(fixed, tk, schema_set, Some(&resolver)) {
+            if let Ok(fixed) = validate_schema_literal(fixed, tk, schema_set, Some(&resolver)) {
                 if holds_qname_value(&fixed.typed_value) {
                     return typed_values_equal(instance_typed, &fixed.typed_value);
                 }
             }
         }
     }
-    fixed_matches_typed(instance_raw, instance_typed, fixed, type_key, schema_set)
+    // The literal at the schema set's instant here too (it matters only to a
+    // type that reads a clock and has no {value} to compare by).
+    fixed_matches_typed_at(
+        instance_raw,
+        instance_typed,
+        fixed,
+        type_key,
+        schema_set,
+        Some(schema_set.schema_clock()),
+    )
+}
+
+/// Whether the instance value `instance_typed` (written `instance_raw`) is
+/// equal or identical to the {value} of the fixed literal `fixed`, comparing
+/// the two values and never their spellings: the literal is read as the
+/// schema property it is — at the schema set's instant
+/// ([`validate_schema_literal`]) and with the bindings `fixed_ns` of the
+/// declaration it was written on, whichever member type the instance's value
+/// took, so that a union decides the literal's member as it does where the
+/// literal stands.
+///
+/// `None` when the literal has no {value} to compare by — no type, or a
+/// QName / NOTATION whose prefix the declaration binds nowhere (kept in its
+/// lexical form): the caller then compares as it does for any other type. A
+/// literal that is not valid for the type at the schema set's instant matches
+/// nothing.
+fn fixed_matches_by_value(
+    instance_raw: &str,
+    instance_typed: &XmlValue,
+    fixed: &str,
+    fixed_ns: Option<&NamespaceContextSnapshot>,
+    type_key: Option<TypeKey>,
+    schema_set: &SchemaSet,
+) -> Option<bool> {
+    let type_key = type_key?;
+    let resolver = fixed_ns.map(|ns| snapshot_prefixes(ns, &schema_set.name_table));
+    let resolver = resolver.as_ref().map(|r| r as PrefixResolver<'_>);
+    let Ok(literal) = validate_schema_literal(fixed, type_key, schema_set, resolver) else {
+        return Some(false);
+    };
+    if holds_lexical_qname(&literal.typed_value) {
+        return None;
+    }
+    Some(
+        if holds_qname_value(instance_typed) && holds_qname_value(&literal.typed_value) {
+            typed_values_equal(instance_typed, &literal.typed_value)
+        } else {
+            typed_literals_equal(instance_typed, instance_raw, &literal.typed_value, fixed)
+        },
+    )
 }
 
 /// Whether the enumeration literal `literal` (an `xs:QName` / `xs:NOTATION`
@@ -518,16 +631,44 @@ pub fn fixed_values_equal(
     type_key: Option<TypeKey>,
     schema_set: &SchemaSet,
 ) -> bool {
+    fixed_values_equal_with(a, None, b, None, type_key, schema_set)
+}
+
+/// [`fixed_values_equal`] in a validation run, for an instance value
+/// `instance` and a `fixed` literal: the instance is validated with the run's
+/// current dateTime, `clock`, the literal at the schema set's instant, as the
+/// schema property it is ([`validate_schema_literal`]).
+pub(crate) fn fixed_values_equal_at(
+    instance: &str,
+    fixed: &str,
+    type_key: Option<TypeKey>,
+    schema_set: &SchemaSet,
+    clock: Option<&SharedClock>,
+) -> bool {
+    let schema = Some(schema_set.schema_clock());
+    fixed_values_equal_with(instance, clock, fixed, schema, type_key, schema_set)
+}
+
+/// [`fixed_values_equal`] with `a` read at `a_clock`'s instant and `b` at
+/// `b_clock`'s (`None`: each assertion reads the system clock for itself).
+fn fixed_values_equal_with(
+    a: &str,
+    a_clock: Option<&SharedClock>,
+    b: &str,
+    b_clock: Option<&SharedClock>,
+    type_key: Option<TypeKey>,
+    schema_set: &SchemaSet,
+) -> bool {
     if a == b {
         return true;
     }
     let Some(tk) = type_key else {
         return false;
     };
-    let Ok(a_result) = validate_simple_type(a, tk, schema_set) else {
+    let Ok(a_result) = validate_simple_type_inner(a, tk, schema_set, None, a_clock) else {
         return false;
     };
-    let Ok(b_result) = validate_simple_type(b, tk, schema_set) else {
+    let Ok(b_result) = validate_simple_type_inner(b, tk, schema_set, None, b_clock) else {
         return false;
     };
     typed_literals_equal(&a_result.typed_value, a, &b_result.typed_value, b)
@@ -550,8 +691,8 @@ pub(crate) fn fixed_values_identical(
     if a == b {
         return Some(true);
     }
-    let a_result = validate_simple_type(a, type_key, schema_set).ok()?;
-    let b_result = validate_simple_type(b, type_key, schema_set).ok()?;
+    let a_result = validate_schema_literal(a, type_key, schema_set, None).ok()?;
+    let b_result = validate_schema_literal(b, type_key, schema_set, None).ok()?;
     Some(if schema_set.is_xsd10() {
         typed_literals_equal(&a_result.typed_value, a, &b_result.typed_value, b)
     } else {
@@ -1088,13 +1229,34 @@ pub fn fixed_matches_typed(
     type_key: Option<TypeKey>,
     schema_set: &SchemaSet,
 ) -> bool {
+    fixed_matches_typed_at(
+        instance_raw,
+        instance_typed,
+        fixed,
+        type_key,
+        schema_set,
+        None,
+    )
+}
+
+/// [`fixed_matches_typed`] with the fixed literal read at `clock`'s instant
+/// (the schema set's, for a validation run: see [`fixed_matches_typed_in`]);
+/// `None`: each assertion of the type reads the system clock for itself.
+fn fixed_matches_typed_at(
+    instance_raw: &str,
+    instance_typed: &XmlValue,
+    fixed: &str,
+    type_key: Option<TypeKey>,
+    schema_set: &SchemaSet,
+    clock: Option<&SharedClock>,
+) -> bool {
     if instance_raw == fixed {
         return true;
     }
     let Some(tk) = type_key else {
         return false;
     };
-    let Ok(fixed_result) = validate_simple_type(fixed, tk, schema_set) else {
+    let Ok(fixed_result) = validate_simple_type_inner(fixed, tk, schema_set, None, clock) else {
         return false;
     };
     typed_literals_equal(
@@ -1318,6 +1480,7 @@ fn validate_simple_type_inner(
     type_key: TypeKey,
     schema_set: &SchemaSet,
     resolver: Option<PrefixResolver<'_>>,
+    clock: Option<&SharedClock>,
 ) -> Result<SimpleTypeResult, ValidationError> {
     match type_key {
         TypeKey::Simple(sk) => {
@@ -1332,9 +1495,15 @@ fn validate_simple_type_inner(
                 }
             };
             match st_data.variety {
-                SimpleTypeVariety::Atomic => validate_atomic_type(value, sk, schema_set, resolver),
-                SimpleTypeVariety::List => validate_list_type(value, sk, schema_set, resolver),
-                SimpleTypeVariety::Union => validate_union_type(value, sk, schema_set, resolver),
+                SimpleTypeVariety::Atomic => {
+                    validate_atomic_type(value, sk, schema_set, resolver, clock)
+                }
+                SimpleTypeVariety::List => {
+                    validate_list_type(value, sk, schema_set, resolver, clock)
+                }
+                SimpleTypeVariety::Union => {
+                    validate_union_type(value, sk, schema_set, resolver, clock)
+                }
             }
         }
         TypeKey::Complex(ck) => {
@@ -1375,9 +1544,9 @@ fn validate_simple_type_inner(
             };
             let value = value.as_ref();
             let mut result = if let Some(inline_st) = ct_data.resolved_simple_content_type {
-                validate_simple_type_inner(value, inline_st, schema_set, resolver)?
+                validate_simple_type_inner(value, inline_st, schema_set, resolver, clock)?
             } else if let Some(base_key) = ct_data.resolved_base_type {
-                validate_simple_type_inner(value, base_key, schema_set, resolver)?
+                validate_simple_type_inner(value, base_key, schema_set, resolver, clock)?
             } else {
                 // No base type — treat as anySimpleType (accept any value)
                 SimpleTypeResult {
@@ -1398,13 +1567,20 @@ fn validate_simple_type_inner(
             if let Some(sc) = restriction {
                 if !sc.facets.is_empty() {
                     let lex = result.normalized_value.as_deref().unwrap_or(value);
-                    check_simple_content_facets(lex, &result.typed_value, &sc.facets, schema_set)?;
+                    check_simple_content_facets(
+                        lex,
+                        &result.typed_value,
+                        &sc.facets,
+                        ck,
+                        schema_set,
+                    )?;
                     #[cfg(feature = "xsd11")]
                     evaluate_assertion_facets(
                         &result.typed_value,
                         &sc.facets,
                         AssertionFacetsOwner::SimpleContent(ck),
                         schema_set,
+                        clock,
                     )?;
                 }
             }
@@ -1459,6 +1635,24 @@ pub(crate) fn normalized_literal<'a>(
     type_key: TypeKey,
     schema_set: &SchemaSet,
 ) -> Option<std::borrow::Cow<'a, str>> {
+    normalized_literal_at(
+        literal,
+        type_key,
+        schema_set,
+        Some(schema_set.schema_clock()),
+    )
+}
+
+/// [`normalized_literal`] as part of a validation run: a union's members are
+/// tried with the run's current dateTime, `clock` ([`validate_simple_type_at`]),
+/// so that the member that accepts the literal is the one the run's own
+/// validation found.
+fn normalized_literal_at<'a>(
+    literal: &'a str,
+    type_key: TypeKey,
+    schema_set: &SchemaSet,
+    clock: Option<&SharedClock>,
+) -> Option<std::borrow::Cow<'a, str>> {
     let mut current = type_key;
     for _ in 0..100 {
         match current {
@@ -1474,9 +1668,10 @@ pub(crate) fn normalized_literal<'a>(
                     }
                     SimpleTypeVariety::Union => {
                         st.resolved_member_types.iter().find_map(|&member| {
-                            let result =
-                                validate_simple_type_inner(literal, member, schema_set, None)
-                                    .ok()?;
+                            let result = validate_simple_type_inner(
+                                literal, member, schema_set, None, clock,
+                            )
+                            .ok()?;
                             Some(match result.normalized_value {
                                 Some(normalized) if normalized != literal => {
                                     std::borrow::Cow::Owned(normalized)
@@ -1558,18 +1753,68 @@ pub(crate) fn whitespace_changes(text: &str, mode: WhitespaceMode) -> Option<Str
 /// ·normalized value· with respect to the type's whiteSpace (as
 /// [`normalized_literal`] gives it) — when it differs from `text`; `None` when
 /// `text` is already normalized.
+///
+/// Every type but a union normalizes by its whiteSpace alone. A union's
+/// normalization is that of the member type that accepts the value
+/// (Datatypes §4.3.6), found by validating `text` against the members
+/// ([`normalized_literal`]) — a pure function of the text for every union but
+/// one that reads the current dateTime (`ArenasGuard::reads_clock`). For such
+/// a union a second validation could take another member than the validation
+/// run did, so the normalization comes from what the run found: the member
+/// of the run's typed value, `typed` ([`member_whitespace`]), or the run's
+/// own `[schema normalized value]`, `validated`; without either the value is
+/// validated again, with the run's current dateTime, `clock` (`None` outside
+/// a run).
 #[cfg(feature = "xsd11")]
-pub(crate) fn schema_normalized(
+pub(crate) fn validated_normalized(
     text: &str,
     type_key: TypeKey,
     schema_set: &SchemaSet,
+    typed: Option<&XmlValue>,
+    validated: Option<&str>,
+    clock: Option<&SharedClock>,
 ) -> Option<String> {
-    match content_whitespace(type_key, schema_set) {
-        Some(mode) => whitespace_changes(text, mode),
-        None => {
-            let normalized = normalized_literal(text, type_key, schema_set)?;
-            (normalized != text).then(|| normalized.into_owned())
-        }
+    if let Some(mode) = content_whitespace(type_key, schema_set) {
+        return whitespace_changes(text, mode);
+    }
+    if !schema_set.arenas.reads_clock(type_key) {
+        let normalized = normalized_literal(text, type_key, schema_set)?;
+        return (normalized != text).then(|| normalized.into_owned());
+    }
+    if let Some(mode) = typed.and_then(|typed| member_whitespace(typed, schema_set)) {
+        return whitespace_changes(text, mode);
+    }
+    let normalized = match validated {
+        Some(validated) => std::borrow::Cow::Borrowed(validated),
+        None => normalized_literal_at(text, type_key, schema_set, clock)?,
+    };
+    (normalized != text).then(|| normalized.into_owned())
+}
+
+/// The whiteSpace a valid value of a union type was normalized with: that of
+/// the ·basic member· that accepted it (Datatypes §4.3.6: "the normalization
+/// behavior of ·union· types is controlled by the value of whiteSpace on that
+/// one of the ·basic members· against which the ·union· is successfully
+/// validated"), read from the typed value its validation gave — the member's
+/// value inside the union value (inside each nested union's), `collapse` for
+/// a list member. `None` when the value does not say (no member type on it).
+#[cfg(feature = "xsd11")]
+pub(crate) fn member_whitespace(
+    typed: &XmlValue,
+    schema_set: &SchemaSet,
+) -> Option<WhitespaceMode> {
+    let mut value = typed;
+    while let XmlValueKind::Union(member) = &value.value {
+        value = member;
+    }
+    if matches!(value.value, XmlValueKind::List { .. }) {
+        return Some(WhitespaceMode::Collapse);
+    }
+    let member = value.schema_type?;
+    match schema_set.arenas.simple_types.get(member)?.variety {
+        SimpleTypeVariety::Atomic => Some(atomic_whitespace(member, schema_set)),
+        SimpleTypeVariety::List => Some(WhitespaceMode::Collapse),
+        SimpleTypeVariety::Union => None,
     }
 }
 
@@ -1590,6 +1835,7 @@ fn check_simple_content_facets(
     lex: &str,
     typed: &XmlValue,
     facets: &FacetSet,
+    owner: crate::ids::ComplexTypeKey,
     schema_set: &SchemaSet,
 ) -> Result<(), ValidationError> {
     let base_type = typed
@@ -1609,7 +1855,7 @@ fn check_simple_content_facets(
         XmlValueKind::Union(member) => match base_type {
             Some(st) => check_union_facets(
                 facets,
-                None,
+                UnionFacetsOwner::SimpleContent(owner),
                 lex,
                 member,
                 &st.resolved_member_types,
@@ -1836,8 +2082,9 @@ fn validate_atomic_type(
     sk: SimpleTypeKey,
     schema_set: &SchemaSet,
     resolver: Option<PrefixResolver<'_>>,
+    clock: Option<&SharedClock>,
 ) -> Result<SimpleTypeResult, ValidationError> {
-    validate_atomic_type_with(value, sk, schema_set, resolver, true)
+    validate_atomic_type_with(value, sk, schema_set, resolver, true, clock)
 }
 
 /// [`validate_atomic_type`]; `keep_normalized` = `false` leaves the result's
@@ -1848,6 +2095,7 @@ fn validate_atomic_type_with(
     schema_set: &SchemaSet,
     resolver: Option<PrefixResolver<'_>>,
     keep_normalized: bool,
+    clock: Option<&SharedClock>,
 ) -> Result<SimpleTypeResult, ValidationError> {
     let type_code = resolve_type_code(sk, schema_set);
 
@@ -1896,7 +2144,7 @@ fn validate_atomic_type_with(
     // resolve is validated in the value space.
     if let (Some(resolver), XmlTypeCode::QName | XmlTypeCode::Notation) = (resolver, type_code) {
         if let Some(result) = validate_resolved_qname(
-            value, sk, type_code, validator, &facets, resolver, schema_set,
+            value, sk, type_code, validator, &facets, resolver, schema_set, clock,
         )? {
             return Ok(result);
         }
@@ -1956,7 +2204,13 @@ fn validate_atomic_type_with(
             }
             // XSD 1.1: evaluate assertion facets
             #[cfg(feature = "xsd11")]
-            evaluate_assertion_facets(&val, &facets, AssertionFacetsOwner::Simple(sk), schema_set)?;
+            evaluate_assertion_facets(
+                &val,
+                &facets,
+                AssertionFacetsOwner::Simple(sk),
+                schema_set,
+                clock,
+            )?;
             Ok(SimpleTypeResult {
                 typed_value: val,
                 member_type: None,
@@ -1974,6 +2228,7 @@ fn validate_atomic_type_with(
 /// ([`check_qname_facets`]) and the assertions the QName (NOTATION) value.
 /// `Ok(None)` when `resolver` binds the prefix nowhere: the value is then
 /// validated in its lexical form, as without bindings.
+#[allow(clippy::too_many_arguments)]
 fn validate_resolved_qname(
     value: &str,
     sk: SimpleTypeKey,
@@ -1982,6 +2237,7 @@ fn validate_resolved_qname(
     facets: &FacetSet,
     resolver: PrefixResolver<'_>,
     schema_set: &SchemaSet,
+    #[cfg_attr(not(feature = "xsd11"), allow(unused_variables))] clock: Option<&SharedClock>,
 ) -> Result<Option<SimpleTypeResult>, ValidationError> {
     let lexical = validator
         .validate(value)
@@ -2019,6 +2275,7 @@ fn validate_resolved_qname(
         facets,
         AssertionFacetsOwner::Simple(sk),
         schema_set,
+        clock,
     )?;
     Ok(Some(SimpleTypeResult {
         typed_value,
@@ -2092,6 +2349,7 @@ fn validate_list_type(
     sk: SimpleTypeKey,
     schema_set: &SchemaSet,
     resolver: Option<PrefixResolver<'_>>,
+    clock: Option<&SharedClock>,
 ) -> Result<SimpleTypeResult, ValidationError> {
     let st_data = match schema_set.arenas.simple_types.get(sk) {
         Some(d) => d,
@@ -2134,7 +2392,8 @@ fn validate_list_type(
     // the node will be an instance of one of the member types of the union").
     let mut items = Vec::with_capacity(items_str.len());
     for item_str in &items_str {
-        let result = validate_simple_type_inner(item_str, item_type_key, schema_set, resolver)?;
+        let result =
+            validate_simple_type_inner(item_str, item_type_key, schema_set, resolver, clock)?;
         items.push(list_member(result.typed_value));
     }
     // The declared item type's code; a union's is that of its base type,
@@ -2174,6 +2433,7 @@ fn validate_list_type(
         &facets,
         AssertionFacetsOwner::Simple(sk),
         schema_set,
+        clock,
     )?;
 
     Ok(SimpleTypeResult {
@@ -2221,6 +2481,8 @@ fn check_list_facets(
                 .validate_enum_value_space(
                     |literal| {
                         literal_readings(enumeration, literal, &schema_set.name_table, &|reading| {
+                            // An enumeration's values are schema
+                            // properties: read at the schema set's instant.
                             list_literal_matches(
                                 literal,
                                 items,
@@ -2228,6 +2490,7 @@ fn check_list_facets(
                                 item_type_key,
                                 schema_set,
                                 reading,
+                                Some(schema_set.schema_clock()),
                             )
                         })
                     },
@@ -2251,6 +2514,7 @@ fn list_literal_matches(
     item_type_key: TypeKey,
     schema_set: &SchemaSet,
     resolver: Option<PrefixResolver<'_>>,
+    clock: Option<&SharedClock>,
 ) -> bool {
     let collapsed = normalize_whitespace(literal, WhitespaceMode::Collapse);
     let tokens: Vec<&str> = if collapsed.is_empty() {
@@ -2263,16 +2527,15 @@ fn list_literal_matches(
             .iter()
             .zip(members.iter().zip(instance.split_ascii_whitespace()))
             .all(|(token, (member, member_lexical))| {
-                validate_simple_type_inner(token, item_type_key, schema_set, resolver).is_ok_and(
-                    |item| {
+                validate_simple_type_inner(token, item_type_key, schema_set, resolver, clock)
+                    .is_ok_and(|item| {
                         super::identity::literal_values_equal_or_identical(
                             &list_member(item.typed_value),
                             token,
                             member,
                             member_lexical,
                         )
-                    },
-                )
+                    })
             })
 }
 
@@ -2293,7 +2556,7 @@ fn list_literal_matches(
 /// before (the caller reports the prefix).
 fn check_union_facets(
     facets: &FacetSet,
-    key: Option<SimpleTypeKey>,
+    owner: UnionFacetsOwner,
     value: &str,
     member: &XmlValue,
     member_types: &[TypeKey],
@@ -2322,13 +2585,18 @@ fn check_union_facets(
             )
             .map_err(facet_error);
     }
-    let index = match key.and_then(|sk| schema_set.enumeration_index(sk)) {
-        Some(index) => index,
-        None => std::sync::Arc::new(union_enumeration_index(
-            enumeration,
-            member_types,
-            schema_set,
-        )),
+    // An enumeration's values are schema properties: the index is computed
+    // once per schema set, for a simple type and for a simple content
+    // restriction alike.
+    let build = || union_enumeration_index(enumeration, member_types, schema_set);
+    let index = match owner {
+        UnionFacetsOwner::Simple(sk) => match schema_set.enumeration_index(sk) {
+            Some(index) => index,
+            None => std::sync::Arc::new(build()),
+        },
+        UnionFacetsOwner::SimpleContent(ck) => schema_set
+            .arenas
+            .simple_content_enumeration_index(ck, build),
     };
     let admitted = match &unwrap_unions(member).value {
         XmlValueKind::Atomic(XmlAtomicValue::QName(name)) => {
@@ -2370,9 +2638,17 @@ pub(crate) fn union_enumeration_index(
     }
     let value_of = |literal: &str, resolver: Option<PrefixResolver<'_>>| {
         member_types.iter().find_map(|&member| {
-            validate_simple_type_inner(literal, member, schema_set, resolver)
-                .ok()
-                .map(|result| result.typed_value)
+            // An enumeration's values are schema properties: the literals are
+            // read at the schema set's instant, the index computed once.
+            validate_simple_type_inner(
+                literal,
+                member,
+                schema_set,
+                resolver,
+                Some(schema_set.schema_clock()),
+            )
+            .ok()
+            .map(|result| result.typed_value)
         })
     };
     let mut index = crate::types::facets::EnumerationIndex::default();
@@ -2462,6 +2738,7 @@ fn validate_union_type(
     sk: SimpleTypeKey,
     schema_set: &SchemaSet,
     resolver: Option<PrefixResolver<'_>>,
+    clock: Option<&SharedClock>,
 ) -> Result<SimpleTypeResult, ValidationError> {
     let st_data = match schema_set.arenas.simple_types.get(sk) {
         Some(d) => d,
@@ -2483,18 +2760,20 @@ fn validate_union_type(
     // member matches.
     let mut unbound: Option<(SimpleTypeResult, TypeKey)> = None;
     for &member_key in &st_data.resolved_member_types {
-        if let Ok(result) = validate_simple_type_inner(value, member_key, schema_set, resolver) {
+        if let Ok(result) =
+            validate_simple_type_inner(value, member_key, schema_set, resolver, clock)
+        {
             if resolver.is_some() && holds_lexical_qname(&result.typed_value) {
                 if unbound.is_none() {
                     unbound = Some((result, member_key));
                 }
                 continue;
             }
-            return union_member_result(value, sk, schema_set, result, member_key);
+            return union_member_result(value, sk, schema_set, result, member_key, clock);
         }
     }
     if let Some((result, member_key)) = unbound {
-        return union_member_result(value, sk, schema_set, result, member_key);
+        return union_member_result(value, sk, schema_set, result, member_key, clock);
     }
 
     // No member matched
@@ -2508,6 +2787,14 @@ fn validate_union_type(
     ))
 }
 
+/// Whose union facets [`check_union_facets`] checks: a union simple type's,
+/// or a complex type's simple content restriction of a union.
+#[derive(Debug, Clone, Copy)]
+enum UnionFacetsOwner {
+    Simple(SimpleTypeKey),
+    SimpleContent(crate::ids::ComplexTypeKey),
+}
+
 /// The union value of `sk` for the value `result` its member type
 /// `member_key` gave: the union-level facets (pattern, enumeration) and
 /// assertions on it, the member's typed value wrapped as the union's.
@@ -2517,6 +2804,7 @@ fn union_member_result(
     schema_set: &SchemaSet,
     result: SimpleTypeResult,
     member_key: TypeKey,
+    #[cfg_attr(not(feature = "xsd11"), allow(unused_variables))] clock: Option<&SharedClock>,
 ) -> Result<SimpleTypeResult, ValidationError> {
     let st_data = schema_set.arenas.simple_types.get(sk);
     let members = st_data
@@ -2526,7 +2814,7 @@ fn union_member_result(
     if !facets.is_empty() {
         check_union_facets(
             &facets,
-            Some(sk),
+            UnionFacetsOwner::Simple(sk),
             value,
             &result.typed_value,
             members,
@@ -2547,6 +2835,7 @@ fn union_member_result(
         &facets,
         AssertionFacetsOwner::Simple(sk),
         schema_set,
+        clock,
     )?;
 
     Ok(SimpleTypeResult {
@@ -2595,12 +2884,17 @@ pub(crate) fn resolve_assertion_default_ns(
 /// Assertion facets on simpleType restrictions receive only the `$value`
 /// variable (the typed value being validated). No context node or DOM
 /// access is needed, so this evaluates inline during streaming validation.
+/// `clock` is the clock of the validation run the value belongs to: its
+/// instant is the assertions' current dateTime (XSD 1.1 Structures §3.13.4.2
+/// clause 6); `None` outside a run, where each assertion reads the system
+/// clock for itself.
 #[cfg(feature = "xsd11")]
 pub(crate) fn evaluate_assertion_facets(
     typed_value: &XmlValue,
     facets: &FacetSet,
     owner: AssertionFacetsOwner,
     schema_set: &SchemaSet,
+    clock: Option<&SharedClock>,
 ) -> Result<(), ValidationError> {
     use crate::xpath::functions::effective_boolean_value;
     use crate::xpath::RoXmlNavigator;
@@ -2648,6 +2942,7 @@ pub(crate) fn evaluate_assertion_facets(
         let outcome = crate::xpath::operators::with_decimal_capacity_marks(|| {
             expr.evaluator(&ctx)
                 .with_warnings(&warnings)
+                .with_run_clock(clock)
                 .run_with::<RoXmlNavigator<'static>, _>(|eval| {
                     eval.set_variable_by_name("value", xpath_value).unwrap();
                 })

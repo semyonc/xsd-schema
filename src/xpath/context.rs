@@ -8,6 +8,8 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+pub(crate) use crate::clock::HostClock;
+use crate::clock::SharedClock;
 use crate::ids::NameId;
 use crate::namespace::context::NamespaceContextSnapshot;
 use crate::namespace::qname::QualifiedName;
@@ -793,65 +795,6 @@ impl<V> Default for VarStore<V> {
 }
 
 // ============================================================================
-// The host's clock
-// ============================================================================
-
-/// An instant of the system clock, read once per dynamic context: whole
-/// seconds since 1970-01-01T00:00:00Z — negative before it — and the
-/// nanoseconds into that second.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct HostClock {
-    /// Whole seconds since the Unix epoch, rounded towards negative infinity.
-    pub(crate) seconds: i64,
-    /// Nanoseconds into `seconds`, below 1,000,000,000.
-    pub(crate) nanos: u32,
-}
-
-impl HostClock {
-    /// `time` in seconds and nanoseconds since the Unix epoch. A time before
-    /// 1970 gives a negative count of seconds, not a panic.
-    #[cfg_attr(all(target_family = "wasm", target_os = "unknown"), allow(dead_code))]
-    pub(crate) fn from_system_time(time: std::time::SystemTime) -> Self {
-        match time.duration_since(std::time::UNIX_EPOCH) {
-            Ok(after) => Self {
-                seconds: i64::try_from(after.as_secs()).unwrap_or(i64::MAX),
-                nanos: after.subsec_nanos(),
-            },
-            Err(before) => {
-                let before = before.duration();
-                let seconds = i64::try_from(before.as_secs()).unwrap_or(i64::MAX);
-                match before.subsec_nanos() {
-                    0 => Self {
-                        seconds: -seconds,
-                        nanos: 0,
-                    },
-                    nanos => Self {
-                        seconds: -seconds - 1,
-                        nanos: 1_000_000_000 - nanos,
-                    },
-                }
-            }
-        }
-    }
-
-    /// The system clock now; `None` on `wasm32-unknown-unknown` (any
-    /// `wasm*-unknown-unknown`), whose standard library has no clock —
-    /// `SystemTime::now()` panics there. A host on that target that calls
-    /// `fn:current-dateTime` sets
-    /// [`DynamicContext::current_datetime`] itself.
-    fn now() -> Option<Self> {
-        #[cfg(all(target_family = "wasm", target_os = "unknown"))]
-        {
-            None
-        }
-        #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-        {
-            Some(Self::from_system_time(std::time::SystemTime::now()))
-        }
-    }
-}
-
-// ============================================================================
 // DynamicContext (for eval-time)
 // ============================================================================
 
@@ -902,7 +845,10 @@ impl HostClock {
 /// instant expressed in the implicit timezone, and keeps it, so that it is
 /// ·stable· (F&O §16.3). A host that evaluates several expressions as one
 /// unit of work sets both fields on every dynamic context it builds, so that
-/// they stay the same throughout. On `wasm32-unknown-unknown`, whose
+/// they stay the same throughout; the XSD 1.1 validation runtime gives every
+/// expression of one run the run's instant
+/// ([`ValidationRuntime::set_current_time`](crate::validation::ValidationRuntime::set_current_time)).
+/// On `wasm32-unknown-unknown`, whose
 /// standard library has no clock, `fn:current-dateTime` without a
 /// `current_datetime` raises the dynamic error XPDY0002.
 pub struct DynamicContext<'a, N: DomNavigator> {
@@ -925,6 +871,10 @@ pub struct DynamicContext<'a, N: DomNavigator> {
     /// when [`current_datetime`](Self::current_datetime) is not set (`None`
     /// on a target without a clock).
     host_clock: std::cell::OnceCell<Option<HostClock>>,
+    /// The clock of the validation run this evaluation belongs to, if any:
+    /// `host_clock` is read from it, so that every expression of the run
+    /// reports one instant (XSD 1.1 Structures §3.13.4.2 clause 6).
+    run_clock: Option<&'a SharedClock>,
     /// Variable bindings (indexed by VarSlotId from NameBinder)
     pub variables: VarStore<super::functions::XPathValue<N>>,
     /// Function evaluator for eval-time dispatch (None = use builtins).
@@ -990,6 +940,7 @@ impl<'a, N: DomNavigator> DynamicContext<'a, N> {
             implicit_timezone: static_context.implicit_timezone,
             base_uri: static_context.base_uri.clone(),
             host_clock: std::cell::OnceCell::new(),
+            run_clock: None,
             variables: VarStore::new(var_count),
             function_evaluator: None,
             extension: None,
@@ -1096,10 +1047,21 @@ impl<'a, N: DomNavigator> DynamicContext<'a, N> {
         }
     }
 
-    /// The host's clock, read the first time it is needed, or `None` on a
-    /// target without a clock.
+    /// The host's clock, read the first time it is needed — the instant of
+    /// the validation run this evaluation belongs to
+    /// ([`set_run_clock`](Self::set_run_clock)), else the system clock — or
+    /// `None` on a target without a clock.
     pub(crate) fn host_clock(&self) -> Option<HostClock> {
-        *self.host_clock.get_or_init(HostClock::now)
+        *self.host_clock.get_or_init(|| match self.run_clock {
+            Some(run) => run.instant(),
+            None => HostClock::now(),
+        })
+    }
+
+    /// Make this evaluation part of the validation run whose clock is
+    /// `clock`: its current dateTime is the run's instant.
+    pub(crate) fn set_run_clock(&mut self, clock: &'a SharedClock) {
+        self.run_clock = Some(clock);
     }
 
     /// Get the context item, returning an error if undefined.
@@ -1636,40 +1598,6 @@ mod tests {
             result,
             Err(super::super::error::XPathError::XPST0008 { .. })
         ));
-    }
-
-    /// Offsets in whole 100 ns and instants after 1601 only: what `SystemTime`
-    /// holds on every platform (Windows keeps 100 ns intervals since
-    /// 1601-01-01). The single nanosecond and the year 1 are
-    /// `datetime_from_unix`'s cases, whose inputs are integers.
-    #[test]
-    fn host_clock_counts_from_the_epoch_in_both_directions() {
-        use std::time::{Duration, UNIX_EPOCH};
-        let at = |time| {
-            let clock = HostClock::from_system_time(time);
-            (clock.seconds, clock.nanos)
-        };
-        assert_eq!(at(UNIX_EPOCH), (0, 0));
-        assert_eq!(at(UNIX_EPOCH + Duration::new(1, 500)), (1, 500));
-        assert_eq!(
-            at(UNIX_EPOCH + Duration::new(1_764_000_000, 123_456_700)),
-            (1_764_000_000, 123_456_700)
-        );
-        // Before 1970: whole seconds floored, nanoseconds forward — no panic.
-        assert_eq!(at(UNIX_EPOCH - Duration::from_secs(1)), (-1, 0));
-        assert_eq!(
-            at(UNIX_EPOCH - Duration::from_millis(1_500)),
-            (-2, 500_000_000)
-        );
-        assert_eq!(
-            at(UNIX_EPOCH - Duration::from_nanos(100)),
-            (-1, 999_999_900)
-        );
-        // 1969-01-01T00:00:00Z.
-        assert_eq!(
-            at(UNIX_EPOCH - Duration::from_secs(31_536_000)),
-            (-31_536_000, 0)
-        );
     }
 
     /// A target without a clock (`wasm32-unknown-unknown`): the context's

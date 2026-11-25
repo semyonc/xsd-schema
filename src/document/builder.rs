@@ -634,10 +634,27 @@ impl<'a> BufferDocumentBuilder<'a> {
     /// host marked with [`register_idrefs`](Self::register_idrefs) while it
     /// was open is filed in the idrefs index.
     pub fn end_element(&mut self) -> Result<(), BufferDocumentError> {
+        self.end_element_from(TypedSource::Compute)
+    }
+
+    /// [`end_element`](Self::end_element) for an element a validation run has
+    /// just validated: `typed` is the typed value the run gave it (`None` when
+    /// it found none — an invalid value, a nilled element), and the element
+    /// is filed in the id and idrefs indexes from it rather than from a
+    /// second validation of its content, which could disagree with the run's
+    /// verdict (an XSD 1.1 assertion facet reading another clock).
+    pub(crate) fn end_element_validated(
+        &mut self,
+        typed: Option<&XmlValue>,
+    ) -> Result<(), BufferDocumentError> {
+        self.end_element_from(TypedSource::Validated(typed))
+    }
+
+    fn end_element_from(&mut self, source: TypedSource<'_>) -> Result<(), BufferDocumentError> {
         self.flush_text()?;
         if let Some(state) = self.element_stack.last() {
             let elem = state.node_ref;
-            self.file_element(elem);
+            self.file_element(elem, source);
         }
 
         let _state = self
@@ -727,6 +744,30 @@ impl<'a> BufferDocumentBuilder<'a> {
         node_ref: u32,
         binding: NodeSchemaBinding,
     ) -> Result<bool, BufferDocumentError> {
+        self.set_node_binding_from(node_ref, binding, TypedSource::Compute)
+    }
+
+    /// [`set_node_binding`](Self::set_node_binding) for an attribute a
+    /// validation run has just validated: `typed` is the typed value the run
+    /// gave it (`None` when the value was not valid), and the attribute is
+    /// filed in the id and idrefs indexes from it rather than from a second
+    /// validation, which could disagree with the run's verdict (an XSD 1.1
+    /// assertion facet reading another clock).
+    pub(crate) fn set_node_binding_validated(
+        &mut self,
+        node_ref: u32,
+        binding: NodeSchemaBinding,
+        typed: Option<&XmlValue>,
+    ) -> Result<bool, BufferDocumentError> {
+        self.set_node_binding_from(node_ref, binding, TypedSource::Validated(typed))
+    }
+
+    fn set_node_binding_from(
+        &mut self,
+        node_ref: u32,
+        binding: NodeSchemaBinding,
+        source: TypedSource<'_>,
+    ) -> Result<bool, BufferDocumentError> {
         let idx = self.doc.binding_remap.register(binding)?;
         let is_complex = matches!(binding.type_key, crate::ids::TypeKey::Complex(_));
         let node = self.doc.nodes.get(node_ref);
@@ -753,11 +794,11 @@ impl<'a> BufferDocumentBuilder<'a> {
             }
         });
         if kind == NodeType::Attribute {
-            self.file_typed_id(node_ref, idx);
-            self.file_typed_idrefs(node_ref, idx);
+            self.file_typed_id(node_ref, idx, source);
+            self.file_typed_idrefs(node_ref, idx, source);
         }
         if closed_element {
-            self.file_element(node_ref);
+            self.file_element(node_ref, source);
         }
         Ok(is_complex)
     }
@@ -1154,10 +1195,10 @@ impl<'a> BufferDocumentBuilder<'a> {
                 file_id_claim(&mut self.doc.id_elements, &key, claim);
             }
         } else if binding != 0 {
-            self.file_typed_id(attr_ref, binding);
+            self.file_typed_id(attr_ref, binding, TypedSource::Compute);
         }
         if binding != 0 {
-            self.file_typed_idrefs(attr_ref, binding);
+            self.file_typed_idrefs(attr_ref, binding, TypedSource::Compute);
         } else if was_idrefs {
             self.mark_and_file_idrefs(attr_ref);
         }
@@ -1244,7 +1285,7 @@ impl<'a> BufferDocumentBuilder<'a> {
     /// it an id. A duplicate is kept but not selected (see [`IdSlot`]), and is
     /// not reported: ID uniqueness in a validated document is `cvc-id`'s
     /// business, which the validator reports on its own channel.
-    fn file_typed_id(&mut self, attr_ref: u32, binding_idx: u32) {
+    fn file_typed_id(&mut self, attr_ref: u32, binding_idx: u32, source: TypedSource<'_>) {
         let Some((class, type_key, schema_set, claim)) =
             self.typed_id_candidate(attr_ref, binding_idx)
         else {
@@ -1253,7 +1294,7 @@ impl<'a> BufferDocumentBuilder<'a> {
         let doc = &mut self.doc;
         let value = doc.strings.get(doc.nodes.get(attr_ref + 1).value);
         let scope = InScope::at(doc, attr_ref);
-        let key = typed_id_key(class, value, type_key, schema_set, &scope);
+        let key = typed_id_key(class, value, type_key, schema_set, &scope, source);
         if let Some(key) = key {
             file_id_claim(&mut doc.id_elements, &key, claim);
         }
@@ -1264,14 +1305,12 @@ impl<'a> BufferDocumentBuilder<'a> {
     /// or the binding changes, so the key recomputes to the one it was filed
     /// under.
     fn withdraw_typed_id(&mut self, attr_ref: u32, binding_idx: u32) {
-        let Some((class, type_key, schema_set, _)) = self.typed_id_candidate(attr_ref, binding_idx)
-        else {
+        let Some((class, _, _, _)) = self.typed_id_candidate(attr_ref, binding_idx) else {
             return;
         };
         let doc = &mut self.doc;
         let value = doc.strings.get(doc.nodes.get(attr_ref + 1).value);
-        let scope = InScope::at(doc, attr_ref);
-        let key = typed_id_key(class, value, type_key, schema_set, &scope);
+        let key = filed_id_key(class, value);
         if let Some(key) = key {
             withdraw_id_claim(&mut doc.id_elements, &key, attr_ref);
         }
@@ -1334,14 +1373,32 @@ impl<'a> BufferDocumentBuilder<'a> {
     /// typed-value of the element consists of exactly one atomic value and
     /// that value is of type xs:ID, or a type derived from xs:ID, the is-id
     /// property is true".
-    fn element_id_key(&mut self, elem: u32, binding_idx: u32) -> Option<String> {
+    fn element_id_key(
+        &mut self,
+        elem: u32,
+        binding_idx: u32,
+        source: TypedSource<'_>,
+    ) -> Option<String> {
         let class = self.id_class(binding_idx);
         if class == IdClass::Never {
             return None;
         }
         let (value, binding, schema_set) = self.element_typed_lexical(elem, binding_idx)?;
         let scope = InScope::at(&self.doc, elem);
-        typed_id_key(class, &value, binding.type_key, schema_set, &scope).map(Cow::into_owned)
+        typed_id_key(class, &value, binding.type_key, schema_set, &scope, source)
+            .map(Cow::into_owned)
+    }
+
+    /// The key [`element_id_key`](Self::element_id_key) filed the element
+    /// `elem`, bound at `binding_idx`, under — if it filed it at all
+    /// ([`filed_id_key`]).
+    fn element_filed_key(&mut self, elem: u32, binding_idx: u32) -> Option<String> {
+        let class = self.id_class(binding_idx);
+        if class == IdClass::Never {
+            return None;
+        }
+        let (value, _, _) = self.element_typed_lexical(elem, binding_idx)?;
+        filed_id_key(class, &value).map(Cow::into_owned)
     }
 
     /// Files the element `elem` as it stands: in the id index when its typed
@@ -1349,7 +1406,7 @@ impl<'a> BufferDocumentBuilder<'a> {
     /// is-idrefs property — by its annotation, or because a host marked it.
     /// Called when the element ends, and when a closed element is bound
     /// again.
-    fn file_element(&mut self, elem: u32) {
+    fn file_element(&mut self, elem: u32, source: TypedSource<'_>) {
         let node = self.doc.nodes.get(elem);
         let binding_idx = node.binding_index();
         let marked = node.has_flag(Node::IS_IDREFS);
@@ -1357,7 +1414,7 @@ impl<'a> BufferDocumentBuilder<'a> {
             return;
         }
         if binding_idx != 0 {
-            if let Some(key) = self.element_id_key(elem, binding_idx) {
+            if let Some(key) = self.element_id_key(elem, binding_idx, source) {
                 let claim = IdClaim {
                     tree: self.tree_of(elem),
                     elem,
@@ -1371,7 +1428,7 @@ impl<'a> BufferDocumentBuilder<'a> {
                 && self.element_typed_lexical(elem, binding_idx).is_some_and(
                     |(value, binding, schema_set)| {
                         let scope = InScope::at(&self.doc, elem);
-                        typed_is_idrefs(&value, binding.type_key, schema_set, &scope)
+                        typed_is_idrefs(&value, binding.type_key, schema_set, &scope, source)
                     },
                 ));
         if idrefs {
@@ -1390,7 +1447,7 @@ impl<'a> BufferDocumentBuilder<'a> {
         if binding_idx == 0 {
             return;
         }
-        if let Some(key) = self.element_id_key(elem, binding_idx) {
+        if let Some(key) = self.element_filed_key(elem, binding_idx) {
             withdraw_id_claim(&mut self.doc.id_elements, &key, elem);
         }
         self.withdraw_idrefs(elem);
@@ -1425,7 +1482,7 @@ impl<'a> BufferDocumentBuilder<'a> {
     /// xs:IDREF or xs:IDREFS, or a type derived from one of those types, the
     /// is-idrefs property is true". The typed value is the one
     /// `BufferDocNavigator::typed_value` computes.
-    fn file_typed_idrefs(&mut self, attr_ref: u32, binding_idx: u32) {
+    fn file_typed_idrefs(&mut self, attr_ref: u32, binding_idx: u32, source: TypedSource<'_>) {
         if self.idrefs_class(binding_idx) == IdrefsClass::Never || self.id_owner(attr_ref).is_none()
         {
             return;
@@ -1438,7 +1495,7 @@ impl<'a> BufferDocumentBuilder<'a> {
         };
         let value = self.attribute_value(attr_ref);
         let scope = InScope::at(&self.doc, attr_ref);
-        if typed_is_idrefs(value, binding.type_key, schema_set, &scope) {
+        if typed_is_idrefs(value, binding.type_key, schema_set, &scope, source) {
             self.mark_and_file_idrefs(attr_ref);
         }
     }
@@ -1939,7 +1996,9 @@ impl IdClass {
 /// when it is an id — the `xs:ID` value itself, whitespace-collapsed as
 /// `xs:ID` is.
 ///
-/// [`IdClass::ByValue`] computes the typed value exactly as
+/// [`IdClass::ByValue`] needs the typed value. A node a validation run has
+/// just validated has it from the run ([`TypedSource::Validated`]), so that
+/// the index agrees with the run's verdict; any other is computed exactly as
 /// `BufferDocNavigator::typed_value` does for an annotated attribute — the
 /// same `validate_simple_type` call — so that the index and `fn:data` never
 /// disagree, and a copy that keeps the annotation is indexed as its source.
@@ -1949,24 +2008,59 @@ fn typed_id_key<'v>(
     type_key: TypeKey,
     schema_set: &SchemaSet,
     scope: &InScope<'_, '_>,
+    source: TypedSource<'_>,
 ) -> Option<Cow<'v, str>> {
     match class {
         IdClass::Never | IdClass::Unknown => None,
         IdClass::PlainId => id_index_key(value),
         IdClass::ByValue => {
-            let resolver = |prefix: Option<&str>| scope.binding(prefix);
-            let typed = crate::validation::simple::validate_simple_type_in(
-                value,
-                type_key,
-                schema_set,
-                Some(&resolver),
-            )
-            .ok()?
-            .typed_value;
-            let id = single_id(&typed)?;
+            let computed;
+            let typed = match source {
+                TypedSource::Validated(typed) => typed?,
+                TypedSource::Compute => {
+                    let resolver = |prefix: Option<&str>| scope.binding(prefix);
+                    computed = crate::validation::simple::validate_simple_type_in(
+                        value,
+                        type_key,
+                        schema_set,
+                        Some(&resolver),
+                    )
+                    .ok()?
+                    .typed_value;
+                    &computed
+                }
+            };
+            let id = single_id(typed)?;
             id_index_key(id).map(|key| Cow::Owned(key.into_owned()))
         }
     }
+}
+
+/// The key a node of class `class` with the string value `value` was filed
+/// under in the id index, if [`typed_id_key`] filed it: its whitespace-collapsed
+/// value. An `xs:ID` typed value is the collapsed lexical form (`xs:ID` keeps
+/// `collapse`; a one-item list's item and a union's `xs:ID` member value are
+/// that form too), so the key needs no second validation — and withdrawing
+/// under it is exact whether the node was filed or not, since only this
+/// node's own claim is withdrawn.
+fn filed_id_key(class: IdClass, value: &str) -> Option<Cow<'_, str>> {
+    match class {
+        IdClass::Never | IdClass::Unknown => None,
+        IdClass::PlainId | IdClass::ByValue => id_index_key(value),
+    }
+}
+
+/// Where the typed value of a node comes from when the id and idrefs indexes
+/// need it.
+#[derive(Debug, Clone, Copy)]
+enum TypedSource<'v> {
+    /// Validate the node's string value against its annotation, as
+    /// `BufferDocNavigator::typed_value` does.
+    Compute,
+    /// The typed value a validation run gave the node — `None` when the run
+    /// found none (a value that is not valid, a nilled element) — used as it
+    /// is.
+    Validated(Option<&'v XmlValue>),
 }
 
 /// The `xs:ID` value a typed value consists of, when it is exactly one atomic
@@ -2064,6 +2158,7 @@ fn typed_is_idrefs(
     type_key: TypeKey,
     schema_set: &SchemaSet,
     scope: &InScope<'_, '_>,
+    source: TypedSource<'_>,
 ) -> bool {
     fn holds(value: &XmlValue) -> bool {
         match &value.value {
@@ -2072,6 +2167,9 @@ fn typed_is_idrefs(
             XmlValueKind::List { items, .. } => items.iter().any(holds),
             XmlValueKind::UntypedAtomic(_) => false,
         }
+    }
+    if let TypedSource::Validated(typed) = source {
+        return typed.is_some_and(holds);
     }
     let resolver = |prefix: Option<&str>| scope.binding(prefix);
     crate::validation::simple::validate_simple_type_in(value, type_key, schema_set, Some(&resolver))

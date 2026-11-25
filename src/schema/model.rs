@@ -191,9 +191,34 @@ pub struct SchemaSet {
     /// The nesting limit of the passes over the set's components (see
     /// [`SchemaSet::max_depth`]).
     max_depth: usize,
+
+    /// The instant at which the set reads its own literals: the values of an
+    /// enumeration, the {value} of a value constraint, the literals its
+    /// schema-time checks compare — schema properties, which XSD 1.1
+    /// assertions on their types can make depend on the current dateTime.
+    /// Read from the system clock the first time one of them needs it, then
+    /// kept, so that within the set a literal reads the same on every path and
+    /// in every validation run; a set none of whose literals calls
+    /// `fn:current-dateTime` reads no clock.
+    schema_clock: crate::clock::SharedClock,
 }
 
 impl SchemaSet {
+    /// The clock at which the set reads its own literals (see the
+    /// `schema_clock` field): what an XSD 1.1 assertion of a literal's type
+    /// reports as the current dateTime.
+    pub(crate) fn schema_clock(&self) -> &crate::clock::SharedClock {
+        &self.schema_clock
+    }
+
+    /// Fix the instant at which the set reads its own literals — before it
+    /// reads any (`false` once one was read). For tests.
+    #[cfg(all(test, feature = "xsd11"))]
+    pub(crate) fn fix_schema_instant(&self, now: std::time::SystemTime) -> bool {
+        self.schema_clock
+            .fix(crate::clock::HostClock::from_system_time(now))
+    }
+
     /// Create a new empty schema set
     pub fn new() -> Self {
         Self::with_version(XsdVersion::V1_0)
@@ -228,6 +253,7 @@ impl SchemaSet {
             value_constraint_namespaces: HashMap::new(),
             directive_failures: Vec::new(),
             max_depth: crate::parser::parse::DEFAULT_MAX_DEPTH,
+            schema_clock: crate::clock::SharedClock::new(),
         };
 
         // Initialize built-in types

@@ -9,6 +9,7 @@
 //! - `resolve_ct_assertion_default_ns` — xpathDefaultNamespace cascade
 //! - `evaluate_complex_type_assertions` — core XPath evaluation
 
+use crate::clock::SharedClock;
 use crate::document::buffer::BufferDocument;
 use crate::document::navigator::BufferDocNavigator;
 use crate::ids::{ComplexTypeKey, NameId, TypeKey};
@@ -17,7 +18,7 @@ use crate::parser::frames::{AssertResult, ComplexContentResult};
 use crate::parser::location::SourceLocation;
 use crate::schema::SchemaSet;
 use crate::validation::errors::{self, ValidationError};
-use crate::validation::simple::validate_simple_type_in;
+use crate::validation::simple::validate_simple_type_at;
 use crate::xpath::functions::{effective_boolean_value, XPathValue};
 
 use crate::arenas::SchemaArenas;
@@ -165,25 +166,28 @@ fn compute_dollar_value<'doc>(
     element_ref: u32,
     governing_ct_key: ComplexTypeKey,
     schema_set: &SchemaSet,
+    clock: Option<&'doc SharedClock>,
 ) -> XPathValue<BufferDocNavigator<'doc>> {
     let ct = &schema_set.arenas.complex_types[governing_ct_key];
     if !matches!(ct.content, ComplexContentResult::Simple(_)) {
         return XPathValue::empty();
     }
 
-    let nav = BufferDocNavigator::new(doc, element_ref);
+    let nav = BufferDocNavigator::new(doc, element_ref).with_run_clock(clock);
     if matches!(nav.typed_value(), TypedValue::Nilled) {
         return XPathValue::empty();
     }
 
     // An `xs:QName` / `xs:NOTATION` value is resolved with the element's
-    // in-scope namespaces, as the validation runtime resolves it.
+    // in-scope namespaces, as the validation runtime resolves it. The value
+    // is validated again, with the run's current dateTime.
     let resolver = |prefix: Option<&str>| nav.prefix_binding(prefix);
-    match validate_simple_type_in(
+    match validate_simple_type_at(
         &nav.value(),
         TypeKey::Complex(governing_ct_key),
         schema_set,
         Some(&resolver),
+        clock,
     ) {
         // §3.13.4.1 clause 2.3.1: "the XDM representation of
         // E.[schema actual value]". When the governing simple-content type's
@@ -221,11 +225,16 @@ pub(crate) fn note_expression_warnings(
 /// the element subtree in a `BufferDocument`.
 ///
 /// Returns a `Vec` of all `cvc-assertion` errors (does not stop at first failure).
+///
+/// `clock` is the clock of the validation run: every assertion, and every
+/// typed value of the subtree it computes, reports its instant as the current
+/// dateTime (XSD 1.1 Structures §3.13.4.2 clause 6).
 pub(crate) fn evaluate_complex_type_assertions(
     doc: &BufferDocument<'_>,
     element_ref: u32,
     ct_key: ComplexTypeKey,
     schema_set: &SchemaSet,
+    clock: &SharedClock,
 ) -> Vec<ValidationError> {
     // Compiled once per schema set (`CompiledXPathCache`), base first.
     let assertions = schema_set
@@ -237,7 +246,7 @@ pub(crate) fn evaluate_complex_type_assertions(
     // §3.13.4.1 clause 2.3 ties `$value` to E's governing type
     // (the parameter `ct_key`), so it is identical across all
     // inherited assertions. Compute once and clone per evaluation.
-    let dollar_value = compute_dollar_value(doc, element_ref, ct_key, schema_set);
+    let dollar_value = compute_dollar_value(doc, element_ref, ct_key, schema_set, Some(clock));
 
     for assertion in assertions.iter() {
         // The schema-time check (`schema::validate_assertion_xpath`) compiled
@@ -267,13 +276,14 @@ pub(crate) fn evaluate_complex_type_assertions(
             }
         };
 
-        let nav = BufferDocNavigator::new_assertion(doc, element_ref);
+        let nav = BufferDocNavigator::new_assertion(doc, element_ref).with_run_clock(Some(clock));
         let value_for_eval = dollar_value.clone();
 
         let warnings = std::cell::RefCell::new(Vec::new());
         let outcome = crate::xpath::operators::with_decimal_capacity_marks(|| {
             expr.evaluator(&ctx)
                 .with_warnings(&warnings)
+                .with_run_clock(Some(clock))
                 .run_with_node_and_setup(Some(nav), |eval| {
                     eval.set_variable_by_name("value", value_for_eval)
                         .expect("$value declared via compile_with_vars");

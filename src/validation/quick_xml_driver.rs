@@ -208,6 +208,45 @@ pub struct EndElementInfo {
     pub validation_attempted: crate::validation::info::ValidationAttempted,
 }
 
+/// What the run found for the element that has just ended, lent to
+/// [`ValidationEventHandler::after_end_element_values`] for the duration of
+/// the call: the values are the run's own, so what a handler builds from them
+/// agrees with the run's verdict — also for a type whose XSD 1.1 assertions
+/// read the current dateTime, which a second validation of the content could
+/// read at another instant.
+///
+/// Both are absent for an element whose content is not a valid value of its
+/// type, that is nilled, or that has no simple content (a complex type with
+/// element-only, mixed or empty content; an element no type governs). An
+/// element that is not valid for another reason — a `fixed` value it does not
+/// match, an ID that occurs twice — keeps the values its content gave: its
+/// `[validity]` is in the [`EndElementInfo`] beside them.
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct EndElementValues<'a> {
+    /// The element's typed value — its \[schema actual value\] — exactly as
+    /// [`SchemaInfo::typed_value`] holds it after
+    /// [`ValidationRuntime::validate_end_element`]: of the governing type, a
+    /// union's value carrying the member type that accepted it, a QName /
+    /// NOTATION resolved with the bindings in scope. As there, it can be
+    /// `None` for a valid element with simple content when the run retains no
+    /// typed values
+    /// ([`ValidationFlags::BUILD_PSVI_TYPED_VALUES`](crate::validation::ValidationFlags::BUILD_PSVI_TYPED_VALUES)
+    /// cleared) and nothing needed the value: a string or number type
+    /// validated in its lexical form alone. It is present whenever the value
+    /// decides anything a tree needs beyond the type's own `whiteSpace` — a
+    /// list, a union, an `xs:ID` / `xs:IDREF` / `xs:QName` / `xs:NOTATION`
+    /// type, a type with an assertion, a `default` / `fixed` value taken.
+    pub typed_value: Option<&'a crate::types::value::XmlValue>,
+    /// The element's \[schema normalized value\] (Structures §3.3.5.4) as
+    /// [`SchemaInfo::normalized_value`] holds it: for an element that took
+    /// its declaration's `default` / `fixed` value (clause 5.1 of Element
+    /// Locally Valid (Element)), the {lexical form} of the value constraint.
+    /// `None` where the run validated the lexical form alone, as for
+    /// `typed_value`.
+    pub normalized_value: Option<&'a str>,
+}
+
 /// How a text/CDATA event was dispatched into the runtime.
 #[derive(Debug, Clone, Copy)]
 pub enum TextKind {
@@ -250,8 +289,11 @@ pub enum TextKind {
 /// 9. Body events: `on_text`, `on_comment`, `on_processing_instruction`.
 /// 10. On the closing event:
 ///     1. (internal) `runtime.validate_end_element`
-///     2. `after_end_element`
+///     2. `after_end_element` — or, for a handler whose `wants_typed_values`
+///        is `true`, `after_end_element_values` in its place
 ///     3. `on_element_end_offset`
+///
+/// `wants_typed_values` is asked once, before the first event.
 pub trait ValidationEventHandler {
     /// Caller's hook-error type. Reported through
     /// [`DriveWithError::Hook`].
@@ -316,12 +358,74 @@ pub trait ValidationEventHandler {
     }
 
     /// `depth` is the depth at which the element existed (1 = root close).
+    ///
+    /// Not called for a handler whose
+    /// [`wants_typed_values`](Self::wants_typed_values) is `true`: such a
+    /// handler gets
+    /// [`after_end_element_values`](Self::after_end_element_values) in its
+    /// place (whose default calls this one).
     fn after_end_element(
         &mut self,
         _info: &EndElementInfo,
         _depth: usize,
     ) -> Result<(), Self::Error> {
         Ok(())
+    }
+
+    /// Whether the handler wants the typed values the run finds, to build
+    /// from them — a typed tree, typed records — rather than from a second
+    /// validation of the lexical forms. The default is `false`: the handler
+    /// gets verdicts only, and the driver ends each element on the runtime's
+    /// value-free path.
+    ///
+    /// When it returns `true`, the driver
+    ///
+    /// * ends each element on the runtime's value-returning path and calls
+    ///   [`after_end_element_values`](Self::after_end_element_values) in
+    ///   place of [`after_end_element`](Self::after_end_element), lending it
+    ///   the element's typed value and \[schema normalized value\]
+    ///   ([`EndElementValues`]);
+    /// * gives every defaulted attribute that has a type its typed value
+    ///   ([`DefaultAttribute::typed_value`](crate::validation::DefaultAttribute::typed_value)
+    ///   in [`EndOfAttributesView::default_attributes`]), which is otherwise
+    ///   present only under
+    ///   [`ValidationFlags::BUILD_PSVI_TYPED_VALUES`](crate::validation::ValidationFlags::BUILD_PSVI_TYPED_VALUES)
+    ///   or for a type with `xs:QName` / `xs:NOTATION` values.
+    ///
+    /// Neither changes what is validated or reported: the errors, the
+    /// warnings and every `[validity]` are those of a handler that does not
+    /// ask. The request costs each element end what the runtime's value path
+    /// costs over its value-free one (the element's normalized value is
+    /// kept), and a defaulted attribute the reading of its literal.
+    ///
+    /// The driver asks once, before the first event of the document. A
+    /// handler that wraps another one forwards both this method and
+    /// `after_end_element_values` to it — a wrapper that forwards neither
+    /// hides the request, and the inner handler then gets `after_end_element`
+    /// without the values. The quick-xml drivers ([`drive_quick_xml_with`]
+    /// and its `_in` / `_bytes` forms, and the typed build over them) honour
+    /// it.
+    fn wants_typed_values(&self) -> bool {
+        false
+    }
+
+    /// The end of an element for a handler whose
+    /// [`wants_typed_values`](Self::wants_typed_values) is `true`: `info`
+    /// and `depth` as [`after_end_element`](Self::after_end_element) gets
+    /// them, and `values`, the element's typed value and \[schema normalized
+    /// value\] as the run found them, borrowed from the runtime for the
+    /// duration of the call ([`EndElementValues`]).
+    ///
+    /// The default forwards to `after_end_element(info, depth)`, so a handler
+    /// that only asks for the typed values of defaulted attributes keeps its
+    /// end hook.
+    fn after_end_element_values(
+        &mut self,
+        info: &EndElementInfo,
+        _values: EndElementValues<'_>,
+        depth: usize,
+    ) -> Result<(), Self::Error> {
+        self.after_end_element(info, depth)
     }
 
     fn on_text(&mut self, _kind: TextKind, _text: &str) -> Result<(), Self::Error> {
@@ -656,6 +760,10 @@ where
     // The reader clears the buffer itself before each read.
     buf.clear();
 
+    // Asked once: whether element ends go through the runtime's value path
+    // and defaulted attributes come with their typed values.
+    let wants_values = handler.wants_typed_values();
+
     loop {
         let event = xml_reader.next_event(buf);
         let event_start = xml_reader.event_start() as usize;
@@ -690,6 +798,7 @@ where
                     runtime,
                     schema_set,
                     handler,
+                    wants_values,
                     &mut prefix_map,
                     &mut scope_stack,
                     &mut ns_snapshot,
@@ -707,6 +816,7 @@ where
                     runtime,
                     schema_set,
                     handler,
+                    wants_values,
                     &mut prefix_map,
                     &mut scope_stack,
                     &mut ns_snapshot,
@@ -716,21 +826,8 @@ where
                 )?;
             }
             Ok(Event::End(_)) => {
-                // Streaming consumers receive only `[validity]` and `[validation
-                // attempted]` per element, so use the value-free end path (no
-                // per-element SchemaInfo).
-                let (end_validity, validation_attempted) = runtime.validate_end_element_verdict();
-                let end = EndElementInfo {
-                    validity: end_validity,
-                    validation_attempted,
-                };
-                handler
-                    .after_end_element(&end, depth)
-                    .map_err(DriveWithError::Hook)?;
                 let end_pos = xml_reader.buffer_position() as usize;
-                handler
-                    .on_element_end_offset(end_pos)
-                    .map_err(DriveWithError::Hook)?;
+                let end_validity = close_element(runtime, handler, wants_values, depth, end_pos)?;
                 if depth == 1 {
                     root_validity = Some(end_validity);
                 }
@@ -852,6 +949,7 @@ fn handle_start_or_empty<R, W, S, H>(
     runtime: &mut ValidationRuntime<'_, S>,
     schema_set: &SchemaSet,
     handler: &mut H,
+    wants_values: bool,
     prefix_map: &mut PrefixMap,
     scope_stack: &mut Vec<Vec<Vec<u8>>>,
     ns_snapshot: &mut Option<NamespaceContextSnapshot>,
@@ -997,7 +1095,12 @@ where
     let eoa_info = runtime.validate_end_of_attributes();
     #[cfg(feature = "xsd11")]
     let deferred = runtime.take_deferred_attribute_results();
-    let defaults = runtime.take_default_attributes();
+    // With their typed values for a handler that asked for them.
+    let defaults = if wants_values {
+        runtime.take_default_attributes_typed()
+    } else {
+        runtime.take_default_attributes()
+    };
     let eoa_view = EndOfAttributesView {
         info: &eoa_info,
         default_attributes: &defaults,
@@ -1010,21 +1113,8 @@ where
 
     // 7. For empty elements, close inline.
     if is_empty {
-        // Streaming consumers receive only `[validity]` and `[validation
-        // attempted]` per element (the handler hook takes an `EndElementInfo`),
-        // so use the value-free end path.
-        let (end_validity, validation_attempted) = runtime.validate_end_element_verdict();
-        let end = EndElementInfo {
-            validity: end_validity,
-            validation_attempted,
-        };
-        handler
-            .after_end_element(&end, *depth)
-            .map_err(DriveWithError::Hook)?;
         let end_pos = xml_reader.buffer_position() as usize;
-        handler
-            .on_element_end_offset(end_pos)
-            .map_err(DriveWithError::Hook)?;
+        let end_validity = close_element(runtime, handler, wants_values, *depth, end_pos)?;
         if *depth == 1 {
             *root_validity = Some(end_validity);
         }
@@ -1033,6 +1123,66 @@ where
     }
 
     Ok(())
+}
+
+/// End the open element, for `<e/>` and `</e>` alike: the runtime's end step,
+/// the handler's end hook, then its end offset `end_pos`. Returns the
+/// element's `[validity]`.
+///
+/// A handler that did not ask for typed values (`wants_values` = `false`, the
+/// default) receives only `[validity]` and `[validation attempted]`, so the
+/// element ends on the runtime's value-free path (no per-element
+/// `SchemaInfo`, no normalized value kept). One that asked gets the element's
+/// typed value and \[schema normalized value\] with them: the runtime ends the
+/// element on its value path and lends what it holds for the call
+/// (`ValidationRuntime::validate_end_element_with`).
+// Inlined into its two callers, as the helpers below are: `wants_values` is a
+// constant `false` for a handler that keeps the trait's default, which leaves
+// the first branch alone in the loop.
+#[inline(always)]
+fn close_element<S, H>(
+    runtime: &mut ValidationRuntime<'_, S>,
+    handler: &mut H,
+    wants_values: bool,
+    depth: usize,
+    end_pos: usize,
+) -> Result<SchemaValidity, DriveWithError<H::Error>>
+where
+    S: ValidationSink,
+    H: ValidationEventHandler,
+{
+    let end_validity = if !wants_values {
+        let (validity, validation_attempted) = runtime.validate_end_element_verdict();
+        let end = EndElementInfo {
+            validity,
+            validation_attempted,
+        };
+        handler
+            .after_end_element(&end, depth)
+            .map_err(DriveWithError::Hook)?;
+        validity
+    } else {
+        runtime.validate_end_element_with(
+            |validity, validation_attempted, typed_value, normalized_value| {
+                let end = EndElementInfo {
+                    validity,
+                    validation_attempted,
+                };
+                let values = EndElementValues {
+                    typed_value,
+                    normalized_value,
+                };
+                handler
+                    .after_end_element_values(&end, values, depth)
+                    .map(|()| validity)
+                    .map_err(DriveWithError::Hook)
+            },
+        )?
+    };
+    handler
+        .on_element_end_offset(end_pos)
+        .map_err(DriveWithError::Hook)?;
+    Ok(end_validity)
 }
 
 /// Collect xmlns / xmlns:* declarations of the tag into `prefix_map`.

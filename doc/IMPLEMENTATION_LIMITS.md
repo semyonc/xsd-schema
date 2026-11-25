@@ -221,6 +221,51 @@ documentation has the details.
   §16.3, ·stable·), with the clock's fractional seconds, in the implicit
   timezone. On `wasm32-unknown-unknown`, whose standard library has no clock,
   these functions raise `XPDY0002` unless the host sets `current_datetime`.
+- **The current dateTime of a validation run** (XSD 1.1) is one instant for
+  the whole run (Structures §3.13.4.2 clause 6): the host's
+  (`ValidationRuntime::set_current_time`), or the system clock read the first
+  time an expression of the run asks for it — a run that evaluates no
+  `fn:current-dateTime` reads no clock. Every assertion, assertion facet and
+  type alternative of the run reports it, and so do the typed values the
+  assertion's data model computes (`$value`, `fn:data`, also of the nodes
+  `fn:id` and `fn:idref` return); its ids, idrefs and union whitespace are
+  those the run found. A typed build holds what its run found as well — ids,
+  defaulted values, the whitespace of a union that reads the current dateTime
+  — whatever the retention flags (`BUILD_PSVI_TYPED_VALUES`) say and whichever
+  entry point drives it (`document::build_typed_document_with`, or a
+  `TypedBuilderHandler` driven with `drive_quick_xml_with`): the driver lends
+  the handler the run's values at each element end
+  (`ValidationEventHandler::wants_typed_values`).
+- **A schema set's own literals** — the values of an `enumeration`, the
+  {value} of a `default` or `fixed` value constraint, the literals the
+  schema-time checks compare — are schema properties, read at one instant of
+  the schema set's own: the system clock, read the first time one of them
+  needs it (an XSD 1.1 assertion of the literal's type that calls
+  `fn:current-dateTime`), then kept. Within one schema set a literal reads the
+  same on every path and in every run, whatever the wall clock; a run compares
+  its instance values, read at its own instant, with them. Only a type that
+  reads the current dateTime can tell the two instants apart — a type one of
+  whose `xs:assertion` facets (its own, a base type's, a list item type's, a
+  union member type's, a simple content's) names `fn:current-dateTime`,
+  `fn:current-date` or `fn:current-time` — and only for such a type are value
+  constraints handled otherwise than they always were: a fixed value is
+  compared by value with the recorded {value} (the literal read with its
+  declaration's bindings), also where the instance is written as the literal
+  is, and an empty element takes the recorded {lexical form}. Two schema sets
+  built at different times can read such a literal differently. A host cannot
+  give a schema set its instant; on `wasm32-unknown-unknown` such a literal
+  raises `XPDY0002` and is not valid.
+- **Outside a run** each evaluation reads the clock for itself, as a
+  standalone XPath evaluation does: a typed value a navigator computes over a
+  typed document after its build or over a host's own bindings,
+  `validation::validate_simple_type`, `fixed_values_equal` and
+  `fixed_matches_typed`. A handler that wraps a `TypedBuilderHandler` and
+  forwards neither `wants_typed_values` nor `after_end_element_values` hides
+  the builder's request from the driver: the builder then gets element ends
+  without the run's values and validates each element's content again, with
+  the system clock, so that for a type that reads the current dateTime the
+  document can hold another member's whitespace or miss an id that the run
+  accepted — the run's verdict is not affected.
 
 ## 6. Nesting
 

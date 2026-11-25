@@ -477,6 +477,17 @@ pub struct ArenasGuard {
     /// (QName / NOTATION types), built on first use from the effective facets
     /// and invalidated with them by [`entries_mut`](Self::entries_mut).
     enumeration_index_cache: RwLock<SecondaryMap<SimpleTypeKey, Arc<EnumerationIndex>>>,
+    /// The same index for the `enumeration` of a complex type's simple
+    /// content restriction whose base content is a union, keyed by the
+    /// complex type: its facets are no simple type's.
+    simple_content_enumeration_index_cache:
+        RwLock<SecondaryMap<ComplexTypeKey, Arc<EnumerationIndex>>>,
+    /// XSD 1.1: per type, whether validating a value against it can read the
+    /// current dateTime ([`reads_clock`](Self::reads_clock)), decided on
+    /// first use and invalidated with the caches above by
+    /// [`entries_mut`](Self::entries_mut).
+    #[cfg(feature = "xsd11")]
+    reads_clock_cache: RwLock<ClockReadingTypes>,
     /// XSD 1.1: the `xs:assert`, `assertion` facet and `xs:alternative` tests
     /// (Structures §3.13.4.1, §3.12.4), each compiled on first use and kept,
     /// so evaluation per element or value no longer parses and binds the
@@ -501,6 +512,16 @@ impl ArenasGuard {
         // `&mut self` already guarantees exclusivity, so `get_mut` needs no lock.
         self.effective_facets_cache.get_mut().unwrap().clear();
         self.enumeration_index_cache.get_mut().unwrap().clear();
+        self.simple_content_enumeration_index_cache
+            .get_mut()
+            .unwrap()
+            .clear();
+        #[cfg(feature = "xsd11")]
+        {
+            let reads_clock = self.reads_clock_cache.get_mut().unwrap();
+            reads_clock.simple.clear();
+            reads_clock.complex.clear();
+        }
         #[cfg(feature = "xsd11")]
         self.compiled_xpath.clear();
         &mut self.inner
@@ -585,6 +606,95 @@ impl ArenasGuard {
         built
     }
 
+    /// [`enumeration_index`](Self::enumeration_index) for the simple content
+    /// restriction of the complex type `ck`.
+    pub(crate) fn simple_content_enumeration_index(
+        &self,
+        ck: ComplexTypeKey,
+        build: impl FnOnce() -> EnumerationIndex,
+    ) -> Arc<EnumerationIndex> {
+        if let Some(index) = self
+            .simple_content_enumeration_index_cache
+            .read()
+            .unwrap()
+            .get(ck)
+        {
+            return Arc::clone(index);
+        }
+        let built = Arc::new(build());
+        self.simple_content_enumeration_index_cache
+            .write()
+            .unwrap()
+            .insert(ck, Arc::clone(&built));
+        built
+    }
+
+    /// XSD 1.1: whether validating a value against `type_key` can read the
+    /// current dateTime — whether an `xs:assertion` facet that names one of
+    /// `fn:current-dateTime`, `fn:current-date`, `fn:current-time`
+    /// ([`assertion_reads_clock`]) is among the facets the validation
+    /// evaluates: the type's own, those of its base types, of a list's item
+    /// type, of a union's member types, and for a complex type with simple
+    /// content those of its simple content restriction and of its content
+    /// type. Only such a type can give one literal two values at two
+    /// instants, so only for it does the runtime read a `fixed` or `default`
+    /// literal otherwise than for every other type. Decided once per type.
+    #[cfg(feature = "xsd11")]
+    pub(crate) fn reads_clock(&self, type_key: TypeKey) -> bool {
+        {
+            let cache = self.reads_clock_cache.read().unwrap();
+            let known = match type_key {
+                TypeKey::Simple(sk) => cache.simple.get(sk),
+                TypeKey::Complex(ck) => cache.complex.get(ck),
+            };
+            if let Some(&known) = known {
+                return known;
+            }
+        }
+        let reads = self.compute_reads_clock(type_key, 0);
+        let mut cache = self.reads_clock_cache.write().unwrap();
+        match type_key {
+            TypeKey::Simple(sk) => cache.simple.insert(sk, reads),
+            TypeKey::Complex(ck) => cache.complex.insert(ck, reads),
+        };
+        reads
+    }
+
+    /// The walk behind [`reads_clock`](Self::reads_clock), over exactly the
+    /// types whose assertion facets `validation::simple` evaluates for a
+    /// value of `type_key`. A chain deeper than any valid schema's (a cycle
+    /// of an invalid one) ends the walk.
+    #[cfg(feature = "xsd11")]
+    fn compute_reads_clock(&self, type_key: TypeKey, depth: u32) -> bool {
+        if depth > 100 {
+            return false;
+        }
+        let reads = |facets: &FacetSet| facets.assertions.iter().any(assertion_reads_clock);
+        let next = |key: TypeKey| key != type_key && self.compute_reads_clock(key, depth + 1);
+        match type_key {
+            TypeKey::Simple(sk) => {
+                let Some(st) = self.inner.simple_types.get(sk) else {
+                    return false;
+                };
+                reads(&st.facets)
+                    || matches!(st.resolved_base_type, Some(base @ TypeKey::Simple(_)) if next(base))
+                    || st.resolved_item_type.is_some_and(next)
+                    || st.resolved_member_types.iter().any(|&member| next(member))
+            }
+            TypeKey::Complex(ck) => {
+                let Some(ct) = self.inner.complex_types.get(ck) else {
+                    return false;
+                };
+                let ComplexContentResult::Simple(sc) = &ct.content else {
+                    return false;
+                };
+                reads(&sc.facets)
+                    || ct.resolved_simple_content_type.is_some_and(next)
+                    || ct.resolved_base_type.is_some_and(next)
+            }
+        }
+    }
+
     /// XSD 1.1: the compiled XPath tests of the schema set's assertions and
     /// type alternatives, filled on demand and wiped by
     /// [`entries_mut`](Self::entries_mut).
@@ -617,6 +727,27 @@ impl ArenasGuard {
         }
         facets
     }
+}
+
+/// The cache behind [`ArenasGuard::reads_clock`], one dense map per kind of
+/// type.
+#[cfg(feature = "xsd11")]
+#[derive(Debug, Default)]
+struct ClockReadingTypes {
+    simple: SecondaryMap<SimpleTypeKey, bool>,
+    complex: SecondaryMap<ComplexTypeKey, bool>,
+}
+
+/// Whether the test of an `xs:assertion` facet can read the current dateTime:
+/// whether its text names `fn:current-dateTime`, `fn:current-date` or
+/// `fn:current-time`, the only functions of XPath 2.0 that read a clock
+/// (F&O 1.0 §16.3 to §16.5). XPath 2.0 calls a function by the name written
+/// in the expression, so a test without the text `current-` calls none of
+/// them; a test that only mentions it (in a string literal, a comment) is
+/// taken to read the clock, which is the safe side.
+#[cfg(feature = "xsd11")]
+pub(crate) fn assertion_reads_clock(assertion: &crate::types::facets::AssertionFacet) -> bool {
+    assertion.test.contains("current-")
 }
 
 impl Deref for ArenasGuard {

@@ -34,7 +34,7 @@ use crate::validation::errors::ValidationError;
 use crate::validation::info::{SchemaInfo, ValidationAttempted, ValidationFlags};
 use crate::validation::quick_xml_driver::{
     drive_quick_xml_with, AttributeView, DoctypeView, DriveOutcome, DriveWithError,
-    ElementStartView, EndElementInfo, EndOfAttributesView, NoopHandler, TextKind,
+    ElementStartView, EndElementInfo, EndElementValues, EndOfAttributesView, NoopHandler, TextKind,
     ValidationEventHandler,
 };
 use crate::validation::runtime::ValidationRuntime;
@@ -46,6 +46,59 @@ use super::builder::BufferDocumentBuilder;
 use super::error::BufferDocumentError;
 use super::type_remap::NodeSchemaBinding;
 use super::BufferDocumentOptions;
+
+/// What the validation run found for a value, for its normalization: its
+/// typed value and its [schema normalized value], each when the run kept it;
+/// and, for the value to be validated again when the run kept neither, the
+/// clock to read it at (`None`: the system clock).
+#[derive(Clone, Copy)]
+struct Validated<'v> {
+    typed: Option<&'v crate::types::value::XmlValue>,
+    normalized: Option<&'v str>,
+    clock: Option<&'v crate::clock::SharedClock>,
+}
+
+impl<'v> Validated<'v> {
+    fn of(info: &'v SchemaInfo) -> Self {
+        Self {
+            typed: info.typed_value.as_ref(),
+            normalized: info.normalized_value.as_deref(),
+            clock: None,
+        }
+    }
+
+    /// What the run lent about the element that has just ended
+    /// ([`ValidationEventHandler::after_end_element_values`]).
+    fn ended(values: EndElementValues<'v>) -> Self {
+        Self {
+            typed: values.typed_value,
+            normalized: values.normalized_value,
+            clock: None,
+        }
+    }
+
+    /// A value constraint's value: the schema's, `typed` when the run kept it,
+    /// else read at the schema set's instant like every literal of the set.
+    fn constraint(
+        typed: Option<&'v crate::types::value::XmlValue>,
+        schema_set: &'v SchemaSet,
+    ) -> Self {
+        Self {
+            typed,
+            normalized: None,
+            clock: Some(schema_set.schema_clock()),
+        }
+    }
+
+    /// Nothing from the run: an element's end reported without its values
+    /// (`after_end_element`, which only a wrapper that does not forward
+    /// `after_end_element_values` calls), so the value is validated again.
+    const NONE: Validated<'static> = Validated {
+        typed: None,
+        normalized: None,
+        clock: None,
+    };
+}
 
 // ── SilentValidationSink ──────────────────────────────────────────────
 
@@ -135,6 +188,17 @@ impl<E: std::error::Error + 'static> std::error::Error for TypedBuildError<E> {
 /// the builder — or let [`build_typed_document_with`] do both. The builder
 /// must have been created for the same [`SchemaSet`] as the validator
 /// (`BufferDocumentBuilder::new(arena, &set.name_table, Some(&set), options)`).
+///
+/// The tree follows what the run finds: the handler asks the driver for the
+/// run's values
+/// ([`wants_typed_values`](ValidationEventHandler::wants_typed_values)) —
+/// the typed values it files ids and idrefs from, the value a defaulted
+/// element took, the member type of a union whose assertions read the
+/// current dateTime — so both ways of driving it build the same document,
+/// whatever [`ValidationFlags::BUILD_PSVI_TYPED_VALUES`] says. A handler that wraps
+/// this one forwards `wants_typed_values` and
+/// [`after_end_element_values`](ValidationEventHandler::after_end_element_values)
+/// to it, as it forwards the other hooks.
 ///
 /// Internally it keeps the per-element bookkeeping of the build: the
 /// element-ref stack (so text/end events correlate to the open element), the
@@ -458,9 +522,12 @@ impl<'b, 'a, H> TypedBuilderHandler<'b, 'a, H> {
             return Ok(());
         };
         let mode = self.whitespace(type_key);
-        if let Some(normalized) =
-            self.normalized(self.builder.attribute_value(attr_ref), type_key, mode)
-        {
+        if let Some(normalized) = self.normalized(
+            self.builder.attribute_value(attr_ref),
+            type_key,
+            mode,
+            Validated::of(info),
+        ) {
             self.builder.set_attribute_value(attr_ref, &normalized);
         }
         Ok(())
@@ -487,19 +554,27 @@ impl<'b, 'a, H> TypedBuilderHandler<'b, 'a, H> {
 
     /// `text`'s [schema normalized value] as a lexical form of `type_key`
     /// (whose whiteSpace is `mode`, `None` for a union), when it differs from
-    /// `text`.
+    /// `text`. A union's is that of the member type the validation run found
+    /// for the value (`validated`, the run's result: its typed value's member,
+    /// or its own normalized value), not that of a second validation, which
+    /// could take another member when one of its XSD 1.1 assertions reads
+    /// another clock; only without either is the value validated again.
     fn normalized(
         &self,
         text: &str,
         type_key: crate::ids::TypeKey,
         mode: Option<crate::types::facets::WhitespaceMode>,
+        validated: Validated<'_>,
     ) -> Option<String> {
         match mode {
             Some(mode) => crate::validation::simple::whitespace_changes(text, mode),
-            None => crate::validation::simple::schema_normalized(
+            None => crate::validation::simple::validated_normalized(
                 text,
                 type_key,
                 self.builder.schema_set()?,
+                validated.typed,
+                validated.normalized,
+                validated.clock,
             ),
         }
     }
@@ -575,7 +650,12 @@ impl<'b, 'a, H> TypedBuilderHandler<'b, 'a, H> {
                 attribute_decl: info.attribute_decl,
                 content_type: None,
             };
-            self.builder.set_node_binding(attr_ref, binding)?;
+            // Filed in the id index from the typed value the run gave it.
+            self.builder.set_node_binding_validated(
+                attr_ref,
+                binding,
+                info.typed_value.as_ref(),
+            )?;
         }
         Ok(())
     }
@@ -631,7 +711,11 @@ impl<'b, 'a, H> TypedBuilderHandler<'b, 'a, H> {
                     attribute_decl: attr_info.attribute_decl,
                     content_type: None,
                 };
-                self.builder.set_node_binding(*attr_ref, binding)?;
+                self.builder.set_node_binding_validated(
+                    *attr_ref,
+                    binding,
+                    attr_info.typed_value.as_ref(),
+                )?;
             }
         }
         if self.defaults_as_nodes {
@@ -680,7 +764,8 @@ impl<'b, 'a, H> TypedBuilderHandler<'b, 'a, H> {
         });
         let normalized = type_key.and_then(|tk| {
             let mode = self.whitespace(tk);
-            self.normalized(&default.value, tk, mode)
+            let validated = Validated::constraint(default.typed_value.as_ref(), schema_set);
+            self.normalized(&default.value, tk, mode, validated)
         });
         let lexical = normalized.as_deref().unwrap_or(&default.value);
         // A QName / NOTATION in the value is the schema's expanded name (the
@@ -702,7 +787,24 @@ impl<'b, 'a, H> TypedBuilderHandler<'b, 'a, H> {
                 attribute_decl: default.attribute_key,
                 content_type: None,
             };
-            self.builder.set_node_binding(attr_ref, binding)?;
+            // The constraint's value for the id and idrefs indexes: the
+            // run's, which the driver gives a handler that asks for typed
+            // values; read here, at the schema set's instant as the run reads
+            // it, only when a wrapper hid the request from the driver.
+            let read;
+            let typed = match default.typed_value.as_ref() {
+                Some(typed) => Some(typed),
+                None => {
+                    read = crate::validation::simple::validate_schema_literal(
+                        value, type_key, schema_set, None,
+                    )
+                    .ok()
+                    .map(|result| result.typed_value);
+                    read.as_ref()
+                }
+            };
+            self.builder
+                .set_node_binding_validated(attr_ref, binding, typed)?;
         }
         Ok(())
     }
@@ -724,7 +826,9 @@ impl<'b, 'a, H> TypedBuilderHandler<'b, 'a, H> {
     /// `decl`) becomes in the open element whose governing type is
     /// `type_key`: its {lexical form} — under a type other than the declared
     /// one the form itself, as validation reads it (Structures §3.3.4.3
-    /// clause 5.1.2) —, white space normalized for `type_key`, a QName /
+    /// clause 5.1.2) —, white space normalized for `type_key` (under a
+    /// declared type that reads the current dateTime, the form as the schema
+    /// set recorded it), a QName /
     /// NOTATION in it written again for the instance
     /// ([`qname_lexical_in_scope`]).
     ///
@@ -734,21 +838,37 @@ impl<'b, 'a, H> TypedBuilderHandler<'b, 'a, H> {
         value: &str,
         decl: &'a crate::arenas::ElementDeclData,
         type_key: crate::ids::TypeKey,
+        validated: Validated<'_>,
     ) -> Result<String, BufferDocumentError> {
         let source = decl.source.as_ref();
-        let overridden = self.builder.schema_set().and_then(|schema_set| {
-            let declared = decl
-                .resolved_type
-                .unwrap_or_else(|| crate::ids::TypeKey::Complex(schema_set.any_type_key()));
-            (declared != type_key)
+        let declared = self.builder.schema_set().map(|schema_set| {
+            decl.resolved_type
+                .unwrap_or_else(|| crate::ids::TypeKey::Complex(schema_set.any_type_key()))
+        });
+        // Under the declared type, when one of its assertions reads the
+        // current dateTime: the form the schema set recorded, as it is — the
+        // run takes it so (`ValidationRuntime::literal_values_may_vary`), and
+        // normalizing the attribute again, by the member type the run's
+        // instant gives a union, could give another form.
+        let recorded = self.builder.schema_set().and_then(|schema_set| {
+            (declared == Some(type_key) && schema_set.arenas.reads_clock(type_key))
                 .then(|| schema_set.value_constraint_lexical_form(decl))
                 .flatten()
         });
-        let value = overridden.as_deref().unwrap_or(value);
-        let mode = self.whitespace(type_key);
-        let lexical = self
-            .normalized(value, type_key, mode)
-            .unwrap_or_else(|| value.to_string());
+        let lexical = match recorded {
+            Some(recorded) => recorded,
+            None => {
+                let overridden = self.builder.schema_set().and_then(|schema_set| {
+                    (declared != Some(type_key))
+                        .then(|| schema_set.value_constraint_lexical_form(decl))
+                        .flatten()
+                });
+                let value = overridden.as_deref().unwrap_or(value);
+                let mode = self.whitespace(type_key);
+                self.normalized(value, type_key, mode, validated)
+                    .unwrap_or_else(|| value.to_string())
+            }
+        };
         let Some(schema_set) = self.builder.schema_set() else {
             return Ok(lexical);
         };
@@ -758,18 +878,28 @@ impl<'b, 'a, H> TypedBuilderHandler<'b, 'a, H> {
         let Some(snapshot) = schema_set.value_constraint_namespaces(source) else {
             return Ok(lexical);
         };
-        let resolver =
-            crate::validation::simple::snapshot_prefixes(snapshot, &schema_set.name_table);
-        let Ok(typed) = crate::validation::simple::validate_simple_type_in(
-            &lexical,
-            type_key,
-            schema_set,
-            Some(&resolver),
-        ) else {
-            return Ok(lexical);
+        // The value the run gave the element; else the constraint's literal
+        // read at the schema set's instant, as a schema value.
+        let read;
+        let typed = match validated.typed {
+            Some(typed) => typed,
+            None => {
+                let resolver =
+                    crate::validation::simple::snapshot_prefixes(snapshot, &schema_set.name_table);
+                let Ok(result) = crate::validation::simple::validate_schema_literal(
+                    &lexical,
+                    type_key,
+                    schema_set,
+                    Some(&resolver),
+                ) else {
+                    return Ok(lexical);
+                };
+                read = result.typed_value;
+                &read
+            }
         };
         Ok(self
-            .qname_lexical_in_scope(&typed.typed_value, &lexical)?
+            .qname_lexical_in_scope(typed, &lexical)?
             .unwrap_or(lexical))
     }
 
@@ -886,8 +1016,15 @@ impl<'b, 'a, H> TypedBuilderHandler<'b, 'a, H> {
     fn build_after_end_element(
         &mut self,
         info: &EndElementInfo,
+        ended: Option<EndElementValues<'_>>,
     ) -> Result<(), BufferDocumentError> {
         let valid = info.validity == crate::validation::info::SchemaValidity::Valid;
+        // The element's typed value and [schema normalized value] as the run
+        // found them (`ended`, which the driver lends at every element end):
+        // the text, a union's whitespace and the id entries follow the run's
+        // verdict, whatever the retention flags say. Without them — an end
+        // reported through `after_end_element` — they are computed again.
+        let validated = ended.map_or(Validated::NONE, Validated::ended);
         // Clause 5.1 of Element Locally Valid (Element): an element with no
         // element or character [children] takes its declaration's value
         // constraint, whose {lexical form} is then its [schema normalized
@@ -907,13 +1044,16 @@ impl<'b, 'a, H> TypedBuilderHandler<'b, 'a, H> {
                     let mode = self.whitespace(type_key);
                     match default(self, saw_text) {
                         Some((value, decl)) => {
-                            let text = self.default_text(value, decl, type_key)?;
+                            let text = self.default_text(value, decl, type_key, validated)?;
                             self.builder.replace_pending_text(&text);
                         }
                         None => {
-                            if let Some(normalized) =
-                                self.normalized(self.builder.pending_text(), type_key, mode)
-                            {
+                            if let Some(normalized) = self.normalized(
+                                self.builder.pending_text(),
+                                type_key,
+                                mode,
+                                validated,
+                            ) {
                                 self.builder.replace_pending_text(&normalized);
                             }
                         }
@@ -932,7 +1072,7 @@ impl<'b, 'a, H> TypedBuilderHandler<'b, 'a, H> {
                     let text: String = match default(self, saw_text) {
                         Some((value, decl)) => {
                             held.insert(0, HeldContent::Text(String::new()));
-                            self.default_text(value, decl, type_key)?
+                            self.default_text(value, decl, type_key, validated)?
                         }
                         None => held
                             .iter()
@@ -943,7 +1083,9 @@ impl<'b, 'a, H> TypedBuilderHandler<'b, 'a, H> {
                             .collect(),
                     };
                     let mode = self.whitespace(type_key);
-                    let normalized = self.normalized(&text, type_key, mode).unwrap_or(text);
+                    let normalized = self
+                        .normalized(&text, type_key, mode, validated)
+                        .unwrap_or(text);
                     let mut text = Some(normalized);
                     let mut kept = Vec::with_capacity(held.len());
                     for content in held {
@@ -999,7 +1141,12 @@ impl<'b, 'a, H> TypedBuilderHandler<'b, 'a, H> {
                 self.builder.set_nil(elem_ref);
             }
         }
-        self.builder.end_element()?;
+        // The id and idrefs entries: from the run's typed value, else from a
+        // second validation of the content.
+        match ended {
+            Some(ended) => self.builder.end_element_validated(ended.typed_value)?,
+            None => self.builder.end_element()?,
+        }
         self.elem_ref_stack.pop();
         self.element_decl_stack.pop();
         Ok(())
@@ -1096,15 +1243,45 @@ impl<H: ValidationEventHandler> ValidationEventHandler for TypedBuilderHandler<'
             .map_err(TypedBuildError::Handler)
     }
 
+    /// The end of an element reported without the run's values. The drivers
+    /// never call it — this handler asks for the values
+    /// ([`wants_typed_values`](ValidationEventHandler::wants_typed_values))
+    /// and gets
+    /// [`after_end_element_values`](ValidationEventHandler::after_end_element_values)
+    /// — so it is reached only through a wrapper that forwards neither; the
+    /// element's normalized value and its id / idrefs entries are then
+    /// computed by validating its content again.
     fn after_end_element(
         &mut self,
         info: &EndElementInfo,
         depth: usize,
     ) -> Result<(), Self::Error> {
-        self.build_after_end_element(info)?;
+        self.build_after_end_element(info, None)?;
         self.inner
             .after_end_element(info, depth)
             .map_err(TypedBuildError::Handler)
+    }
+
+    /// The tree follows what the run finds: the typed value and \[schema
+    /// normalized value\] of each element it ends, the typed value of each
+    /// defaulted attribute.
+    fn wants_typed_values(&self) -> bool {
+        true
+    }
+
+    fn after_end_element_values(
+        &mut self,
+        info: &EndElementInfo,
+        values: EndElementValues<'_>,
+        depth: usize,
+    ) -> Result<(), Self::Error> {
+        self.build_after_end_element(info, Some(values))?;
+        if self.inner.wants_typed_values() {
+            self.inner.after_end_element_values(info, values, depth)
+        } else {
+            self.inner.after_end_element(info, depth)
+        }
+        .map_err(TypedBuildError::Handler)
     }
 
     fn on_element_end_offset(&mut self, byte_pos: usize) -> Result<(), Self::Error> {
@@ -1199,6 +1376,17 @@ impl<H: ValidationEventHandler + ?Sized> ValidationEventHandler for LentHandler<
     }
     fn after_end_element(&mut self, info: &EndElementInfo, depth: usize) -> Result<(), H::Error> {
         self.0.after_end_element(info, depth)
+    }
+    fn wants_typed_values(&self) -> bool {
+        self.0.wants_typed_values()
+    }
+    fn after_end_element_values(
+        &mut self,
+        info: &EndElementInfo,
+        values: EndElementValues<'_>,
+        depth: usize,
+    ) -> Result<(), H::Error> {
+        self.0.after_end_element_values(info, values, depth)
     }
     fn on_text(&mut self, kind: TextKind, text: &str) -> Result<(), H::Error> {
         self.0.on_text(kind, text)
