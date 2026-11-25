@@ -227,6 +227,27 @@ pub(crate) fn type_has_qname_values(type_key: TypeKey, schema_set: &SchemaSet) -
     walk(type_key, schema_set, 0)
 }
 
+/// Whether the spelling of the valid value `instance` of `type_key` says too
+/// little to compare it by: the value is a union's or a list's, of a type
+/// whose values can hold QNames ([`type_has_qname_values`]). One spelling is
+/// then a QName where the bindings put it in the type's QName member and
+/// another member's value elsewhere, and two spellings can be one value.
+///
+/// An atomic value needs no such care, and no look at its type: of an
+/// atomic QName type every value is a QName, which is compared by expanded
+/// name wherever a value is compared, and of any other atomic type equal
+/// spellings are equal values.
+pub(crate) fn value_mixes_qname_values(
+    instance: &XmlValue,
+    type_key: TypeKey,
+    schema_set: &SchemaSet,
+) -> bool {
+    matches!(
+        instance.value,
+        XmlValueKind::Union(_) | XmlValueKind::List { .. }
+    ) && type_has_qname_values(type_key, schema_set)
+}
+
 /// Whether values of the simple type `type_key` can be (or contain) `xs:ID`,
 /// `xs:IDREF` or `xs:ENTITY` values — the ones the ID/IDREF table
 /// (Structures §3.17.5.2: "is or is derived from ID, IDREF or IDREFS") and the
@@ -287,7 +308,7 @@ pub(crate) fn fixed_values_equal_in(
     schema_set: &SchemaSet,
 ) -> bool {
     match resolved_pair(a, a_ns, b, b_ns, type_key, schema_set) {
-        Some((a, b)) => typed_values_equal(&a, &b),
+        Some((a_value, b_value)) => typed_literals_equal(&a_value, a, &b_value, b),
         None => {
             let schema = Some(schema_set.schema_clock());
             fixed_values_equal_with(a, schema, b, schema, type_key, schema_set)
@@ -306,18 +327,24 @@ pub(crate) fn fixed_values_identical_in(
     schema_set: &SchemaSet,
 ) -> Option<bool> {
     match resolved_pair(a, a_ns, b, b_ns, Some(type_key), schema_set) {
-        Some((a, b)) => Some(if schema_set.is_xsd10() {
-            typed_values_equal(&a, &b)
+        Some((a_value, b_value)) => Some(if schema_set.is_xsd10() {
+            typed_literals_equal(&a_value, a, &b_value, b)
         } else {
-            super::identity::values_identical(&a, &b)
+            super::identity::literal_values_identical(&a_value, a, &b_value, b)
         }),
         None => fixed_values_identical(a, b, type_key, schema_set),
     }
 }
 
-/// The typed values of two QName-valued literals, each validated with the
-/// bindings it was written with; `None` unless the type has QName values,
-/// both snapshots are known and both literals resolve.
+/// The typed values of two literals of a type with QName values, each
+/// validated with the bindings it was written with; `None` unless the type
+/// has QName values, both snapshots are known and both literals map to a
+/// value there (a prefix bound nowhere leaves a QName in its lexical form).
+///
+/// The pair is given whatever the two values are: under a union one literal
+/// can be a QName and the other, spelled alike under other bindings, a value
+/// of another member type — two values, which a comparison of the spellings
+/// would take for one.
 fn resolved_pair(
     a: &str,
     a_ns: Option<&NamespaceContextSnapshot>,
@@ -337,7 +364,7 @@ fn resolved_pair(
     );
     let a = validate_schema_literal(a, type_key, schema_set, Some(&ra)).ok()?;
     let b = validate_schema_literal(b, type_key, schema_set, Some(&rb)).ok()?;
-    (holds_qname_value(&a.typed_value) && holds_qname_value(&b.typed_value))
+    (!holds_lexical_qname(&a.typed_value) && !holds_lexical_qname(&b.typed_value))
         .then_some((a.typed_value, b.typed_value))
 }
 
@@ -351,13 +378,19 @@ fn resolved_pair(
 /// of the [attribute]" on the declaration. Otherwise (or when the literal does
 /// not resolve) as [`fixed_matches_typed`].
 ///
-/// `values_only` is for a type one of whose XSD 1.1 assertions reads the
-/// current dateTime (`ArenasGuard::reads_clock`), and for no other: such an
-/// assertion can make the instance (read at the run's instant) and the
-/// literal (read at the schema set's, [`validate_schema_literal`]) two values
-/// though they are written alike, so the two values are always compared
-/// ([`fixed_matches_by_value`]). Every other type takes the path above,
-/// whatever XPath expressions the schema set has elsewhere.
+/// `values_only` is for a type whose literal, written alike, can be another
+/// value in the instance than where the declaration stands, and for no other
+/// (`ValidationRuntime::fixed_compared_by_value`): a union's or a list's
+/// value of a type whose values can hold QNames
+/// ([`value_mixes_qname_values`]: the bindings differ, and a union gives the
+/// spelling of a QName to another member type; an atomic QName is compared
+/// by expanded name below),
+/// and a type one of whose XSD 1.1 assertions reads the current dateTime
+/// (`ArenasGuard::reads_clock`: the instance is read at the run's instant,
+/// the literal at the schema set's, [`validate_schema_literal`]). For these
+/// the two values are always compared ([`fixed_matches_by_value`]). Every
+/// other type takes the path above, whatever XPath expressions the schema
+/// set has elsewhere.
 pub(crate) fn fixed_matches_typed_in(
     instance_raw: &str,
     instance_typed: &XmlValue,
@@ -432,13 +465,15 @@ fn fixed_matches_by_value(
     if holds_lexical_qname(&literal.typed_value) {
         return None;
     }
-    Some(
-        if holds_qname_value(instance_typed) && holds_qname_value(&literal.typed_value) {
-            typed_values_equal(instance_typed, &literal.typed_value)
-        } else {
-            typed_literals_equal(instance_typed, instance_raw, &literal.typed_value, fixed)
-        },
-    )
+    // With the literals beside the values: a date/time member whose seconds
+    // have more fraction digits than its value holds is compared as written,
+    // in a list with QNames as anywhere else.
+    Some(typed_literals_equal(
+        instance_typed,
+        instance_raw,
+        &literal.typed_value,
+        fixed,
+    ))
 }
 
 /// Whether the enumeration literal `literal` (an `xs:QName` / `xs:NOTATION`
@@ -814,7 +849,7 @@ pub(crate) fn xsd10_fixed_matches(
         // (its members' forms joined by single spaces).
         (None, Some(_)) => {
             let canonical = xsd10_canonical_form(v, value_lexical);
-            let normalized = governing_normalized(&canonical, governing, schema_set);
+            let normalized = governing_normalized(&canonical, governing, actual, schema_set);
             read_and_compare_10(a, actual_text, &normalized, value_ns, schema_set)
         }
         (None, None) => atomic_matches_10(
@@ -824,17 +859,30 @@ pub(crate) fn xsd10_fixed_matches(
             value_lexical,
             value_ns,
             schema_set,
-            |c| governing_normalized(c, governing, schema_set),
+            |c| governing_normalized(c, governing, actual, schema_set),
         ),
     }
 }
 
-/// `literal` normalized with the white space of the governing type.
+/// `literal` normalized with the white space of the governing type, for the
+/// comparison with the item's value `actual`. A union has none of its own:
+/// "the normalization behavior of ·union· types is controlled by the value
+/// of whiteSpace on that one of the ·memberTypes· against which the ·union·
+/// is successfully validated" (Datatypes 1.0 §4.3.6) — the member type the
+/// item's value was read as ([`member_whitespace`]). Validating the literal
+/// against the members again would have no namespace bindings, and take a
+/// prefixed name for a QName member where the item's is a string.
 fn governing_normalized(
     literal: &str,
     governing: Option<TypeKey>,
+    actual: &XmlValue,
     schema_set: &SchemaSet,
 ) -> String {
+    if matches!(actual.value, XmlValueKind::Union(_)) {
+        if let Some(mode) = member_whitespace(actual, schema_set) {
+            return normalize_whitespace(literal, mode).into_owned();
+        }
+    }
     match governing {
         Some(tk) => normalized_literal(literal, tk, schema_set)
             .map(|n| n.into_owned())
@@ -1758,7 +1806,10 @@ pub(crate) fn whitespace_changes(text: &str, mode: WhitespaceMode) -> Option<Str
 /// normalization is that of the member type that accepts the value
 /// (Datatypes §4.3.6), found by validating `text` against the members
 /// ([`normalized_literal`]) — a pure function of the text for every union but
-/// one that reads the current dateTime (`ArenasGuard::reads_clock`). For such
+/// one that reads the current dateTime (`ArenasGuard::reads_clock`) and one
+/// with a member type of QName values ([`type_has_qname_values`]: which
+/// member takes a prefixed name depends on the bindings where it is written,
+/// and that second validation has none). For such
 /// a union a second validation could take another member than the validation
 /// run did, so the normalization comes from what the run found: the member
 /// of the run's typed value, `typed` ([`member_whitespace`]), or the run's
@@ -1777,7 +1828,7 @@ pub(crate) fn validated_normalized(
     if let Some(mode) = content_whitespace(type_key, schema_set) {
         return whitespace_changes(text, mode);
     }
-    if !schema_set.arenas.reads_clock(type_key) {
+    if !schema_set.arenas.reads_clock(type_key) && !type_has_qname_values(type_key, schema_set) {
         let normalized = normalized_literal(text, type_key, schema_set)?;
         return (normalized != text).then(|| normalized.into_owned());
     }
@@ -1798,7 +1849,6 @@ pub(crate) fn validated_normalized(
 /// validated"), read from the typed value its validation gave — the member's
 /// value inside the union value (inside each nested union's), `collapse` for
 /// a list member. `None` when the value does not say (no member type on it).
-#[cfg(feature = "xsd11")]
 pub(crate) fn member_whitespace(
     typed: &XmlValue,
     schema_set: &SchemaSet,

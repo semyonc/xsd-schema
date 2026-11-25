@@ -165,6 +165,34 @@ corpora give the same results.
   before the end, a last character with unused bits set, any other character.
   The octets, and so `length`, `enumeration`, `fixed` and identity
   constraints, do not depend on the spaces; a `pattern` sees them.
+- A `fixed` value of a type whose values can be `xs:QName`s (also a union
+  with such a member type, or a list of one) is compared with the instance by
+  value, the literal read with the namespace bindings of its declaration
+  (Structures §3.3.4.3 clause 5.2.2.2.2, §3.2.4.3 clause 4). The comparison
+  used to accept equal spellings first, and read the literal without those
+  bindings when the instance held no QName. For a union of a QName
+  enumeration and `xs:string`, with `fixed="q:k"`: an instance `q:k` that is
+  the other kind of value (a QName where the fixed value is the string, or
+  the string where it is a QName) was accepted and is now rejected
+  (`cvc-attribute.4`, `cvc-elt.5.2.2`); with `xs:token` as the member type,
+  ` q:k ` with white space was rejected though it is the fixed token, and is
+  now accepted. XSD 1.0 compares an element with the canonical form of the
+  value, as before; under a union it now normalizes that form with the white
+  space of the member type the element's value was read as, where it used to
+  validate the form against the members again, without bindings (seen under
+  an `xsi:type`: a fixed string ` q:k ` rejected, `q:k` accepted). A list
+  with a QName and a date/time member whose seconds have more fraction digits
+  than a value holds is compared with the seconds as written for an attribute
+  too. A typed document (`xsd11`) gives a value of such a union the white
+  space of the member type the run read it as: a string member keeps its
+  spaces, a QName member written with another prefix loses them.
+- Schema: an attribute use, or a restriction, that repeats the `fixed` value
+  of a type with QName values is compared with the declaration's value, each
+  literal read with the bindings where it is written (Attribute Use
+  Properties Correct, Structures §3.5.6 clause 2). `fixed="q:k"` on a use
+  that binds `q` to another namespace, making it the string member of a union
+  where the declaration has the QName, was accepted and is now an error
+  (`au-props-correct`).
 - XSD 1.1: one validation run has one current dateTime (Structures §3.13.4.2
   clause 6: "The current dateTime is ·implementation-defined·, but is
   constant during an ·assessment· episode"). Every assertion (`xs:assert`, an

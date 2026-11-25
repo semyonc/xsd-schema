@@ -4269,6 +4269,33 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         }
     }
 
+    /// Whether the `fixed` literal of a declaration is compared with the
+    /// valid instance value `instance`, read under `type_key`, by the {value}
+    /// the schema set reads from the literal — with the bindings of the
+    /// declaration it is written on — and never by its spelling
+    /// (`fixed_matches_by_value`):
+    ///
+    /// - a union's or a list's value of a type whose values can hold
+    ///   `xs:QName` / `xs:NOTATION` values
+    ///   ([`value_mixes_qname_values`](super::simple::value_mixes_qname_values)).
+    ///   The same spelling is one value where the declaration stands and
+    ///   another in the instance — for a union with another member type, a
+    ///   QName here and a string there — and two spellings can be one value.
+    ///   Structures §3.3.4.3 clause 5.2.2.2.2 and §3.2.4.3 clause 4 compare
+    ///   ·actual values·. (An atomic QName is compared by expanded name on
+    ///   every path already.);
+    /// - a type one of whose assertions reads the current dateTime
+    ///   ([`literal_values_may_vary`](Self::literal_values_may_vary)).
+    ///
+    /// For every other value the two readings of a literal are one value,
+    /// and equal spellings are equal values.
+    fn fixed_compared_by_value(&self, type_key: Option<TypeKey>, instance: &XmlValue) -> bool {
+        self.literal_values_may_vary(type_key)
+            || type_key.is_some_and(|tk| {
+                super::simple::value_mixes_qname_values(instance, tk, self.schema_set)
+            })
+    }
+
     /// The `&self` scan behind
     /// [`process_absent_attribute_uses`](Self::process_absent_attribute_uses),
     /// borrowing the element's seen attributes straight from the validation
@@ -5208,22 +5235,27 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                         .unwrap_or_else(|| TypeKey::Complex(schema_set.any_type_key()));
                     // The {value} the schema reads (a schema property): compared
                     // with under another governing type, and under the declared
-                    // one too when an assertion of it reads the current
-                    // dateTime (`literal_values_may_vary`), so that both paths
-                    // compare with the one {value}.
+                    // one too when its values can hold QNames (the spelling of
+                    // one is another value in the instance) or an assertion of
+                    // it reads the current dateTime
+                    // (`fixed_compared_by_value`), so that both paths compare
+                    // with the one {value}.
                     let by_record = ev_state.schema_type != Some(declared)
-                        || self.literal_values_may_vary(Some(declared));
+                        || ev_state.typed_value.as_ref().is_some_and(|typed| {
+                            self.fixed_compared_by_value(Some(declared), typed)
+                        });
                     let declared_value = ev_state
                         .typed_value
                         .as_ref()
                         .filter(|_| !substituted_fixed && by_record)
-                        .and_then(|_| schema_set.value_constraint_value(elem_data))
-                        .filter(|(_, value)| value.type_code != XmlTypeCode::UntypedAtomic);
+                        .and_then(|_| schema_set.element_value_constraint_value(elem_key))
+                        .filter(|record| record.1.type_code != XmlTypeCode::UntypedAtomic);
                     let matches = if substituted_fixed {
                         true
-                    } else if let (Some((lexical, value)), Some(typed)) =
+                    } else if let (Some(record), Some(typed)) =
                         (&declared_value, &ev_state.typed_value)
                     {
+                        let (lexical, value) = (&record.0, &record.1);
                         if schema_set.is_xsd10() {
                             super::simple::xsd10_fixed_matches(
                                 typed,
@@ -5254,7 +5286,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                                 .value_constraint_namespaces(elem_data.source.as_ref()),
                             ev_state.schema_type,
                             self.schema_set,
-                            self.literal_values_may_vary(ev_state.schema_type),
+                            self.fixed_compared_by_value(ev_state.schema_type, typed),
                         )
                     } else {
                         super::simple::fixed_values_equal_at(
@@ -7462,7 +7494,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                         .value_constraint_namespaces(fixed_source.as_ref()),
                     attr_type,
                     self.schema_set,
-                    self.literal_values_may_vary(attr_type),
+                    self.fixed_compared_by_value(attr_type, tv),
                 )
             } else {
                 super::simple::fixed_values_equal_at(
@@ -8261,7 +8293,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                             fixed_ns,
                             attr_type,
                             self.schema_set,
-                            self.literal_values_may_vary(attr_type),
+                            self.fixed_compared_by_value(attr_type, tv),
                         )
                     } else {
                         super::simple::fixed_values_equal_at(
@@ -8391,7 +8423,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                             fixed_ns,
                             attr_type,
                             self.schema_set,
-                            self.literal_values_may_vary(attr_type),
+                            self.fixed_compared_by_value(attr_type, tv),
                         )
                     } else {
                         super::simple::fixed_values_equal_at(

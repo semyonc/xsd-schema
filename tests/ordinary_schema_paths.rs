@@ -205,10 +205,34 @@ fn the_matrix_validates_what_it_says() {
             assert_eq!(others, [""; 0], "{shape:?}, q = {q_ns}:\n{verdict}");
         }
     }
-    // With `q` bound to the enumeration's namespace the document written as
-    // the literals is valid as a whole.
-    let literal = stream(Shape::Literal, "urn:a");
-    assert_eq!(literal, "root validity: Some(Valid)\n");
+    // Those six, written as the literals, are valid where the document's `q`
+    // makes the text the value the declaration's `q` made the literal
+    // (Structures §3.3.4.3 clause 5.2.2.2.2, §3.2.4.3 clause 4: the ·actual
+    // values· are compared, not the spellings). Three are declared where `q`
+    // is `urn:b`: their literal is the string member's value, and a document
+    // that binds `q` to the enumeration's `urn:a` writes a QName, another
+    // value. The other three are declared where `q` is `urn:a`: their
+    // literal is the QName, and a document that binds `q` elsewhere writes
+    // the string member's value, or no value of the enumeration.
+    let declared_elsewhere = [
+        "union of QName enumeration",
+        "list of that union",
+        "union of QName enumeration, spaces",
+    ];
+    let qnames = [
+        "union, QName member, spaces",
+        "union, QName member",
+        "QName enumeration",
+    ];
+    for q_ns in Q_NAMESPACES {
+        let verdict = stream(Shape::Literal, q_ns);
+        let expected = if q_ns == "urn:a" {
+            declared_elsewhere
+        } else {
+            qnames
+        };
+        assert_eq!(reported_in(&verdict), expected, "q = {q_ns}:\n{verdict}");
+    }
     assert_eq!(errors(&stream(Shape::Empty, "urn:a")), 0);
 
     // Another value: each fixed element and each fixed attribute is reported

@@ -286,6 +286,18 @@ impl SchemaSet {
             .and_then(|r| r.value.map(|value| (r.lexical_form, value)))
     }
 
+    /// [`value_constraint_value`](Self::value_constraint_value) of the
+    /// declaration `element`, read once per schema set and kept: every
+    /// element the declaration governs is compared with the same {value}.
+    pub(crate) fn element_value_constraint_value(
+        &self,
+        element: ElementKey,
+    ) -> Option<std::sync::Arc<crate::arenas::ValueConstraint>> {
+        self.arenas.element_value_constraint(element, || {
+            self.value_constraint_value(self.arenas.elements.get(element)?)
+        })
+    }
+
     /// The declaration `element` names: itself, or the one a reference entry
     /// resolves to.
     fn element_declaration(&self, element: ElementKey) -> Option<&ElementDeclData> {

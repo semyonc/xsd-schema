@@ -437,6 +437,10 @@ impl SchemaArenas {
     }
 }
 
+/// The {lexical form} and the {value} of a value constraint (Structures
+/// §3.3.2.1), as the schema set reads them from the declaration.
+pub(crate) type ValueConstraint = (String, crate::types::value::XmlValue);
+
 /// Read-transparent, mutation-gated wrapper around [`SchemaArenas`].
 ///
 /// `SchemaSet` stores its arenas behind this guard so the lazily-computed
@@ -482,6 +486,12 @@ pub struct ArenasGuard {
     /// complex type: its facets are no simple type's.
     simple_content_enumeration_index_cache:
         RwLock<SecondaryMap<ComplexTypeKey, Arc<EnumerationIndex>>>,
+    /// Per element declaration, the {lexical form} and {value} of its value
+    /// constraint (`None`: it has none, or its {value} is not known), read on
+    /// first use — a schema property, the same for every element the
+    /// declaration governs — and invalidated with the caches above by
+    /// [`entries_mut`](Self::entries_mut).
+    element_value_constraint_cache: RwLock<SecondaryMap<ElementKey, Option<Arc<ValueConstraint>>>>,
     /// XSD 1.1: per type, whether validating a value against it can read the
     /// current dateTime ([`reads_clock`](Self::reads_clock)), decided on
     /// first use and invalidated with the caches above by
@@ -513,6 +523,10 @@ impl ArenasGuard {
         self.effective_facets_cache.get_mut().unwrap().clear();
         self.enumeration_index_cache.get_mut().unwrap().clear();
         self.simple_content_enumeration_index_cache
+            .get_mut()
+            .unwrap()
+            .clear();
+        self.element_value_constraint_cache
             .get_mut()
             .unwrap()
             .clear();
@@ -604,6 +618,25 @@ impl ArenasGuard {
             .unwrap()
             .insert(sk, Arc::clone(&built));
         built
+    }
+
+    /// The {lexical form} and {value} of the value constraint of the element
+    /// declaration `key`, read by `read` the first time and kept: what a
+    /// fixed value constraint compares each element's ·actual value· with.
+    pub(crate) fn element_value_constraint(
+        &self,
+        key: ElementKey,
+        read: impl FnOnce() -> Option<ValueConstraint>,
+    ) -> Option<Arc<ValueConstraint>> {
+        if let Some(known) = self.element_value_constraint_cache.read().unwrap().get(key) {
+            return known.clone();
+        }
+        let constraint = read().map(Arc::new);
+        self.element_value_constraint_cache
+            .write()
+            .unwrap()
+            .insert(key, constraint.clone());
+        constraint
     }
 
     /// [`enumeration_index`](Self::enumeration_index) for the simple content
