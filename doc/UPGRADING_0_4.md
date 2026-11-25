@@ -20,7 +20,7 @@ block is compiled and run with the crate.
 
 0.4 needs Rust 1.88 or later (0.3.x: 1.85). quick-xml 0.42 and lalrpop 0.23
 need 1.86, and the ICU4X 2.4 crates behind regexml-fork 0.4 (the `xsd11`
-feature) need 1.88. 0.3.1 stays the release for Rust 1.85 to 1.87: a project on
+feature) need 1.88. 0.3.2 stays the release for Rust 1.85 to 1.87: a project on
 those toolchains keeps `xsd-schema = "0.3"`.
 
 ## 2. Code changes
@@ -135,7 +135,7 @@ assert_eq!(dynamic.effective_implicit_timezone(), TimezoneOffset::UTC);
 
 Validation verdicts do not change on the test suites: the W3C XSD 1.0 and 1.1
 suites, the XPath 2.0 tests of XQTS and the GAEB and WSDL corpora give the same
-results as with 0.3.1, failures included by name.
+results as with 0.3.2, failures included by name.
 
 - **The implicit timezone (`xsd11`)** of an XPath evaluation that sets none is
   UTC, no longer the host's local offset (the process's `TZ`). A date/time

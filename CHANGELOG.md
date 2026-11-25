@@ -14,10 +14,10 @@ crate's API. The XPath engine (`xsd11`) takes UTC as the implicit timezone when
 none is set, instead of the host's local offset, and the crate no longer
 depends on `chrono`. Code that uses none of the items under *Breaking changes*
 and builds with Rust 1.88 needs no change; [Upgrading to 0.4](doc/UPGRADING_0_4.md)
-has the 0.3.x and the 0.4 code for each item. 0.3.1 stays the release for Rust
+has the 0.3.x and the 0.4 code for each item. 0.3.2 stays the release for Rust
 1.85 to 1.87.
 
-Conformance is unchanged against 0.3.1: the W3C XSD 1.0 suite passes 39,461 of
+Conformance is unchanged against 0.3.2: the W3C XSD 1.0 suite passes 39,461 of
 39,510 tests, the XSD 1.1 suite 2,313 of 2,319 and the XPath 2.0 tests of XQTS
 8,047 of 8,047, with the same failures by name; the GAEB DA XML 3.3 and WSDL
 corpora give the same results.
