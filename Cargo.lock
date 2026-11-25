@@ -1523,7 +1523,7 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 
 [[package]]
 name = "xsd-schema"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "ahash",
  "base64",

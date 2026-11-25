@@ -294,6 +294,61 @@ corpora give the same results.
   990-item NF-e document executes 0.7 % fewer. Schema documents are read the
   same way.
 
+## [0.3.2] - 2026-11-24
+
+This release removes no public item and changes no signature. It has two
+changes, both for schemas with substitution groups and both reported against
+0.3.1 with XBRL schemas: the XBRL 2.1 instance and linkbase schemas now load,
+and a schema with a large substitution group compiles in a fraction of the
+time.
+
+Conformance is unchanged against 0.3.1: the W3C XSD 1.0 suite passes 39,461
+of 39,510 tests, the XSD 1.1 suite 2,313 of 2,319 and the XPath 2.0 tests of
+XQTS 8,047 of 8,047, with the same failures by name; the GAEB DA XML 3.3 and
+WSDL corpora give the same results.
+
+### Fixed
+
+- A complex-content restriction that names a member of a substitution group
+  where the base names the head is no longer rejected with
+  `derivation-ok-restriction` because of the member's own declaration — a type
+  that extends the head's, `nillable`, a different `fixed` value or `block`
+  ([#36](https://github.com/semyonc/xsd-schema/issues/36)). The check compared
+  the member with the head; the declaration it answers to is the member
+  itself (XSD 1.0 §3.9.6 Particle Valid (Restriction)
+  clause 2.1, where the head's particle stands for a choice of the members of
+  its group; XSD 1.1 §3.4.6.4 clause 2, where the governing declaration of
+  such an element is the member's). What a member's type owes the head's is
+  Element Declaration Properties Correct, which was and is checked. The XBRL
+  2.1 linkbase schema (`link:presentationArc` for `xl:arc`, `link:loc` for
+  `xl:locator`, …) loads with this.
+
+  Under XSD 1.0 a member accepted by this rule has to occur once where it is
+  written, as its particle in that choice does: `bar` with `maxOccurs="2"`
+  against the head with `maxOccurs="3"` stays invalid (W3C `particlesV020`),
+  while a repeated choice of `bar` is accepted. XSD 1.1 compares the element
+  sequences, so it accepts both. Restrictions that were accepted before are
+  accepted as before.
+
+### Performance
+
+- Compiling a schema with a large substitution group no longer takes time
+  quadratic in the size of the group
+  ([#37](https://github.com/semyonc/xsd-schema/issues/37)). Every sequence,
+  choice and `xs:all` with a reference to the head collected the names of all
+  the members of the group, for a wildcard with `notQName="##definedSibling"`
+  to exclude, whether or not it had such a wildcard, and found the members by
+  scanning every element declaration once per member. The names are now
+  collected only for a group that has a wildcard to read them, through an
+  index of the declarations by head. With 4,000 members and 400 types that
+  refer to the head, schema compilation goes from 18.0 s to 0.52 s and the
+  construction of a `SchemaValidator` from 17.3 s to 1 ms; with a
+  `##definedSibling` wildcard in each type, from 16.4 s and 16.3 s to 0.50 s
+  and 0.10 s. On the ESMA ESEF 2025 taxonomy (5,546 element declarations,
+  most of them in the substitution group of `xbrli:item`) it is 37 ms instead
+  of 110 ms, and under 1 ms instead of 72 ms. Validation results are
+  unchanged. `benches/schema_compile.rs` measures the case.
+
 ## [0.3.1] - 2026-11-08
 
 This release removes no public item and changes no signature. It is faster
@@ -3437,7 +3492,8 @@ Performance-focused release. No breaking changes to the public API.
 Initial release: XML Schema (XSD 1.0/1.1) validator with PSVI and a built-in
 XPath 2.0 engine.
 
-[Unreleased]: https://github.com/semyonc/xsd-schema/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/semyonc/xsd-schema/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/semyonc/xsd-schema/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/semyonc/xsd-schema/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/semyonc/xsd-schema/compare/v0.2.3...v0.3.0
 [0.2.3]: https://github.com/semyonc/xsd-schema/compare/v0.2.2...v0.2.3

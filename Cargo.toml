@@ -1,6 +1,6 @@
 [package]
 name = "xsd-schema"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 rust-version = "1.88"
 authors = ["semyonc"]
@@ -147,6 +147,12 @@ required-features = ["xsd11"]
 [[bench]]
 name = "regex_functions"
 path = "benches/regex_functions.rs"
+harness = false
+required-features = ["xsd11"]
+
+[[bench]]
+name = "schema_compile"
+path = "benches/schema_compile.rs"
 harness = false
 required-features = ["xsd11"]
 
