@@ -799,15 +799,97 @@ fn binary_octets_are_the_decoders() {
     for _ in 0..200_000 {
         let n = r.next() % 13;
         let s: String = (0..n).map(|_| r.pick(&b64)).collect();
-        let plan = values::base64_octets(&s);
-        let runtime = base64::engine::general_purpose::STANDARD.decode(s.as_bytes());
-        assert_eq!(plan, runtime.ok().map(|o| o.len()), "{s:?}");
+        // The plan reads the collapsed form; a form without a space is the
+        // decoder's own.
+        let collapsed = crate::types::facets::normalize_whitespace(
+            &s,
+            crate::types::facets::WhitespaceMode::Collapse,
+        );
+        let plan = values::base64_octets(&collapsed);
+        let octets = |value: crate::types::value::XmlValue| match value.value {
+            crate::types::value::XmlValueKind::Atomic(
+                crate::types::value::XmlAtomicValue::Base64Binary(octets),
+            ) => octets.len(),
+            other => panic!("{other:?}"),
+        };
+        let validator = crate::types::validators::Base64BinaryValidator;
+        let runtime = crate::types::validators::TypeValidator::validate(&validator, &s).map(octets);
+        assert_eq!(plan, runtime.ok(), "{s:?}");
+        if !s.contains(' ') {
+            let decoded = base64::engine::general_purpose::STANDARD.decode(s.as_bytes());
+            assert_eq!(plan, decoded.ok().map(|o| o.len()), "{s:?}");
+        }
     }
     // Longer than one chunk, padding only at the end.
     let long = "QUJD".repeat(700) + "QQ==";
     assert_eq!(values::base64_octets(&long), Some(2101));
     let padded_inside = "QQ==".repeat(400);
     assert_eq!(values::base64_octets(&padded_inside), None);
+    // The same two wrapped in lines of 76 and of 4 characters (collapsed: one
+    // space between the lines), across the chunk boundary.
+    let wrapped = |text: &str, width: usize| {
+        text.as_bytes()
+            .chunks(width)
+            .map(|line| std::str::from_utf8(line).unwrap())
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    for width in [76, 4, 1] {
+        assert_eq!(
+            values::base64_octets(&wrapped(&long, width)),
+            Some(2101),
+            "{width}"
+        );
+        assert_eq!(
+            values::base64_octets(&wrapped(&padded_inside, width)),
+            None,
+            "{width}"
+        );
+    }
+    // The end of the data on either side of a chunk boundary, with the
+    // spaces the grammar allows around the padding: the plan counts what the
+    // validator decodes.
+    let validated = |s: &str| {
+        let validator = crate::types::validators::Base64BinaryValidator;
+        match crate::types::validators::TypeValidator::validate(&validator, s) {
+            Ok(value) => match value.value {
+                crate::types::value::XmlValueKind::Atomic(
+                    crate::types::value::XmlAtomicValue::Base64Binary(octets),
+                ) => Some(octets.len()),
+                other => panic!("{other:?}"),
+            },
+            Err(_) => None,
+        }
+    };
+    for quanta in 252..=258 {
+        for tail in [
+            "",
+            "QUJD",
+            "QQ==",
+            "QQ= =",
+            "QQ ==",
+            "Q Q==",
+            "Q Q = =",
+            "QUI=",
+            "QUI =",
+            "QU I=",
+            "Q UI =",
+            "QQ==QUJD",
+            "QQ= = QUJD",
+            "QQ=",
+            "QR==",
+            "QUJ=",
+        ] {
+            for lead in ["", "QUJD ", "Q UJD"] {
+                let form = format!("{lead}{}{tail}", "QUJD".repeat(quanta));
+                assert_eq!(
+                    values::base64_octets(&form),
+                    validated(&form),
+                    "{quanta} {lead:?} {tail:?}"
+                );
+            }
+        }
+    }
     let hex = ["0", "a", "F", "g", " ", "9"];
     for _ in 0..100_000 {
         let n = r.next() % 7;
@@ -987,6 +1069,9 @@ fn value_constraints_and_ids_as_shipped() {
         "<r><f>1.50</f><d>2001-12-31</d></r>",
         "<r Id='a'><s Id='b'>QUJD</s></r>",
         "<r Id='a'><s Id='b' Algorithm='urn:a'>QUJDRA==</s></r>",
+        // Base64 with a space after a character (Datatypes §3.3.16.2 [33]).
+        "<r><s>QUJD RA==</s></r>",
+        "<r><s>\n  QUJD\n  RA= =\n</s></r>",
     ] {
         assert_eq!(verdicts(&set, &plan, doc), (true, true), "{doc}");
     }
@@ -997,7 +1082,9 @@ fn value_constraints_and_ids_as_shipped() {
         "<r><f> 1.50 </f></r>",
         "<r Id='a'><s Id='a'>QUJD</s></r>",
         "<r><s Algorithm='urn:b'>QUJD</s></r>",
-        "<r><s>QUJD RA==</s></r>",
+        // Not Base64: `=` before the end, a character outside the alphabet.
+        "<r><s>QQ== QUJD</s></r>",
+        "<r><s>QUJD*A==</s></r>",
     ] {
         assert!(!verdicts(&set, &plan, doc).0, "{doc}");
     }

@@ -154,6 +154,17 @@ corpora give the same results.
 
 ### Fixed
 
+- `xs:base64Binary` accepts Base64 with white space between its characters,
+  so a value wrapped in lines is valid. Datatypes §3.3.16.2 allows a space
+  after each character but the last (`B64 ::= B64char #x20?`) and the type's
+  whiteSpace is `collapse`: "Any string compatible with either RFC can occur
+  in an element or attribute validated by this type". Every earlier release
+  rejected such a value (`Invalid symbol 32`); a value on one line, with white
+  space only around it, was always accepted. What the grammar excludes is
+  still invalid: a number of characters that is not a multiple of four, `=`
+  before the end, a last character with unused bits set, any other character.
+  The octets, and so `length`, `enumeration`, `fixed` and identity
+  constraints, do not depend on the spaces; a `pattern` sees them.
 - XSD 1.1: one validation run has one current dateTime (Structures §3.13.4.2
   clause 6: "The current dateTime is ·implementation-defined·, but is
   constant during an ·assessment· episode"). Every assertion (`xs:assert`, an

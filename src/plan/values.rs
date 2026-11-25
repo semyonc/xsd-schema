@@ -762,26 +762,76 @@ pub(crate) fn hex_octets(v: &str) -> Option<usize> {
 /// decoded as the validator decodes it (`base64`'s standard engine: padding
 /// required, canonical trailing bits), in chunks of whole quanta: no
 /// allocation. A chunk before the last one with padding answers `None`.
+///
+/// The single spaces a collapsed form may have between its characters
+/// (Datatypes §3.3.16.2 \[33\] `B64 ::= B64char #x20?`: a literal wrapped in
+/// lines) carry no data. A form without one is decoded where it stands, and
+/// is not searched for one: the decoder refuses the first chunk that has a
+/// space, and from there the characters are gathered into chunks without
+/// the spaces ([`base64_octets_spaced`]).
 #[inline(never)]
 pub(crate) fn base64_octets(v: &str) -> Option<usize> {
     use base64::Engine;
-    const CHUNK: usize = 1024;
+    let engine = &base64::engine::general_purpose::STANDARD;
     let b = v.as_bytes();
-    let mut out = [0u8; CHUNK];
+    let mut out = [0u8; BASE64_CHUNK];
     let mut total = 0;
     let mut i = 0;
     loop {
-        let end = (i + CHUNK).min(b.len());
+        let end = (i + BASE64_CHUNK).min(b.len());
         let chunk = &b[i..end];
+        // Padding with characters after it (a collapsed form does not end in
+        // a space) is at the end only when what follows is the second `=`
+        // of `= =`: with a space, the form is read without its spaces.
         if end < b.len() && chunk.contains(&b'=') {
-            return None;
+            return if b[i..].contains(&b' ') {
+                base64_octets_spaced(&b[i..]).map(|rest| total + rest)
+            } else {
+                None
+            };
         }
-        total += base64::engine::general_purpose::STANDARD
-            .decode_slice(chunk, &mut out)
-            .ok()?;
+        match engine.decode_slice(chunk, &mut out) {
+            Ok(octets) => total += octets,
+            Err(_) if chunk.contains(&b' ') => {
+                return base64_octets_spaced(&b[i..]).map(|rest| total + rest);
+            }
+            Err(_) => return None,
+        }
         i = end;
         if i >= b.len() {
             return Some(total);
         }
     }
+}
+
+/// The characters of a quantum-aligned stretch of Base64 the plan decodes at
+/// once.
+const BASE64_CHUNK: usize = 1024;
+
+/// [`base64_octets`] of a form with spaces, from a quantum boundary on: its
+/// characters other than spaces, gathered into chunks of the same size.
+#[cold]
+fn base64_octets_spaced(b: &[u8]) -> Option<usize> {
+    use base64::Engine;
+    let engine = &base64::engine::general_purpose::STANDARD;
+    let mut out = [0u8; BASE64_CHUNK];
+    let mut packed = [0u8; BASE64_CHUNK];
+    let (mut filled, mut total) = (0, 0);
+    for &byte in b {
+        if byte == b' ' {
+            continue;
+        }
+        if filled == BASE64_CHUNK {
+            // A character follows, so this chunk is not the last one.
+            if packed.contains(&b'=') {
+                return None;
+            }
+            total += engine.decode_slice(&packed[..], &mut out).ok()?;
+            filled = 0;
+        }
+        packed[filled] = byte;
+        filled += 1;
+    }
+    total += engine.decode_slice(&packed[..filled], &mut out).ok()?;
+    Some(total)
 }

@@ -1919,9 +1919,32 @@ impl TypeValidator for Base64BinaryValidator {
 
     fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
         use base64::Engine;
-        let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
-        base64::engine::general_purpose::STANDARD
-            .decode(normalized.as_bytes())
+        // Datatypes §3.3.16.2: "the 65 characters of the Base64 Alphabet …
+        // together with the space character (#x20)" — after each character
+        // but the last, [33] `B64 ::= B64char #x20?` (also [35], [37], and
+        // between the two `=` of [32]). whiteSpace is `collapse`, so a
+        // literal wrapped in lines arrives here with single spaces: "Any
+        // string compatible with either RFC can occur in an element or
+        // attribute validated by this type". The spaces carry no data; the
+        // rest is the Base64 encoding the decoder checks (a multiple of four
+        // characters, `=` only at the end, [36] and [38] for the last
+        // character before it).
+        //
+        // Collapsing leaves one space where the literal had white space and
+        // none around it, and the grammar takes a space after any character
+        // but the last: so the literal is in the lexical space exactly when
+        // its characters other than XML white space are that encoding. A
+        // literal without white space is decoded where it stands; any other
+        // is decoded once, without it.
+        let xml_space = |byte: &u8| matches!(byte, b' ' | b'\t' | b'\n' | b'\r');
+        let engine = &base64::engine::general_purpose::STANDARD;
+        let decoded = if value.as_bytes().iter().any(xml_space) {
+            let packed: Vec<u8> = value.bytes().filter(|byte| !xml_space(byte)).collect();
+            engine.decode(packed)
+        } else {
+            engine.decode(value.as_bytes())
+        };
+        decoded
             .map(|bytes| {
                 XmlValue::new(
                     XmlTypeCode::Base64Binary,
@@ -4613,6 +4636,93 @@ mod tests {
         let v = Base64BinaryValidator;
         let result = v.validate("SGVsbG8=").unwrap();
         assert_eq!(result.type_code, XmlTypeCode::Base64Binary);
+    }
+
+    /// Datatypes §3.3.16.2: a space may follow each character but the last
+    /// (\[33\] `B64 ::= B64char #x20?`, \[35\], \[37\], and between the
+    /// two `=` of \[32\]), and whiteSpace is `collapse` — so Base64 wrapped
+    /// in lines, as RFC 2045 writes it, is a lexical representation.
+    #[test]
+    fn base64_binary_takes_the_spaces_of_the_grammar() {
+        let octets = |input: &str| match Base64BinaryValidator.validate(input) {
+            Ok(XmlValue {
+                value: XmlValueKind::Atomic(XmlAtomicValue::Base64Binary(octets)),
+                ..
+            }) => Some(octets),
+            Ok(other) => panic!("{other:?}"),
+            Err(_) => None,
+        };
+        let abc = Some(b"abcdefghijklmnop".to_vec());
+        for input in [
+            "YWJjZGVmZ2hpamtsbW5vcA==",
+            "  YWJjZGVmZ2hpamtsbW5vcA==\n",
+            "YWJjZGVmZ2hp\namtsbW5vcA==",
+            "YWJjZGVmZ2hp\r\n      amtsbW5vcA==",
+            "Y W J j Z G V m Z 2 h p a m t s b W 5 v c A = =",
+            "YWJjZGVmZ2hpamtsbW5vcA= =",
+            "YWJjZGVmZ2hpamtsbW5vcA ==",
+        ] {
+            assert_eq!(octets(input), abc, "{input:?}");
+        }
+        assert_eq!(octets("YW Jj"), Some(b"abc".to_vec()));
+        assert_eq!(octets("YWI ="), Some(b"ab".to_vec()));
+        assert_eq!(octets(""), Some(Vec::new()));
+        assert_eq!(octets(" \n "), Some(Vec::new()));
+        for input in [
+            // Not a multiple of four characters; `=` before the end.
+            "YW J",
+            "YQ==YQ==",
+            "YQ== YQ==",
+            "=",
+            // \[36\] and \[38\]: the last character before the padding.
+            "YWJ=",
+            "YR==",
+            "Y R = =",
+            // No other character, and no other white space after collapsing.
+            "YW*j",
+            "YW\u{a0}Jj",
+            "YW-j",
+        ] {
+            assert_eq!(octets(input), None, "{input:?}");
+        }
+    }
+
+    /// The validator accepts exactly the literals the regular expression of
+    /// Datatypes §3.3.16.2 matches ("The Base64Binary production is
+    /// equivalent to the following regular expression"), after whiteSpace
+    /// `collapse`.
+    #[test]
+    fn base64_binary_is_the_regular_expression_of_the_specification() {
+        let grammar = regex::Regex::new(concat!(
+            "^((([A-Za-z0-9+/] ?){4})*(([A-Za-z0-9+/] ?){3}[A-Za-z0-9+/]",
+            "|([A-Za-z0-9+/] ?){2}[AEIMQUYcgkosw048] ?=",
+            "|[A-Za-z0-9+/] ?[AQgw] ?= ?=))?$"
+        ))
+        .unwrap();
+        let alphabet = [
+            "A", "Q", "g", "w", "B", "c", "+", "/", "=", " ", " ", "\n", "z", "9", "*",
+        ];
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let (mut accepted, mut spaced) = (0, 0);
+        for _ in 0..400_000 {
+            let length = next() % 14;
+            let literal: String = (0..length)
+                .map(|_| alphabet[(next() % alphabet.len() as u64) as usize])
+                .collect();
+            let collapsed = normalize_whitespace(&literal, WhitespaceMode::Collapse);
+            let expected = grammar.is_match(&collapsed);
+            let found = Base64BinaryValidator.validate(&literal).is_ok();
+            assert_eq!(found, expected, "{literal:?}");
+            accepted += usize::from(found);
+            spaced += usize::from(found && collapsed.contains(' '));
+        }
+        assert!(accepted > 1_000 && spaced > 300, "{accepted} {spaced}");
     }
 
     #[test]
